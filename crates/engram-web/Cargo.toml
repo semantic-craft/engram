@@ -1,0 +1,41 @@
+[package]
+name = "engram-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Read-only HTTP browser for the engram wiki (project list, tree navigation, markdown rendering, FTS5 search)."
+
+[dependencies]
+engram-core.workspace = true
+engram-store.workspace = true
+engram-wiki.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+axum.workspace = true
+jiff.workspace = true
+sha2.workspace = true
+
+# Templating + markdown.
+askama = "0.12"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+# Syntax highlighting for fenced code blocks. Default features pull
+# in onig (regex via C); the pure-Rust regex feature avoids that.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+[build-dependencies]
+anyhow.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

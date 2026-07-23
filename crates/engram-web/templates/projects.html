@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}Projects — engram{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Projects</h1>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki.</p>
+</div>
+
+<div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 text-sm text-amber-900 dark:text-amber-200">
+  <p class="font-medium mb-1">This is LLM-optimised memory, not hand-curated documentation.</p>
+  <p class="text-amber-800 dark:text-amber-300/90 leading-relaxed">
+    Pages are compiled from session observations by an LLM and revised as you work — they're shaped
+    for an agent's retrieval needs, not for human readability. The primary interface is the MCP
+    tools (<code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_query</code>,
+    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_recent</code>,
+    <code class="font-mono text-xs bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">memory_explore</code>,
+    …) your coding agent calls automatically. This browser is for spelunking — auditing what
+    landed, browsing your own history, sharing a page with a teammate — not for serving as project
+    documentation.
+  </p>
+</div>
+
+{% if projects.is_empty() %}
+<div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-12 text-center">
+  <p class="text-slate-500 dark:text-slate-400 text-sm">
+    No projects yet — wire up a hook and start a session.
+  </p>
+</div>
+{% else %}
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+  {% for card in projects %}
+  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
+    <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
+    <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
+    <div class="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+      <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>
+      {% if card.last_updated_relative != "" %}
+      <span>{{ card.last_updated_relative }}</span>
+      {% endif %}
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

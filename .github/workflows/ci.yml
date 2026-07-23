@@ -1,0 +1,148 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # Use the committed static/tailwind.css instead of downloading the
+  # Tailwind binary and recompiling at build time. Deterministic and
+  # network-free on ephemeral hosted runners (crates/engram-web/build.rs).
+  TAILWIND_SKIP: "1"
+
+# Platform-agnostic gates (fmt, clippy, deny, audit, gitleaks, the
+# separate companion workspace) run on Linux — cheapest and fastest.
+# Only the jobs that must exercise real OS behaviour run on macOS /
+# Windows: the macOS test + release binary and the Windows regression
+# tests. GitHub-hosted runners give public repos free standard minutes,
+# so no self-hosted infrastructure is required.
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  # Native Windows is where the `#[cfg(windows)]` regression tests (drain
+  # lock ERROR_LOCK_VIOLATION, libgit2 path-resolution fallback, verbatim
+  # path handling) actually run — the macOS test job never compiles them.
+  # Observability only for now (`continue-on-error`): a Windows
+  # runner-environment quirk must not block merges, but the results are
+  # visible on every push so Windows-only breakage is caught in review
+  # instead of by end users.
+  test-windows:
+    name: test (Windows, non-gating)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  # The companion importer is deliberately outside the root workspace
+  # (its own [workspace] in companions/engram-importer/Cargo.toml), so
+  # none of the jobs above compile it. Gate it here with the same
+  # fmt/clippy/test trio docs/companion-crates.md prescribes, or a
+  # toolchain bump / convention change rots it silently.
+  companions:
+    name: companions (engram-importer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companions/engram-importer
+      - run: cargo fmt --check --manifest-path companions/engram-importer/Cargo.toml
+      - run: cargo clippy --manifest-path companions/engram-importer/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path companions/engram-importer/Cargo.toml
+
+  # Build the release binary on its own so a release-only failure
+  # (LTO crash, codegen issue, dead-code-with-debug-assertions) is caught
+  # in CI rather than only when a tag is pushed. Mirrors the release
+  # asset: the single Apple Silicon binary. No Intel macOS and no Linux —
+  # neither is a release target.
+  release-build:
+    name: cargo build --release (macos-aarch64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin engram
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-engram-macos-aarch64
+          path: target/release/engram
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `cargo deny check` reads deny.toml and checks
+      # advisories/licenses/bans/sources over the whole dependency graph.
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: >
+          cargo audit
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2024-0320
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers every commit reachable
+          # from the pushed ref, not just the last one.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Exit nonzero if any secret is found; config lives at the
+          # repo root so the same rules apply locally if you also
+          # install gitleaks.
+          GITLEAKS_CONFIG: .gitleaks.toml

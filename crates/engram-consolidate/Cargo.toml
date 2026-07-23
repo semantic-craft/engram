@@ -1,0 +1,33 @@
+[package]
+name = "engram-consolidate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Karpathy-style ingest / query / lint consolidation pipeline."
+
+[dependencies]
+engram-core.workspace = true
+engram-store.workspace = true
+engram-wiki.workspace = true
+engram-llm.workspace = true
+git2.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

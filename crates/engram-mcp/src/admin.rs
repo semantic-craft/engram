@@ -1,0 +1,6819 @@
+//! Admin HTTP routes — state-touching operations invoked by the CLI
+//! over plain HTTP (not MCP). Currently exposes:
+//!
+//! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
+//! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
+//!   into seed wiki pages via the configured LLM provider.
+//! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
+//! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
+//! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
+//! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
+//! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
+//! - `POST /admin/lint`           — run the M8 lint pass.
+//! - `POST /admin/forget-sweep`   — run the M8 retention sweep.
+//! - `POST /admin/embed`          — backfill embeddings for latest pages.
+//! - `POST /admin/commit`         — stage + commit the wiki tree via git.
+//! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
+//! - `POST /admin/restore-page`   — restore one page from a checkpoint.
+//! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/move-project`   — move a project into another workspace
+//!   (copy latest pages via the write path, then purge the source).
+//! - `POST /admin/write-page`     — write or update a wiki page atomically.
+//! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
+//! - `POST /admin/delete-page`    — delete a single wiki page by path.
+//!
+//! The CLI is responsible for filesystem access (collecting sources from
+//! the project repo, rendering output for humans); the server is
+//! responsible for all state reads/writes against the wiki + SQLite.
+
+use std::sync::Arc;
+
+use std::io::Seek;
+use std::path::PathBuf;
+
+use axum::Json;
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use engram_consolidate::{
+    AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
+    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
+    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
+    run_curator_report, run_lint, run_sweep,
+};
+use engram_core::{
+    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
+    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+};
+use engram_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
+use engram_store::{
+    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
+    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
+    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
+    f32_vec_to_bytes, lookup_existing_scope,
+};
+use engram_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
+use tracing::{info, warn};
+
+const EMBEDDING_WRITE_BATCH: usize = 100;
+
+/// Shared state for the admin router.
+#[derive(Clone)]
+pub struct AdminState {
+    /// Writer actor handle — used to get-or-create workspace/project.
+    pub writer: WriterHandle,
+    /// Reader pool — used by the idempotency check inside Bootstrap.
+    pub reader: ReaderPool,
+    /// Wiki handle — pages are written here.
+    pub wiki: Wiki,
+    /// Optional LLM provider. When `None`, bootstrap returns 503.
+    pub llm: Option<Arc<dyn LlmProvider>>,
+    /// If true, auto-improve leaves staged proposals pending for manual
+    /// approval; otherwise it approves them immediately through the normal wiki
+    /// write path.
+    pub auto_improve_require_approval: bool,
+    /// Server-configured defaults used by direct admin auto-improvement.
+    /// Request fields remain explicit overrides; omitted eval settings inherit
+    /// this operator policy instead of disabling eval silently.
+    pub auto_improve_review_config: AutoImproveReviewConfig,
+    /// Optional embedder. When `None`, `/admin/embed` returns 503.
+    pub embedder: Option<Arc<dyn Embedder>>,
+    /// Passive process-scoped health recorder for configured providers.
+    pub provider_health: ProviderHealth,
+    /// Retention-decay parameters forwarded from server config.
+    pub decay_params: DecayParams,
+    /// Server's resolved data directory (e.g.
+    /// `~/Library/Application Support/engram` on macOS). Surfaced via
+    /// `/admin/status` so the CLI can report "where the wiki + db actually live".
+    pub data_dir: PathBuf,
+    /// Resolved SQLite path inside `data_dir`. Same purpose as above.
+    pub db_path: PathBuf,
+    /// Server's bind address — informational, surfaced in /admin/status.
+    pub bind: String,
+    /// Server home directory resolved once at config load. Used to keep admin
+    /// audits consistent with the hook router's cwd-prefix guard.
+    pub home_dir: Option<String>,
+    /// Serialises concurrent bootstrap requests. Bootstrap fans out
+    /// into an LLM call + a multi-page wiki write + a git commit;
+    /// running two in parallel would race the `commit_all` git ops and
+    /// stack LLM cost unnecessarily. The mutex is held for the entire
+    /// handler so a second caller waits its turn (request stays open
+    /// until the lock is acquired, then proceeds normally).
+    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-server token pepper, used by the user-management endpoints
+    /// (`POST /admin/users`, `…/rotate-token`) to hash freshly-issued
+    /// tokens before they land in `users.token_hash`. `None` when the
+    /// operator hasn't set `[auth].token_pepper` in config (single-user
+    /// installs that predate v0.8); user-management endpoints then
+    /// return 503 `multi-user not enabled`.
+    pub token_pepper: Option<engram_store::TokenPepper>,
+    /// Shared in-process pointer to the project the agent is currently
+    /// active in (published by the hook router). Read by `move-project` to
+    /// refuse moving the live project (unless `force`) and to keep the
+    /// pointer correct after a move. Empty `ActiveProject::new()` when no
+    /// hook router is attached (admin-only tests).
+    pub active_project: ActiveProject,
+    /// Optional hook to PROACTIVELY evict the hook router's per-cwd
+    /// `(workspace_id, project_id)` cache for a project that just moved
+    /// workspaces. Called with the moved `project_id` after a successful move
+    /// so the next hook event re-resolves cleanly instead of tripping the
+    /// pairing trigger on a stale cached pair first. Fire-and-forget
+    /// (best-effort); the trigger + router re-resolve are the correctness net.
+    /// `None` when no hook router is attached (stdio / admin-only tests).
+    pub on_project_moved: Option<std::sync::Arc<dyn Fn(ProjectId) + Send + Sync>>,
+}
+
+/// JSON request body for `POST /admin/bootstrap`.
+#[derive(Deserialize)]
+struct BootstrapRequest {
+    /// Workspace name (auto-created if it doesn't exist).
+    workspace: String,
+    /// Project name (auto-created if it doesn't exist).
+    project: String,
+    /// Sources pre-collected on the client side.
+    sources: Vec<BootstrapSource>,
+    /// Original collection size before client-side prune (if any).
+    #[serde(default)]
+    sources_collected: Option<usize>,
+    /// Maximum input tokens for LLM call.
+    #[serde(default = "default_max_input_tokens")]
+    max_input_tokens: usize,
+    /// Per-LLM-call input cap; larger bundles are split into chunks.
+    #[serde(default = "default_chunk_input_tokens")]
+    chunk_input_tokens: usize,
+    /// Skip the LLM call and page writes — returns a dry-run outcome.
+    #[serde(default)]
+    dry_run: bool,
+    /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
+    #[serde(default)]
+    force: bool,
+}
+
+fn default_max_input_tokens() -> usize {
+    50_000
+}
+
+fn default_chunk_input_tokens() -> usize {
+    engram_consolidate::DEFAULT_CHUNK_INPUT_TOKENS
+}
+
+/// JSON request body for `POST /admin/auto-improve`.
+#[derive(Deserialize)]
+struct AutoImproveRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Completed session to review.
+    session_id: SessionId,
+    /// Minimum observations before the LLM review runs.
+    #[serde(default = "default_auto_improve_min_observations")]
+    min_observations: usize,
+    /// Minimum session span before the LLM review runs.
+    #[serde(default = "default_auto_improve_min_session_duration_secs")]
+    min_session_duration_secs: u64,
+    /// Minimum proposal confidence accepted by validation.
+    #[serde(default = "default_auto_improve_min_confidence")]
+    min_confidence: f32,
+    /// Approximate chars/4 prompt budget.
+    #[serde(default = "default_auto_improve_max_input_tokens")]
+    max_input_tokens: usize,
+    /// Maximum validated proposals returned.
+    #[serde(default = "default_auto_improve_max_proposals")]
+    max_proposals_per_run: usize,
+    /// Whether future raw fallback details may be considered.
+    #[serde(default)]
+    include_raw_fallback: bool,
+    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    #[serde(default = "default_auto_improve_max_patchable_pages")]
+    max_patchable_pages: usize,
+    /// Maximum body chars rendered per patchable target page.
+    #[serde(default = "default_auto_improve_max_patchable_body_chars")]
+    max_patchable_body_chars: usize,
+    /// Maximum patch edits per proposal.
+    #[serde(default = "default_auto_improve_max_edits_per_proposal")]
+    max_edits_per_proposal: usize,
+    /// Maximum content chars in one patch edit.
+    #[serde(default = "default_auto_improve_max_edit_content_chars")]
+    max_edit_content_chars: usize,
+    /// Maximum aggregate changed chars in one patch proposal.
+    #[serde(default = "default_auto_improve_max_changed_chars_per_proposal")]
+    max_changed_chars_per_proposal: usize,
+    /// Maximum patch edits accepted across one review run.
+    #[serde(default = "default_auto_improve_max_patch_edits_per_run")]
+    max_patch_edits_per_run: usize,
+    /// Maximum recent rejection-buffer entries rendered into prompt context.
+    #[serde(default = "default_auto_improve_max_rejection_context")]
+    max_rejection_context: usize,
+    /// Maximum age in days for rejection-buffer prompt context.
+    #[serde(default = "default_auto_improve_rejection_context_days")]
+    rejection_context_days: u32,
+    /// Maximum materialized final body size.
+    #[serde(default = "default_auto_improve_max_final_body_chars")]
+    max_final_body_chars: usize,
+    /// Maximum approximate tokens allowed in one _rules/ page.
+    #[serde(default = "default_auto_improve_max_rule_page_tokens")]
+    max_rule_page_tokens: usize,
+    /// Maximum approximate tokens allowed in one procedures/ page.
+    #[serde(default = "default_auto_improve_max_procedure_page_tokens")]
+    max_procedure_page_tokens: usize,
+    /// Synthetic actor used for staged proposal provenance.
+    #[serde(default = "default_auto_improve_proposal_actor")]
+    proposal_actor: String,
+    /// Pending proposal sidecar folder.
+    #[serde(default = "default_auto_improve_pending_path")]
+    pending_path: String,
+    /// Optional executable proposal eval gate. When omitted, direct admin
+    /// requests inherit the server's configured eval policy; CLI requests send
+    /// their local config explicitly.
+    #[serde(default)]
+    eval: Option<engram_consolidate::AutoImproveEvalConfig>,
+    /// Removed compatibility field. Requests that still send it fail closed so
+    /// old preview callers cannot accidentally write pages.
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// Removed compatibility field.
+    #[serde(default)]
+    stage: Option<bool>,
+    /// Removed compatibility field.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveStageResponse {
+    run_id: String,
+    approval_required: bool,
+    approval_policy: String,
+    session_id: String,
+    summary: String,
+    warnings: Vec<String>,
+    rejected_candidates_count: usize,
+    proposals: Vec<AutoImproveProposalOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveProposalOutcome {
+    id: String,
+    sidecar_path: String,
+    status: String,
+    page_id: Option<String>,
+}
+
+/// JSON request body for `POST /admin/auto-improve/report`.
+#[derive(Deserialize)]
+struct AutoImproveTelemetryReportRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Lookback window in days.
+    #[serde(default = "default_auto_improve_telemetry_since_days")]
+    since_days: u32,
+    /// Maximum rows in each top-N count table.
+    #[serde(default = "default_auto_improve_telemetry_top_limit")]
+    limit: usize,
+    /// Stage one pending telemetry report page instead of returning a read-only report.
+    #[serde(default)]
+    stage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveTelemetryReportStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: AutoImproveTelemetryReport,
+}
+
+/// JSON request body for `POST /admin/curator`.
+#[derive(Deserialize)]
+struct CuratorRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Return a report without staging anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// Stage one pending report page.
+    #[serde(default)]
+    stage: bool,
+    /// Optional mode alias (`dry_run` or `stage`).
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CuratorStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: CuratorReport,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingWritesQuery {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default = "default_pending_writes_limit")]
+    limit: usize,
+}
+
+fn default_pending_writes_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingWriteScopeQuery {
+    workspace: String,
+    project: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingRejectRequest {
+    #[serde(default)]
+    reason: String,
+}
+
+fn default_auto_improve_min_observations() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS
+}
+
+fn default_auto_improve_min_session_duration_secs() -> u64 {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS
+}
+
+fn default_auto_improve_min_confidence() -> f32 {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE
+}
+
+fn default_auto_improve_max_input_tokens() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS
+}
+
+fn default_auto_improve_max_proposals() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS
+}
+
+fn default_auto_improve_max_patchable_pages() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES
+}
+
+fn default_auto_improve_max_patchable_body_chars() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS
+}
+
+fn default_auto_improve_max_edits_per_proposal() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_edit_content_chars() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS
+}
+
+fn default_auto_improve_max_changed_chars_per_proposal() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_patch_edits_per_run() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCH_EDITS_PER_RUN
+}
+
+fn default_auto_improve_max_rejection_context() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT
+}
+
+fn default_auto_improve_rejection_context_days() -> u32 {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS
+}
+
+fn default_auto_improve_max_final_body_chars() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS
+}
+
+fn default_auto_improve_max_rule_page_tokens() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS
+}
+
+fn default_auto_improve_max_procedure_page_tokens() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS
+}
+
+fn default_auto_improve_proposal_actor() -> String {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into()
+}
+
+fn default_auto_improve_pending_path() -> String {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into()
+}
+
+fn default_auto_improve_telemetry_since_days() -> u32 {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS
+}
+
+fn default_auto_improve_telemetry_top_limit() -> usize {
+    engram_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT
+}
+
+fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("expected 64 hex chars".into());
+    }
+    let mut out = [0_u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[idx] = u8::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// Build the admin axum [`Router`]. Mounts:
+/// - `POST /admin/backup`
+/// - `POST /admin/bootstrap`
+/// - `POST /admin/auto-improve`
+/// - `POST /admin/auto-improve/report`
+/// - `POST /admin/curator`
+/// - `GET  /admin/status`
+/// - `GET  /admin/audit-contamination`
+/// - `GET  /admin/search`
+/// - `GET  /admin/read-page`
+/// - `POST /admin/reorg`
+/// - `POST /admin/lint`
+/// - `POST /admin/forget-sweep`
+/// - `POST /admin/embed`
+/// - `POST /admin/commit`
+/// - `GET  /admin/checkpoints`
+/// - `POST /admin/restore-page`
+/// - `POST /admin/purge-project`
+/// - `POST /admin/rename-project`
+/// - `POST /admin/move-project`
+/// - `POST /admin/write-page`
+/// - `POST /admin/delete-page`
+/// - user-management routes under `/admin/users*`
+pub fn admin_router(state: AdminState) -> Router {
+    let state = Arc::new(state);
+    let operational = Router::new()
+        .route("/admin/backup", post(handle_backup))
+        .route("/admin/bootstrap", post(handle_bootstrap))
+        .route("/admin/auto-improve", post(handle_auto_improve))
+        .route(
+            "/admin/auto-improve/report",
+            post(handle_auto_improve_report),
+        )
+        .route("/admin/curator", post(handle_curator))
+        .route("/admin/pending-writes", get(handle_pending_writes_list))
+        .route(
+            "/admin/pending-writes/{id}",
+            get(handle_pending_write_detail),
+        )
+        .route(
+            "/admin/pending-writes/{id}/diff",
+            get(handle_pending_write_diff),
+        )
+        .route(
+            "/admin/pending-writes/{id}/approve",
+            post(handle_pending_write_approve),
+        )
+        .route(
+            "/admin/pending-writes/{id}/reject",
+            post(handle_pending_write_reject),
+        )
+        .route("/admin/status", get(handle_status))
+        .route(
+            "/admin/audit-contamination",
+            get(handle_audit_contamination),
+        )
+        .route("/admin/search", get(handle_search))
+        .route("/admin/read-page", get(handle_read_page))
+        .route("/admin/reorg", post(handle_reorg))
+        .route("/admin/lint", post(handle_lint))
+        .route("/admin/forget-sweep", post(handle_forget_sweep))
+        .route("/admin/embed", post(handle_embed))
+        .route("/admin/commit", post(handle_commit))
+        .route("/admin/checkpoints", get(handle_checkpoints))
+        .route("/admin/restore-page", post(handle_restore_page))
+        .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/rename-project", post(handle_rename_project))
+        .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/write-page", post(handle_write_page))
+        .route("/admin/delete-page", post(handle_delete_page));
+    let users = Router::new()
+        .route(
+            "/admin/users",
+            get(handle_list_users).post(handle_create_user),
+        )
+        .route("/admin/users/{username}/expire", post(handle_expire_user))
+        .route("/admin/users/{username}/revive", post(handle_revive_user))
+        .route(
+            "/admin/users/{username}/rotate-token",
+            post(handle_rotate_user_token),
+        );
+    operational
+        .merge(users)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_root_for_multiuser_admin,
+        ))
+        .with_state(state)
+}
+
+async fn require_root_for_multiuser_admin(
+    State(state): State<Arc<AdminState>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    let level = req
+        .extensions()
+        .get::<engram_core::AuthLevel>()
+        .copied()
+        .unwrap_or(engram_core::AuthLevel::Anonymous);
+    match level.authorize(Capability::Admin, state.token_pepper.is_some()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => (
+            authz_status(e),
+            Json(serde_json::json!({ "error": e.message() })),
+        )
+            .into_response(),
+    }
+}
+
+fn authz_status(err: engram_core::AuthzError) -> StatusCode {
+    if err.is_authentication_required() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::FORBIDDEN
+    }
+}
+
+// ---------------------------------------------------------------------
+// backup
+// ---------------------------------------------------------------------
+
+/// Handler for `POST /admin/backup`.
+///
+/// Snapshots the live SQLite DB via the online backup API, then
+/// tar-gzips `wiki/`, the snapshot, and `config.toml` (if present)
+/// into a tempfile. The response streams the file instead of buffering
+/// the full archive in memory.
+async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
+    match build_backup_tarball_file(&state).await {
+        Ok(file) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"backup.tar.gz\"",
+            )
+            .body(Body::from_stream(ReaderStream::new(file)))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        Err(e) => {
+            warn!(error = %e, "backup failed");
+            let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                })
+        }
+    }
+}
+
+async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::fs::File> {
+    let staging = tempfile::tempdir()?;
+    let snapshot_path = staging.path().join("memory.sqlite");
+    info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
+    state
+        .reader
+        .snapshot_to(snapshot_path.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("sqlite snapshot: {e}"))?;
+
+    let mut tar_file = tempfile::tempfile()?;
+    {
+        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+        tar.follow_symlinks(false);
+
+        let wiki_dir = state.data_dir.join("wiki");
+        if wiki_dir.is_dir() {
+            tar.append_dir_all("wiki", &wiki_dir)
+                .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
+        }
+
+        tar.append_path_with_name(&snapshot_path, "db/memory.sqlite")
+            .map_err(|e| anyhow::anyhow!("archiving db snapshot: {e}"))?;
+
+        let cfg = state.data_dir.join("config.toml");
+        if cfg.is_file() {
+            tar.append_path_with_name(&cfg, "config.toml")
+                .map_err(|e| anyhow::anyhow!("archiving config.toml: {e}"))?;
+        }
+
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+    }
+    tar_file.sync_data()?;
+    tar_file.rewind()?;
+    Ok(tokio::fs::File::from_std(tar_file))
+}
+
+// ---------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/audit-contamination`. Supplying BOTH
+/// `workspace` and `project` scopes the audit to that one landed bucket;
+/// omit both to audit every project.
+#[derive(Deserialize)]
+struct AuditContaminationQuery {
+    workspace: Option<String>,
+    project: Option<String>,
+}
+
+/// `GET /admin/audit-contamination` — read-only structural contamination audit
+/// (see [`engram_store::ReaderPool::audit_contamination`]). Reports likely
+/// cross-project mislandings (a session whose cwd resolves elsewhere; an
+/// observation whose project disagrees with its session); never mutates, so it
+/// is safe to run on any cadence (e.g. a cron probe alerting on non-zero counts).
+async fn handle_audit_contamination(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<AuditContaminationQuery>,
+) -> impl IntoResponse {
+    let scope = match (
+        trimmed_opt(q.workspace.as_deref()),
+        trimmed_opt(q.project.as_deref()),
+    ) {
+        (Some(ws), Some(proj)) => match lookup_ws_proj_no_create(&state, ws, proj).await {
+            Ok(ids) => Some(ids),
+            Err(e) => return e,
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
+        _ => None,
+    };
+    match state
+        .reader
+        .audit_contamination(scope, state.home_dir.as_deref())
+        .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// JSON response body for `GET /admin/status`. The CLI's `status`
+/// subcommand renders this either as JSON (`--json`) or as a small
+/// human-friendly text block.
+#[derive(Debug, Serialize)]
+pub struct StatusReport {
+    /// Server binary version (Cargo package version).
+    pub version: String,
+    /// Absolute data directory the server uses (server-side path).
+    pub data_dir: String,
+    /// Bind address the HTTP transport is listening on.
+    pub bind: String,
+    /// Absolute SQLite path inside `data_dir`.
+    pub db_path: String,
+    /// Lifetime counts: pages_latest, pages_all, sessions, observations.
+    pub counts: engram_store::StatusCounts,
+    /// Derived-index and retrieval-readiness diagnostics.
+    pub derived: engram_store::DerivedIndexStatus,
+    /// Passive process-scoped provider health.
+    pub providers: ProviderHealthSnapshot,
+}
+
+async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.reader.status_counts().await {
+        Ok(counts) => match state.reader.derived_index_status().await {
+            Ok(derived) => {
+                let report = StatusReport {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    data_dir: state.data_dir.display().to_string(),
+                    bind: state.bind.clone(),
+                    db_path: state.db_path.display().to_string(),
+                    counts,
+                    derived,
+                    providers: state.provider_health.snapshot(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+                )
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// search
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/search?q=…&limit=…`.
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    /// FTS5 query expression.
+    q: String,
+    /// Workspace name to search within. Must be provided together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project name to search within. Must be provided together with `workspace`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Max number of hits to return. Capped at 100 server-side.
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+async fn handle_search(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 100);
+    let search_result = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (Some(workspace), Some(project)) => {
+            match lookup_ws_proj_no_create(&state, workspace, project).await {
+                Ok((ws, proj)) => {
+                    state
+                        .reader
+                        .search_pages_for_project(ws, proj, query.q, limit)
+                        .await
+                }
+                Err(e) => return e,
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
+        _ => state.reader.search_pages(query.q, limit).await,
+    };
+    match search_result {
+        Ok(hits) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// read-page
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/read-page`.
+///
+/// Two modes:
+/// - Path mode: `workspace` + `project` + `path` — direct lookup.
+/// - Query mode: `workspace` + `project` + `q` — FTS5 search scoped to
+///   the given project; fetches the top-ranking hit's full body.
+#[derive(Debug, Deserialize)]
+struct ReadPageQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Direct wiki path (e.g. `notes/foo.md`). Takes precedence over `q`.
+    #[serde(default)]
+    path: Option<String>,
+    /// FTS5 query. Used when `path` is absent; fetches the top hit's full body.
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// Response body for `GET /admin/read-page`.
+#[derive(Debug, Serialize)]
+struct ReadPageResponse {
+    path: String,
+    workspace: String,
+    project: String,
+    title: Option<String>,
+    body: String,
+    frontmatter: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_from: Option<&'static str>,
+}
+
+async fn handle_read_page(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ReadPageQuery>,
+) -> impl IntoResponse {
+    let direct_path = if let Some(raw) = query.path {
+        match engram_core::PagePath::new(raw) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    if direct_path.is_none() && query.q.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "provide `path` or `q`" })),
+        );
+    }
+
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Resolve the page path: direct `path` takes precedence over `q`.
+    let page_path = if let Some(path) = direct_path {
+        path
+    } else if let Some(q) = query.q {
+        let hits = match state
+            .reader
+            .search_pages_for_project(ws, proj, q.clone(), 1)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => return internal_err(e.to_string()),
+        };
+        match hits.into_iter().next() {
+            Some(h) => h.path,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": format!("no pages found for query {q:?}") })),
+                );
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "provide `path` or `q`" })),
+        );
+    };
+
+    match state.wiki.read_page(ws, proj, &page_path) {
+        Ok(md) => {
+            let title = md
+                .frontmatter
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let resp = ReadPageResponse {
+                path: page_path.to_string(),
+                workspace: query.workspace,
+                project: query.project,
+                title,
+                body: md.body,
+                frontmatter: md.frontmatter,
+                served_from: None,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        // Only a missing markdown file can fall back to the DB copy. Other disk
+        // errors belong to the source-of-truth file and must be surfaced.
+        Err(disk_err) if is_missing_wiki_file(&disk_err) => match state
+            .reader
+            .page_body_by_ids(ws, proj, page_path.as_str())
+            .await
+        {
+            Ok(Some(stored)) => {
+                let frontmatter: serde_json::Value = serde_json::from_str(&stored.frontmatter_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let title = frontmatter
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or(Some(stored.title));
+                let resp = ReadPageResponse {
+                    path: page_path.to_string(),
+                    workspace: query.workspace,
+                    project: query.project,
+                    title,
+                    body: stored.body,
+                    frontmatter,
+                    served_from: Some("db-fallback"),
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}))),
+                )
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": disk_err.to_string() })),
+            ),
+            Err(e) => internal_err(e.to_string()),
+        },
+        Err(disk_err) => internal_err(disk_err.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------
+
+/// Build a 500 response carrying the given message.
+fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": msg.into() })),
+    )
+}
+
+fn is_missing_wiki_file(err: &WikiError) -> bool {
+    matches!(err, WikiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn trimmed_opt(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Resolve workspace + project IDs, creating them if absent. Returns
+/// either the IDs or a ready-to-return error response.
+async fn create_ws_proj(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    create_explicit_scope(&state.writer, workspace, project)
+        .await
+        .map(engram_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
+}
+
+/// Look up workspace + project by name **without** auto-creating them.
+/// Returns `(WorkspaceId, ProjectId)` on success, or a ready-to-return
+/// 404/500 error response. Used by read, maintenance, and destructive
+/// handlers where auto-creation would silently succeed on a typo.
+async fn lookup_ws_proj_no_create(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    lookup_existing_scope(&state.reader, workspace, project)
+        .await
+        .map(engram_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
+}
+
+fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if err.is_bad_request() {
+        StatusCode::BAD_REQUEST
+    } else if err.is_not_found() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": err.to_string() })),
+    )
+}
+
+fn skip_webhooks_for_admin_request(
+    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
+    headers: &HeaderMap,
+) -> Vec<String> {
+    let level = level_ext
+        .map(|axum::Extension(level)| level)
+        .unwrap_or(engram_core::AuthLevel::Anonymous);
+    if level
+        .authorize(Capability::SkipAdmissionChain, true)
+        .is_ok()
+    {
+        crate::actor::skip_webhooks_from_headers(headers)
+    } else {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------
+// bootstrap
+// ---------------------------------------------------------------------
+
+async fn handle_bootstrap(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<BootstrapRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Dry-runs are READ-ONLY: no LLM call, no project creation, no
+    // wiki write, no git commit. Early-return BEFORE any state-touching
+    // call so a smoke-test (e.g. `--dry-run` from a tempdir) cannot
+    // pollute the project list with throwaway names. Dry-runs can also
+    // proceed in parallel with anything else — no mutex needed.
+    if req.dry_run {
+        return dry_run_outcome(
+            req.sources,
+            req.sources_collected,
+            req.max_input_tokens,
+            req.chunk_input_tokens,
+        );
+    }
+
+    // Live runs from here on need LLM + workspace/project resolution.
+    if state.llm.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "LLM provider not configured on server"
+            })),
+        ));
+    }
+    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+
+    // Serialise live bootstrap runs. Two parallel `process_sources`
+    // calls would race the wiki's `commit_all` (libgit2 ops on the
+    // same repo) and stack LLM cost unnecessarily. The wait is
+    // operator-visible only in log lines; the request stays open
+    // until the lock is acquired, then proceeds normally.
+    if state.bootstrap_lock.try_lock().is_err() {
+        info!(
+            "another bootstrap is in progress; queueing — \
+             this request waits for the active one to finish"
+        );
+    }
+    let _bootstrap_guard = state.bootstrap_lock.lock().await;
+
+    let llm = Arc::clone(
+        state
+            .llm
+            .as_ref()
+            .expect("llm is Some: checked above (non-dry-run without LLM returns 503)"),
+    );
+
+    let cfg = BootstrapConfig {
+        // repo_path is unused by process_sources — the path field is
+        // only consumed by collect_sources on the client side.
+        repo_path: std::path::PathBuf::new(),
+        workspace_id: ws,
+        project_id: proj,
+        max_input_tokens: req.max_input_tokens,
+        chunk_input_tokens: req.chunk_input_tokens,
+        sources_collected: req.sources_collected,
+        // The individual include_* flags don't matter here: sources
+        // are already collected; process_sources ignores them.
+        include_git: true,
+        include_readme: true,
+        include_docs: true,
+        include_code: true,
+        since: None,
+        dry_run: req.dry_run,
+        force: req.force,
+    };
+
+    let bootstrap = Bootstrap {
+        reader: state.reader.clone(),
+        wiki: state.wiki.clone(),
+        llm,
+    };
+
+    match bootstrap.process_sources(&cfg, req.sources).await {
+        Ok(outcome) => Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+        )),
+        Err(e) => Err(bootstrap_error_response(e)),
+    }
+}
+
+/// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
+/// same budget-pruning logic that `Bootstrap::process_sources` would use.
+/// Map a [`BootstrapError`] to the appropriate HTTP status code.
+///
+/// - `NoSources` / `AlreadyBootstrapped` → 422 (validation failures).
+/// - `Llm` → 502 (upstream provider failure).
+/// - Everything else → 500 (unexpected server-side error).
+fn bootstrap_error_response(
+    e: engram_consolidate::BootstrapError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use engram_consolidate::BootstrapError;
+    let status = match &e {
+        BootstrapError::NoSources | BootstrapError::AlreadyBootstrapped => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+/// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
+/// same budget-pruning logic that `Bootstrap::process_sources` would use.
+fn dry_run_outcome(
+    sources: Vec<BootstrapSource>,
+    sources_collected: Option<usize>,
+    max_input_tokens: usize,
+    chunk_input_tokens: usize,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    use engram_consolidate::BootstrapError;
+    if sources.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": BootstrapError::NoSources.to_string()
+            })),
+        ));
+    }
+    let incoming = sources.len();
+    let (kept, _dropped, total) = prune_sources_to_budget(sources, max_input_tokens);
+    if kept.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": BootstrapError::NoSources.to_string()
+            })),
+        ));
+    }
+    let collected = sources_collected.unwrap_or(incoming);
+    let sources_sent = kept.len();
+    let sources_dropped = collected.saturating_sub(sources_sent);
+    let counts = SourceCounts::from_sources(&kept);
+    let chunk_budget =
+        engram_consolidate::effective_chunk_budget(chunk_input_tokens, max_input_tokens);
+    let llm_chunks = engram_consolidate::plan_bootstrap_chunks(kept.clone(), chunk_budget).len();
+    let outcome = BootstrapOutcome {
+        sources_collected: collected,
+        sources_sent,
+        sources_dropped,
+        sources_by_kind: counts,
+        estimated_input_tokens: total,
+        pages_written: Vec::new(),
+        rationale: "(dry-run; LLM not invoked)".to_string(),
+        dry_run: true,
+        llm_chunks,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// auto-improve reviewer/stager
+// ---------------------------------------------------------------------
+
+async fn handle_auto_improve(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<AutoImproveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.dry_run.is_some() || req.stage.is_some() || req.mode.is_some() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "auto-improve dry_run/stage/mode request fields were removed; set [auto_improve].require_approval = true for manual review"
+            })),
+        ));
+    }
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let Some(llm) = state.llm.as_ref().cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "LLM provider not configured on server"
+            })),
+        ));
+    };
+
+    let cfg = AutoImproveReviewConfig {
+        min_observations: req.min_observations,
+        min_session_duration_secs: req.min_session_duration_secs,
+        min_confidence: req.min_confidence,
+        max_input_tokens: req.max_input_tokens,
+        max_proposals_per_run: req.max_proposals_per_run,
+        include_raw_fallback: req.include_raw_fallback,
+        proposal_actor: req.proposal_actor.clone(),
+        pending_path: req.pending_path.clone(),
+        max_patchable_pages: req.max_patchable_pages,
+        max_patchable_body_chars: req.max_patchable_body_chars,
+        max_edits_per_proposal: req.max_edits_per_proposal,
+        max_edit_content_chars: req.max_edit_content_chars,
+        max_changed_chars_per_proposal: req.max_changed_chars_per_proposal,
+        max_patch_edits_per_run: req.max_patch_edits_per_run,
+        max_rejection_context: req.max_rejection_context,
+        rejection_context_days: req.rejection_context_days,
+        max_final_body_chars: req.max_final_body_chars,
+        max_rule_page_tokens: req.max_rule_page_tokens,
+        max_procedure_page_tokens: req.max_procedure_page_tokens,
+        eval: req
+            .eval
+            .clone()
+            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
+    };
+
+    let report =
+        run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
+            .await
+            .map_err(auto_improve_error_response)?;
+    let proposals = auto_improve_new_proposals(&state, ws, proj, &report).await?;
+    let staged =
+        stage_auto_improve_report(&state, ws, proj, req.session_id, &cfg, &report, proposals)
+            .await?;
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+    let outcomes = finalize_auto_improve_proposals(
+        &state,
+        &staged,
+        AutoImproveFinalizeContext {
+            workspace_id: ws,
+            project_id: proj,
+            require_approval: state.auto_improve_require_approval,
+            actor,
+            author_id,
+            admission_ctx: Some(AdmissionContext {
+                op: AdmissionOp::WritePage,
+                skip_webhooks,
+                ..AdmissionContext::default()
+            }),
+        },
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(AutoImproveStageResponse {
+                run_id: staged.run_id.to_string(),
+                approval_required: state.auto_improve_require_approval,
+                approval_policy: if state.auto_improve_require_approval {
+                    "manual".into()
+                } else {
+                    "auto_approve".into()
+                },
+                session_id: req.session_id.to_string(),
+                summary: report.summary,
+                warnings: report.warnings,
+                rejected_candidates_count: report.rejected_candidates.len(),
+                proposals: outcomes,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+fn auto_improve_auto_approve_actor(
+    mut actor: engram_core::ActorContext,
+) -> engram_core::ActorContext {
+    actor.agent = Some("auto_improve_auto_approve".into());
+    actor
+}
+
+struct AutoImproveFinalizeContext {
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    require_approval: bool,
+    actor: engram_core::ActorContext,
+    author_id: Option<engram_core::UserId>,
+    admission_ctx: Option<AdmissionContext>,
+}
+
+async fn finalize_auto_improve_proposals(
+    state: &AdminState,
+    staged: &StagedAutoImproveData,
+    ctx: AutoImproveFinalizeContext,
+) -> Result<Vec<AutoImproveProposalOutcome>, (StatusCode, Json<serde_json::Value>)> {
+    let mut outcomes = Vec::with_capacity(staged.proposal_ids.len());
+    for (proposal_id, sidecar_path) in staged.proposal_ids.iter().zip(staged.sidecar_paths.iter()) {
+        if ctx.require_approval {
+            outcomes.push(AutoImproveProposalOutcome {
+                id: proposal_id.to_string(),
+                sidecar_path: sidecar_path.clone(),
+                status: "pending".into(),
+                page_id: None,
+            });
+            continue;
+        }
+
+        let approval_actor = auto_improve_auto_approve_actor(ctx.actor.clone());
+        match state
+            .wiki
+            .approve_auto_improve_proposal(
+                ctx.workspace_id,
+                ctx.project_id,
+                *proposal_id,
+                approval_actor,
+                ctx.author_id,
+                ctx.admission_ctx.clone(),
+            )
+            .await
+        {
+            Ok(ApproveAutoImproveProposalResult::Approved { page_id }) => {
+                outcomes.push(AutoImproveProposalOutcome {
+                    id: proposal_id.to_string(),
+                    sidecar_path: sidecar_path.clone(),
+                    status: "approved".into(),
+                    page_id: Some(page_id.to_string()),
+                });
+            }
+            Ok(ApproveAutoImproveProposalResult::Conflict) => {
+                outcomes.push(AutoImproveProposalOutcome {
+                    id: proposal_id.to_string(),
+                    sidecar_path: sidecar_path.clone(),
+                    status: "conflict".into(),
+                    page_id: None,
+                });
+            }
+            Err(e) => return Err(internal_err(e.to_string())),
+        }
+    }
+    Ok(outcomes)
+}
+
+async fn auto_improve_new_proposals(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    report: &engram_consolidate::AutoImproveReport,
+) -> Result<Vec<NewAutoImproveProposal>, (StatusCode, Json<serde_json::Value>)> {
+    let mut proposals = Vec::with_capacity(report.proposals.len());
+    for p in &report.proposals {
+        let path = PagePath::new(p.path.clone()).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid proposal path: {e}") })),
+            )
+        })?;
+        let target_exists = state
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+            .is_some();
+        let operation = if p.edit_mode == "patch"
+            || (target_exists && path.as_str() == "_slots/current-focus.md")
+        {
+            AutoImproveProposalOperation::Update
+        } else {
+            AutoImproveProposalOperation::Create
+        };
+        let expected_base_body_sha256 = p
+            .expected_base_body_sha256
+            .as_deref()
+            .map(hex_to_sha256)
+            .transpose()
+            .map_err(|e| internal_err(format!("invalid expected_base_body_sha256: {e}")))?;
+        proposals.push(NewAutoImproveProposal {
+            operation,
+            target_path: path,
+            kind: p.kind.clone(),
+            title: p.title.clone(),
+            confidence: f64::from(p.confidence),
+            rationale: p.rationale.clone(),
+            evidence_json: serde_json::to_value(&p.evidence)
+                .map_err(|e| internal_err(e.to_string()))?,
+            body_markdown: p.body_markdown.clone(),
+            artifact_sha256: None,
+            edit_mode: Some(p.edit_mode.clone()),
+            patch_json: serde_json::to_value(&p.edits).ok(),
+            expected_base_body_sha256,
+        });
+    }
+    Ok(proposals)
+}
+
+struct StagedAutoImproveData {
+    run_id: engram_core::AutoImproveRunId,
+    proposal_ids: Vec<AutoImproveProposalId>,
+    sidecar_paths: Vec<String>,
+}
+
+async fn stage_auto_improve_report(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session_id: SessionId,
+    cfg: &AutoImproveReviewConfig,
+    report: &engram_consolidate::AutoImproveReport,
+    proposals: Vec<NewAutoImproveProposal>,
+) -> Result<StagedAutoImproveData, (StatusCode, Json<serde_json::Value>)> {
+    let staged = state
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: Some(session_id),
+            provider: Some(report.provider.clone()),
+            model: Some(report.model.clone()),
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::to_value(&report.warnings)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            config_json: serde_json::json!({
+                "min_observations": cfg.min_observations,
+                "min_session_duration_secs": cfg.min_session_duration_secs,
+                "min_confidence": cfg.min_confidence,
+                "max_input_tokens": cfg.max_input_tokens,
+                "max_proposals_per_run": cfg.max_proposals_per_run,
+                "include_raw_fallback": cfg.include_raw_fallback,
+                "max_patchable_pages": cfg.max_patchable_pages,
+                "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                "max_edit_content_chars": cfg.max_edit_content_chars,
+                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                "max_rejection_context": cfg.max_rejection_context,
+                "rejection_context_days": cfg.rejection_context_days,
+                "max_final_body_chars": cfg.max_final_body_chars,
+                "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                "eval": cfg.eval,
+            }),
+            proposal_actor: engram_core::ActorContext {
+                agent: Some(cfg.proposal_actor.clone()),
+                ..engram_core::ActorContext::default()
+            },
+            proposals,
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let sidecar_paths = write_auto_improve_sidecars(state, ws, proj, &staged.proposal_ids).await?;
+    Ok(StagedAutoImproveData {
+        run_id: staged.run_id,
+        proposal_ids: staged.proposal_ids,
+        sidecar_paths,
+    })
+}
+
+async fn target_operation_for_page(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    target: &PagePath,
+) -> Result<AutoImproveProposalOperation, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .reader
+        .page_body_by_ids(ws, proj, target.as_str())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .is_some()
+    {
+        Ok(AutoImproveProposalOperation::Update)
+    } else {
+        Ok(AutoImproveProposalOperation::Create)
+    }
+}
+
+async fn write_auto_improve_sidecars(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    proposal_ids: &[AutoImproveProposalId],
+) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+    let mut sidecar_paths = Vec::with_capacity(proposal_ids.len());
+    for id in proposal_ids {
+        let path = state
+            .wiki
+            .write_auto_improve_sidecar(ws, proj, *id)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        sidecar_paths.push(path.display().to_string());
+    }
+    Ok(sidecar_paths)
+}
+
+fn auto_improve_error_response(
+    e: engram_consolidate::AutoImproveError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use engram_consolidate::AutoImproveError;
+    let status = match &e {
+        AutoImproveError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+        AutoImproveError::SessionOutOfScope { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
+        AutoImproveError::Eval(_) => StatusCode::BAD_GATEWAY,
+        AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
+        AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+// ---------------------------------------------------------------------
+// auto-improve telemetry report
+// ---------------------------------------------------------------------
+
+async fn handle_auto_improve_report(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<AutoImproveTelemetryReportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let params = AutoImproveTelemetryParams {
+        since_days: req.since_days,
+        top_limit: req.limit.clamp(1, 100),
+    };
+    let report = run_auto_improve_telemetry_report(
+        &state.reader,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        params.clone(),
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?;
+    if req.stage {
+        let body_markdown = render_auto_improve_telemetry_report_markdown(&report);
+        let target_path = auto_improve_report_target_path();
+        let target = PagePath::new(target_path).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid auto-improve report target path: {e}") })),
+            )
+        })?;
+        let operation = target_operation_for_page(&state, ws, proj, &target).await?;
+        let staged = state
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: None,
+                model: None,
+                summary: Some(format!("Auto-improve telemetry report: {}", report.summary)),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({
+                    "mode": "stage",
+                    "auto_improve_report": true,
+                    "params": params,
+                }),
+                proposal_actor: engram_core::ActorContext {
+                    agent: Some("auto_improve_report".into()),
+                    ..engram_core::ActorContext::default()
+                },
+                proposals: vec![NewAutoImproveProposal {
+                    operation,
+                    target_path: target,
+                    kind: "auto_improve_report".into(),
+                    title: "Auto-improve Telemetry Report".into(),
+                    confidence: 1.0,
+                    rationale: "Telemetry report only; approval writes the report page and performs no learning-memory changes.".into(),
+                    evidence_json: serde_json::json!({
+                        "summary": report.summary.clone(),
+                        "findings": report.findings.clone(),
+                        "params": report.params.clone(),
+                    }),
+                    body_markdown,
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        let sidecar_paths =
+            write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(AutoImproveTelemetryReportStageResponse {
+                    run_id: staged.run_id.to_string(),
+                    proposal_ids: staged
+                        .proposal_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sidecar_paths,
+                    report,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
+
+async fn handle_curator(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CuratorRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let wants_stage = req.stage || matches!(mode, Some("stage"));
+    let explicit_dry_run = req.dry_run || matches!(mode, Some("dry_run" | "dry-run"));
+    if wants_stage && explicit_dry_run {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "choose either dry_run or stage, not both" })),
+        ));
+    }
+    if let Some(other) = mode
+        && !matches!(other, "stage" | "dry_run" | "dry-run")
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("unknown curator mode '{other}'") })),
+        ));
+    }
+    let wants_dry_run = explicit_dry_run || !wants_stage;
+
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let params = CuratorParams::default();
+    let mut report = run_curator_report(
+        &state.reader,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        params.clone(),
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?;
+    if wants_dry_run {
+        report.dry_run = true;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ));
+    }
+
+    report.dry_run = false;
+    let body_markdown = render_curator_report_markdown(&report);
+    let target_path = curator_target_path();
+    let target = PagePath::new(target_path).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid curator target path: {e}") })),
+        )
+    })?;
+    let operation = target_operation_for_page(&state, ws, proj, &target).await?;
+
+    let staged = state
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: None,
+            provider: None,
+            model: None,
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::json!([]),
+            rejected_candidates_json: serde_json::json!([]),
+            config_json: serde_json::json!({
+                "mode": "stage",
+                "curator": true,
+                "params": params,
+            }),
+            proposal_actor: engram_core::ActorContext {
+                agent: Some("curator".into()),
+                ..engram_core::ActorContext::default()
+            },
+            proposals: vec![NewAutoImproveProposal {
+                operation,
+                target_path: target,
+                kind: "curator_report".into(),
+                title: "Curator Report".into(),
+                confidence: 1.0,
+                rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
+                evidence_json: serde_json::json!({
+                    "summary": report.summary.clone(),
+                    "findings": report.findings.clone(),
+                }),
+                body_markdown,
+                artifact_sha256: None,
+                edit_mode: None,
+                patch_json: None,
+                expected_base_body_sha256: None,
+            }],
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let sidecar_paths = write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(CuratorStageResponse {
+                run_id: staged.run_id.to_string(),
+                proposal_ids: staged
+                    .proposal_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                sidecar_paths,
+                report,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+fn curator_target_path() -> String {
+    let now = jiff::Timestamp::now().to_string();
+    let date = now.get(0..10).unwrap_or("latest");
+    format!("notes/curator-{date}.md")
+}
+
+fn auto_improve_report_target_path() -> String {
+    let stamp = jiff::Timestamp::now().as_microsecond();
+    format!("notes/auto-improve-report-{stamp}.md")
+}
+
+async fn handle_pending_writes_list(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<PendingWritesQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let status = match query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match raw.parse::<AutoImproveProposalStatus>() {
+            Ok(status) => Some(status),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                );
+            }
+        },
+        None => None,
+    };
+    match state
+        .reader
+        .list_auto_improve_proposals(ws, proj, status, query.limit.clamp(1, 200))
+        .await
+    {
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(list).unwrap_or_else(|_| serde_json::json!([]))),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+async fn pending_detail(
+    state: &AdminState,
+    raw_id: &str,
+    query: &PendingWriteScopeQuery,
+) -> Result<
+    (
+        WorkspaceId,
+        ProjectId,
+        engram_store::AutoImproveProposalDetail,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let id: AutoImproveProposalId = raw_id.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+        )
+    })?;
+    let (ws, proj) = lookup_ws_proj_no_create(state, &query.workspace, &query.project).await?;
+    let detail = state
+        .reader
+        .auto_improve_proposal_detail(ws, proj, id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "proposal not found in scope" })),
+            )
+        })?;
+    Ok((ws, proj, detail))
+}
+
+async fn handle_pending_write_detail(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    match pending_detail(&state, &id, &query).await {
+        Ok((_, _, detail)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(detail).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => e,
+    }
+}
+
+async fn handle_pending_write_diff(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    match pending_detail(&state, &id, &query).await {
+        Ok((ws, proj, detail)) => {
+            let before = state
+                .reader
+                .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.body)
+                .unwrap_or_default();
+            let diff = format!(
+                "--- before/{path}\n+++ after/{path}\n@@\n{before}\n--- proposed ---\n{after}\n",
+                path = detail.summary.target_path.as_str(),
+                before = before,
+                after = detail.body_markdown
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "proposal_id": id, "diff": diff })),
+            )
+        }
+        Err(e) => e,
+    }
+}
+
+async fn handle_pending_write_approve(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    let proposal_id: AutoImproveProposalId = match id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+            );
+        }
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+    let admission_ctx = Some(AdmissionContext {
+        op: AdmissionOp::WritePage,
+        skip_webhooks,
+        ..AdmissionContext::default()
+    });
+    match state
+        .wiki
+        .approve_auto_improve_proposal(ws, proj, proposal_id, actor, author_id, admission_ctx)
+        .await
+    {
+        Ok(ApproveAutoImproveProposalResult::Approved { page_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "approved", "page_id": page_id.to_string() })),
+        ),
+        Ok(ApproveAutoImproveProposalResult::Conflict) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "status": "conflict" })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+async fn handle_pending_write_reject(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+    Json(body): Json<PendingRejectRequest>,
+) -> impl IntoResponse {
+    let proposal_id: AutoImproveProposalId = match id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+            );
+        }
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    match state
+        .writer
+        .reject_auto_improve_proposal(RejectAutoImproveProposal {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id,
+            reason: body.reason,
+            actor,
+            author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "rejected" })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// reorg
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/reorg`.
+#[derive(Deserialize)]
+struct ReorgRequest {
+    /// Show what would change without writing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// One entry in the reorg plan (serialised in the response).
+#[derive(Debug, Serialize)]
+pub struct ReorgPlanEntry {
+    /// Session UUID string.
+    pub session_id: String,
+    /// Working directory the session was started in.
+    pub cwd: String,
+    /// Basename-derived project name the session will move to.
+    pub new_project: String,
+}
+
+/// Summary counts returned alongside the plan.
+#[derive(Debug, Serialize)]
+pub struct ReorgSummaryJson {
+    /// Sessions whose `project_id` was changed.
+    pub sessions_moved: usize,
+    /// Observations updated to match their session's new project.
+    pub observations_updated: usize,
+    /// `is_latest=1` pages marked `is_latest=0` (mash-up graveyard).
+    pub pages_graveyarded: usize,
+    /// Number of distinct per-cwd projects referenced in the plan.
+    pub distinct_new_projects: usize,
+}
+
+/// Full response for `POST /admin/reorg`.
+#[derive(Debug, Serialize)]
+pub struct ReorgReport {
+    /// `true` when `dry_run` was requested.
+    pub dry_run: bool,
+    /// All sessions that need (or needed) moving, with their target project.
+    pub plan: Vec<ReorgPlanEntry>,
+    /// Counts after execution (zeros when `dry_run=true`).
+    pub summary: ReorgSummaryJson,
+}
+
+/// Read every session that has a non-empty `cwd` field, returning
+/// `(session_id, project_id, cwd)` triples ordered by `started_at`.
+async fn list_sessions_with_cwd(
+    reader: &engram_store::ReaderPool,
+    workspace_id: WorkspaceId,
+) -> Result<Vec<(SessionId, ProjectId, String)>, StoreError> {
+    reader
+        .with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, cwd \
+                     FROM sessions \
+                     WHERE workspace_id = ?1 AND cwd IS NOT NULL AND cwd != '' \
+                     ORDER BY started_at",
+            )?;
+            let rows = stmt.query_map([workspace_id.as_bytes().as_slice()], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let proj_bytes: Vec<u8> = row.get(1)?;
+                let cwd: String = row.get(2)?;
+                Ok((id_bytes, proj_bytes, cwd))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (id_bytes, proj_bytes, cwd) = r?;
+                let sid = SessionId::from_slice(&id_bytes).map_err(StoreError::Memory)?;
+                let pid = ProjectId::from_slice(&proj_bytes).map_err(StoreError::Memory)?;
+                out.push((sid, pid, cwd));
+            }
+            Ok(out)
+        })
+        .await
+}
+
+/// Build the reorg plan: for each session with a new project basename,
+/// resolve-or-create the target project, return the plan entries plus
+/// the set of session updates and the distinct-project count.
+async fn build_reorg_plan(
+    state: &AdminState,
+    ws: WorkspaceId,
+    sessions: Vec<(SessionId, ProjectId, String)>,
+) -> Result<(Vec<ReorgPlanEntry>, Vec<(SessionId, ProjectId)>, usize), StoreError> {
+    // Resolve target project per distinct cwd (basename-derived).
+    let mut cwd_to_proj: std::collections::HashMap<String, (WorkspaceId, ProjectId, String)> =
+        std::collections::HashMap::new();
+    for (_, _, cwd) in &sessions {
+        if cwd_to_proj.contains_key(cwd.as_str()) {
+            continue;
+        }
+        let project_name = std::path::Path::new(cwd.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        let proj = state
+            .writer
+            .get_or_create_project(ws, project_name.clone(), repo_path_from_reorg_cwd(cwd))
+            .await?;
+        cwd_to_proj.insert(cwd.clone(), (ws, proj, project_name));
+    }
+
+    // Build plan — sessions whose project_id already matches are skipped.
+    let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
+    let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
+    for (session_id, old_project_id, cwd) in &sessions {
+        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
+        if *new_project_id == *old_project_id {
+            continue;
+        }
+        plan_entries.push(ReorgPlanEntry {
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            new_project: project_name.clone(),
+        });
+        writer_plan.push((*session_id, *new_project_id));
+    }
+
+    let distinct_new_projects: std::collections::HashSet<ProjectId> =
+        writer_plan.iter().map(|(_, pid)| *pid).collect();
+
+    Ok((plan_entries, writer_plan, distinct_new_projects.len()))
+}
+
+fn repo_path_from_reorg_cwd(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    let repo_root = engram_consolidate::discover_repo_root(path).ok()?;
+    cwd_is_repo_root(path, &repo_root).then(|| repo_root.to_string_lossy().into_owned())
+}
+
+fn cwd_is_repo_root(cwd: &std::path::Path, repo_root: &std::path::Path) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(cwd), std::fs::canonicalize(repo_root)) {
+        return a == b;
+    }
+    let strip = |p: &std::path::Path| p.to_string_lossy().trim_end_matches('/').to_string();
+    strip(cwd) == strip(repo_root)
+}
+
+async fn handle_reorg(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ReorgRequest>,
+) -> impl IntoResponse {
+    let ws = match state
+        .writer
+        .get_or_create_workspace(DEFAULT_WORKSPACE_NAME)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+
+    let sessions = match list_sessions_with_cwd(&state.reader, ws).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    if sessions.is_empty() {
+        let report = ReorgReport {
+            dry_run: req.dry_run,
+            plan: Vec::new(),
+            summary: ReorgSummaryJson {
+                sessions_moved: 0,
+                observations_updated: 0,
+                pages_graveyarded: 0,
+                distinct_new_projects: 0,
+            },
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    let (plan_entries, writer_plan, distinct_count) =
+        match build_reorg_plan(&state, ws, sessions).await {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("project: {e}") })),
+                );
+            }
+        };
+
+    if req.dry_run || writer_plan.is_empty() {
+        let report = ReorgReport {
+            dry_run: req.dry_run,
+            plan: plan_entries,
+            summary: ReorgSummaryJson {
+                sessions_moved: 0,
+                observations_updated: 0,
+                pages_graveyarded: 0,
+                distinct_new_projects: distinct_count,
+            },
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    let summary = match state.writer.reorg_sessions(ws, writer_plan).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let report = ReorgReport {
+        dry_run: false,
+        plan: plan_entries,
+        summary: ReorgSummaryJson {
+            sessions_moved: summary.sessions_moved,
+            observations_updated: summary.observations_updated,
+            pages_graveyarded: summary.pages_graveyarded,
+            distinct_new_projects: distinct_count,
+        },
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// lint
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/lint`.
+#[derive(Deserialize)]
+struct LintRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Don't write the lint report page.
+    #[serde(default)]
+    dry_run: bool,
+    /// Skip the LLM contradiction pass (rule-based findings only).
+    /// When absent, defaults to `false` (LLM pass runs if a provider
+    /// is configured).
+    #[serde(default)]
+    no_llm: bool,
+}
+
+fn default_workspace() -> String {
+    DEFAULT_WORKSPACE_NAME.to_string()
+}
+
+fn default_project() -> String {
+    DEFAULT_PROJECT_NAME.to_string()
+}
+
+async fn handle_lint(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<LintRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    run_lint(
+        &state.reader,
+        &state.wiki,
+        state.llm.as_ref(),
+        ws,
+        proj,
+        req.dry_run,
+        !req.no_llm,
+    )
+    .await
+    .map(|report| {
+        (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        )
+    })
+    .map_err(|e| internal_err(e.to_string()))
+}
+
+// ---------------------------------------------------------------------
+// forget-sweep
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/forget-sweep`.
+#[derive(Deserialize)]
+struct ForgetSweepRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Report what would be evicted without actually mutating.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn handle_forget_sweep(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ForgetSweepRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    run_sweep(
+        &state.reader,
+        &state.writer,
+        ws,
+        proj,
+        &state.decay_params,
+        req.dry_run,
+    )
+    .await
+    .map(|report| {
+        (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        )
+    })
+    .map_err(|e| internal_err(e.to_string()))
+}
+
+// ---------------------------------------------------------------------
+// embed
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/embed`.
+#[derive(Deserialize)]
+struct EmbedRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist). Ignored when
+    /// [`Self::all_projects`] is true.
+    #[serde(default = "default_project")]
+    project: String,
+    /// When true, regenerates embeddings even for pages that already
+    /// have one matching the current (provider, model, dim).
+    #[serde(default)]
+    reembed: bool,
+    /// When true, count pages that would be embedded/skipped without
+    /// calling the embedder or writing anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// When true, embed every project in `workspace` instead of a
+    /// single `project`. The CLI sets this for `--force` /
+    /// `--reembed` without an explicit `--project` so model migrations
+    /// reach stale rows in every namespace.
+    #[serde(default)]
+    all_projects: bool,
+}
+
+/// Summary response from `POST /admin/embed`.
+#[derive(Debug, Serialize)]
+pub struct EmbedReport {
+    /// Pages that were actually embedded (zero in dry-run).
+    pub embedded: usize,
+    /// Pages skipped because a matching embedding already existed.
+    pub skipped: usize,
+    /// Pages that failed to embed (read error or provider error).
+    pub failed: usize,
+    /// Pages that would be embedded in a live run (only meaningful
+    /// when `dry_run` was requested).
+    pub would_embed: usize,
+    /// Provider name.
+    pub provider: String,
+    /// Model identifier.
+    pub model: String,
+    /// Embedding dimensionality.
+    pub dim: u32,
+}
+
+#[derive(Default)]
+struct EmbedCounts {
+    embedded: usize,
+    skipped: usize,
+    failed: usize,
+    would_embed: usize,
+}
+
+impl EmbedCounts {
+    fn absorb(&mut self, other: Self) {
+        self.embedded += other.embedded;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        self.would_embed += other.would_embed;
+    }
+}
+
+async fn embed_project_pages(
+    state: &AdminState,
+    embedder: &Arc<dyn Embedder>,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    reembed: bool,
+    dry_run: bool,
+) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
+    let provider = embedder.provider().to_string();
+    let model = embedder.model().to_string();
+    let dim = embedder.dim();
+
+    let candidates = state
+        .reader
+        .decay_candidates(ws, proj)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    let already: std::collections::HashSet<_> = if reembed {
+        std::collections::HashSet::new()
+    } else {
+        state
+            .reader
+            .fully_embedded_page_ids(
+                ws,
+                proj,
+                provider.clone(),
+                model.clone(),
+                dim,
+                engram_llm::DOC_CHUNK_MAX_BYTES as u64,
+            )
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+            .into_iter()
+            .collect()
+    };
+
+    let mut counts = EmbedCounts::default();
+    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
+
+    for cand in candidates {
+        if !reembed && already.contains(&cand.id) {
+            counts.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            counts.would_embed += 1;
+            continue;
+        }
+        let md = match state.wiki.read_page(ws, proj, &cand.path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        if md.body.trim().is_empty() {
+            counts.skipped += 1;
+            continue;
+        }
+        let vecs = match embedder.embed_document_chunked(&md.body).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: provider call failed");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        pending.push(EmbeddingWrite {
+            page_id: cand.id,
+            vectors: vecs.iter().map(|v| f32_vec_to_bytes(v)).collect(),
+            provider: provider.clone(),
+            model: model.clone(),
+            dim,
+        });
+        if pending.len() >= EMBEDDING_WRITE_BATCH {
+            flush_embedding_batch(
+                &state.writer,
+                &mut pending,
+                &mut counts.embedded,
+                &mut counts.failed,
+            )
+            .await;
+        }
+    }
+    flush_embedding_batch(
+        &state.writer,
+        &mut pending,
+        &mut counts.embedded,
+        &mut counts.failed,
+    )
+    .await;
+
+    Ok(counts)
+}
+
+async fn handle_embed(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let embedder = match state.embedder.clone() {
+        Some(e) => e,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "embedder not configured on server"
+                })),
+            ));
+        }
+    };
+
+    let provider = embedder.provider().to_string();
+    let model = embedder.model().to_string();
+    let dim = embedder.dim();
+
+    let mut totals = EmbedCounts::default();
+
+    if req.all_projects {
+        if let Some(ws) = state
+            .reader
+            .find_workspace(req.workspace.clone())
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+        {
+            if req.reembed && !req.dry_run {
+                let purged = state
+                    .writer
+                    .delete_stale_page_embeddings(ws, None, provider.clone(), model.clone(), dim)
+                    .await
+                    .map_err(|e| internal_err(e.to_string()))?;
+                info!(purged, provider = %provider, model = %model, "purged stale page_embeddings before workspace re-embed");
+            }
+
+            let summaries = state
+                .reader
+                .list_projects_with_stats()
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            for summary in summaries
+                .into_iter()
+                .filter(|p| p.workspace_name == req.workspace)
+            {
+                let Some(proj) = state
+                    .reader
+                    .find_project(ws, summary.project_name.clone())
+                    .await
+                    .map_err(|e| internal_err(e.to_string()))?
+                else {
+                    continue;
+                };
+                let partial =
+                    embed_project_pages(&state, &embedder, ws, proj, req.reembed, req.dry_run)
+                        .await?;
+                totals.absorb(partial);
+            }
+        }
+    } else {
+        let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+        if req.reembed && !req.dry_run {
+            let purged = state
+                .writer
+                .delete_stale_page_embeddings(ws, Some(proj), provider.clone(), model.clone(), dim)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            info!(purged, provider = %provider, model = %model, "purged stale page_embeddings before project re-embed");
+        }
+        totals = embed_project_pages(&state, &embedder, ws, proj, req.reembed, req.dry_run).await?;
+    }
+
+    let report = EmbedReport {
+        embedded: totals.embedded,
+        skipped: totals.skipped,
+        failed: totals.failed,
+        would_embed: totals.would_embed,
+        provider,
+        model,
+        dim,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
+
+async fn flush_embedding_batch(
+    writer: &WriterHandle,
+    pending: &mut Vec<EmbeddingWrite>,
+    embedded: &mut usize,
+    failed: &mut usize,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
+    let count = batch.len();
+    if let Err(e) = writer.store_embeddings(batch).await {
+        *failed += count;
+        warn!(count, error = %e, "embed: store_embeddings failed");
+    } else {
+        *embedded += count;
+    }
+}
+
+// ---------------------------------------------------------------------
+// commit
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/commit`.
+#[derive(Deserialize)]
+struct CommitRequest {
+    /// Commit message.
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointResponse {
+    /// Full git commit OID.
+    oid: String,
+    /// First 12 hex characters, useful for CLI display.
+    short_oid: String,
+    /// Commit author timestamp in seconds since Unix epoch.
+    time: i64,
+    /// First line of the commit message.
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointListQuery {
+    /// Maximum number of checkpoints to return.
+    #[serde(default = "default_checkpoint_limit")]
+    limit: usize,
+}
+
+fn default_checkpoint_limit() -> usize {
+    20
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+fn checkpoint_or_500(
+    wiki: &Wiki,
+    message: impl AsRef<str>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    wiki.commit_all(message.as_ref())
+        .map(|oid| oid.map(|oid| oid.to_string()))
+        .map_err(|e| internal_err(e.to_string()))
+}
+
+fn checkpoint_or_warn(wiki: &Wiki, message: impl AsRef<str>) -> Option<String> {
+    match wiki.commit_all(message.as_ref()) {
+        Ok(Some(oid)) => Some(oid.to_string()),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "wiki checkpoint failed after mutation");
+            None
+        }
+    }
+}
+
+async fn handle_commit(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CommitRequest>,
+) -> impl IntoResponse {
+    match state.wiki.commit_all(&req.message) {
+        Ok(Some(oid)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "committed": true,
+                "oid": oid.to_string(),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "committed": false,
+                "reason": "nothing to commit",
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn handle_checkpoints(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<CheckpointListQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 100);
+    match state.wiki.recent_checkpoints(limit) {
+        Ok(checkpoints) => {
+            let checkpoints: Vec<CheckpointResponse> = checkpoints
+                .into_iter()
+                .map(|cp| CheckpointResponse {
+                    short_oid: short_oid(&cp.oid),
+                    oid: cp.oid,
+                    time: cp.time,
+                    summary: cp.summary,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(checkpoints).unwrap_or_else(|_| serde_json::json!([]))),
+            )
+        }
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// restore-page
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RestorePageRequest {
+    /// Workspace name. Must exist.
+    workspace: String,
+    /// Project name. Must exist within `workspace`.
+    project: String,
+    /// Relative wiki path to restore.
+    path: String,
+    /// Git revision/commit to restore from.
+    rev: String,
+}
+
+#[derive(Serialize)]
+struct RestorePageResponse {
+    /// UUID of the restored page version.
+    page_id: String,
+    /// Canonical wiki path restored.
+    path: String,
+    /// Revision requested by the caller.
+    restored_from: String,
+    /// Pre-restore checkpoint, if the current tree had changes to save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_checkpoint: Option<String>,
+    /// Post-restore checkpoint, if the restore changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+async fn handle_restore_page(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RestorePageRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let pre_checkpoint = checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-restore-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    )?;
+
+    let page_id = state
+        .wiki
+        .restore_page_from_checkpoint(ws, proj, path.clone(), &req.rev)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "restore-page {}/{}: {} from {}",
+            req.workspace,
+            req.project,
+            path.as_str(),
+            req.rev
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(RestorePageResponse {
+                page_id: page_id.to_string(),
+                path: path.to_string(),
+                restored_from: req.rev,
+                pre_checkpoint,
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// purge-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-project`.
+#[derive(Deserialize)]
+struct PurgeProjectRequest {
+    /// Workspace name. The workspace must already exist; we 404 if absent.
+    workspace: String,
+    /// Project name. The project must already exist; we 404 if absent.
+    project: String,
+    /// Mandatory confirmation flag. Without `confirm: true` the server
+    /// returns 400 — purging is destructive and irreversible.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/purge-project`.
+#[derive(Debug, Serialize)]
+pub struct PurgeProjectReport {
+    /// Human-readable `workspace/project` label.
+    pub label: String,
+    /// Number of `pages` rows deleted (all versions).
+    pub pages_deleted: u64,
+    /// Number of `sessions` rows deleted.
+    pub sessions_deleted: u64,
+    /// Number of `observations` rows deleted.
+    pub observations_deleted: u64,
+    /// Number of `handoffs` rows deleted.
+    pub handoffs_deleted: u64,
+    /// Number of `page_embeddings` rows deleted.
+    pub embeddings_deleted: u64,
+    /// Paths removed from disk (the project's UUID-namespaced directory).
+    pub files_deleted: Vec<String>,
+    /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
+    pub files_failed: Vec<String>,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+async fn handle_purge_project(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    Json(req): Json<PurgeProjectRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    // Look up workspace and project IDs without auto-creating.
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    let label = format!("{}/{}", req.workspace, req.project);
+
+    // Admission must run before any destructive work. A reject-policy webhook
+    // is allowed to abort the purge while DB rows and files are still intact.
+    // Seed names from the request so mirrors do not depend on DB lookup after
+    // the rows are purged below. Carry the authenticated actor so a scope-guard
+    // admission webhook can authorize the purge by user — an empty actor is
+    // rejected (`403 user '' not allowed to purge_project`).
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let purge_ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-project {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
+    // DB cascade already deleted all rows. Directory removal remains best-effort
+    // and is reported separately, matching the pre-admission purge contract.
+    let proj_root_str = state
+        .wiki
+        .project_root(ws_id, proj_id)
+        .display()
+        .to_string();
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_failed: Vec<String> = Vec::new();
+    match state.wiki.remove_project_dir(ws_id, proj_id).await {
+        Ok(()) => {
+            files_deleted.push(proj_root_str);
+        }
+        Err(e) => {
+            warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
+            files_failed.push(proj_root_str);
+        }
+    }
+    // Mirrors that track filesystem reality (a git-push mirror) want to
+    // know the on-disk dir is still present even though the DB rows are
+    // gone, so they can refuse to drop their own copy in violation of
+    // their source of truth. Mirrors that track DB intent can ignore
+    // `partial_failure`. Default-skipped on the wire so existing
+    // webhook consumers see no extra key.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-project {label}"));
+
+    let report = PurgeProjectReport {
+        label: summary.label,
+        pages_deleted: summary.pages_deleted,
+        sessions_deleted: summary.sessions_deleted,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        files_deleted,
+        files_failed,
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// rename-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rename-project`.
+#[derive(Deserialize)]
+struct RenameProjectRequest {
+    /// Workspace name (must exist; we don't auto-create on rename).
+    workspace: String,
+    /// Current project name.
+    from: String,
+    /// New project name. Must be non-empty, no slashes.
+    to: String,
+}
+
+/// Wire-format summary returned by `POST /admin/rename-project`.
+#[derive(Debug, Serialize)]
+pub struct RenameProjectSummary {
+    /// Workspace name.
+    pub workspace: String,
+    /// Previous project name.
+    pub from: String,
+    /// New project name.
+    pub to: String,
+    /// Number of `is_latest=1` pages now under the renamed project.
+    /// No files move — this is purely an informational count.
+    pub pages: u64,
+    /// Post-rename checkpoint, if `_meta.md` changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+async fn handle_rename_project(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RenameProjectRequest>,
+) -> impl IntoResponse {
+    // Look up workspace + source project; 404 if either is absent.
+    let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Step 3: execute the rename. The writer validates the name and
+    // returns ProjectNameTaken / InvalidProjectName on conflicts. A
+    // `NotFound` here signals a race — typically a concurrent
+    // `purge-project` deleted the row between the lookup above and
+    // this UPDATE. Map it to 404 so the caller sees an honest failure
+    // instead of the previous false-200.
+    if let Err(e) = state
+        .writer
+        .rename_project(ws_id, proj_id, req.to.clone())
+        .await
+    {
+        let status = match &e {
+            StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (status, Json(serde_json::json!({ "error": e.to_string() })));
+    }
+
+    // Step 4: count is_latest pages that now belong to the renamed project.
+    // COUNT(*) always produces a row, so no optional() needed. We pass the
+    // 16-byte project id as a plain &[u8] slice to avoid importing rusqlite
+    // (not a direct dependency of this crate).
+    let pid_bytes = *proj_id.as_bytes();
+    let pages = match state
+        .reader
+        .with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pages WHERE project_id = ?1 AND is_latest = 1",
+                [&pid_bytes[..]],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let summary = RenameProjectSummary {
+        workspace: req.workspace.clone(),
+        from: req.from.clone(),
+        to: req.to.clone(),
+        pages,
+        checkpoint: {
+            if let Err(e) = state.wiki.backfill_scope_manifests().await {
+                warn!(error = %e, "rename-project: scope-manifest backfill failed after rename");
+            }
+            checkpoint_or_warn(
+                &state.wiki,
+                format!(
+                    "rename-project {}/{} -> {}",
+                    req.workspace, req.from, req.to
+                ),
+            )
+        },
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// move-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/move-project`.
+#[derive(Deserialize)]
+struct MoveProjectRequest {
+    /// Source workspace. Must already exist; we 404 if absent.
+    from_workspace: String,
+    /// Project name to move. Must already exist in `from_workspace`; 404 if absent.
+    project: String,
+    /// Destination workspace. Auto-created if absent.
+    to_workspace: String,
+    /// Mandatory confirmation flag. The move PURGES the source after
+    /// copying, so without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Override the live-session guard. By default the server refuses (409)
+    /// to move the project the hook router is currently writing to, since a
+    /// live session's next observation would carry a stale workspace id.
+    /// `force: true` proceeds anyway (still safe: the move republishes the
+    /// active pointer and the (workspace_id, project_id) trigger makes any
+    /// stale write fail cleanly rather than corrupt).
+    #[serde(default)]
+    force: bool,
+    /// Policy for the copy-purge MERGE path when a source page's path already
+    /// exists in the destination with DIFFERENT content. Ignored by true-move
+    /// (no copy). Default `block` — the safe choice for a destructive op.
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// What to do when a merged page path collides with an existing destination
+/// page of different content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum OnConflict {
+    /// Abort the whole move (source untouched), listing the conflicting paths.
+    /// The operator resolves them or picks another policy explicitly.
+    #[default]
+    Block,
+    /// The source page supersedes the destination page at the same path (the
+    /// destination's prior version becomes history).
+    Overwrite,
+    /// Keep BOTH: the source page lands under a de-duplicated path
+    /// (`<stem>-from-<src_workspace>.md`), reported in `conflicts`.
+    Duplicate,
+}
+
+/// Wire-format report returned by `POST /admin/move-project`.
+#[derive(Debug, Serialize)]
+pub struct MoveProjectReport {
+    /// `from_workspace/project` label.
+    pub from: String,
+    /// `to_workspace/project` label.
+    pub to: String,
+    /// `true` when the destination workspace already held a same-named
+    /// project — the copy MERGED into it rather than creating a fresh one.
+    pub merged_into_existing: bool,
+    /// How the move was performed:
+    /// - `"true-move"`: a lossless cross-workspace re-stamp (same `project_id`,
+    ///   one SQL transaction + one dir rename). Used when the destination has
+    ///   no same-named project. Sessions/observations/handoffs and the full
+    ///   supersession history all survive; nothing is re-embedded.
+    /// - `"copy-purge"`: the destination already held a same-named project, so
+    ///   the source's latest pages were copied in and merged, then the source
+    ///   purged. Only durable pages move; episodic rows are dropped.
+    pub moved_via: &'static str,
+    /// Number of latest pages copied into the destination (copy-purge) or
+    /// re-stamped in place (true-move).
+    pub pages_copied: u64,
+    /// Source paths whose on-disk file could not be read (copy skipped).
+    /// When non-empty the source is NOT purged so a fixed re-run is safe.
+    pub pages_skipped: Vec<String>,
+    /// Whether the source project was purged (only when every page copied).
+    pub source_purged: bool,
+    /// Source `pages` rows deleted by the purge (all versions).
+    pub source_pages_deleted: u64,
+    /// Source `sessions` rows deleted by the purge.
+    pub source_sessions_deleted: u64,
+    /// Source `observations` rows deleted by the purge.
+    pub source_observations_deleted: u64,
+    /// Source `handoffs` rows deleted by the purge.
+    pub source_handoffs_deleted: u64,
+    /// Source `page_embeddings` rows deleted by the purge.
+    pub source_embeddings_deleted: u64,
+    /// Source on-disk dirs removed.
+    pub files_deleted: Vec<String>,
+    /// Source on-disk dirs that could not be removed (non-fatal).
+    pub files_failed: Vec<String>,
+    /// Same-path conflicts in the copy-purge merge: a source page whose path
+    /// already existed in the destination (with different content) was landed
+    /// under a de-duplicated path so BOTH survive. Each entry is the original
+    /// source path and the de-duplicated destination path it was written to.
+    pub conflicts: Vec<PathConflict>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the move changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// One same-path collision resolved by de-duplicating the source page's path.
+#[derive(Debug, Serialize)]
+pub struct PathConflict {
+    /// The source page's original path (also the destination's existing path).
+    pub path: String,
+    /// The de-duplicated path the source page was written to instead.
+    pub moved_to: String,
+}
+
+/// Lossless cross-workspace move: under the wiki mutation gate, rename the
+/// project's on-disk dir to the destination workspace, then re-stamp its
+/// `workspace_id` across every domain table (one transaction, same
+/// `project_id`). The caller has already verified the destination has no
+/// same-named project.
+async fn true_move_project(
+    state: &Arc<AdminState>,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    pre_checkpoint: Option<String>,
+    actor: engram_core::ActorContext,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Ensure the destination workspace ROW exists (FK target for the
+    // re-stamp) without creating a new project — the existing project_id is
+    // what we move.
+    let dst_ws = match state
+        .writer
+        .get_or_create_workspace(req.to_workspace.clone())
+        .await
+    {
+        Ok(ws) => ws,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // A true move targets a FRESH destination, so its dir must not already
+    // exist. Wiki::move_project_workspace repeats this check under the
+    // exclusive mutation guard before it renames anything.
+    let dst_dir = state.wiki.project_root(dst_ws, src_proj);
+    if dst_dir.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "destination dir already exists: {}; refusing true-move",
+                    dst_dir.display()
+                )
+            })),
+        );
+    }
+
+    let move_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        destination_workspace: Some(req.to_workspace.clone()),
+        destination_project: Some(req.project.clone()),
+        op: AdmissionOp::MoveProject,
+        actor,
+        ..Default::default()
+    };
+
+    // Wiki owns the critical section: it runs move admission, renames the dir,
+    // re-stamps SQLite, and rolls the dir back on SQL failure while normal page
+    // writes/reindexes are blocked by the same process-local gate.
+    let summary = match state
+        .wiki
+        .move_project_workspace(src_proj, src_ws, dst_ws, Some(move_ctx))
+        .await
+    {
+        Ok(s) => s,
+        Err(WikiError::Store(StoreError::NotFound(msg))) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": msg })),
+            );
+        }
+        Err(e @ WikiError::DestinationExists(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "true-move: move aborted before completion");
+            return internal_err(format!("move aborted (nothing changed): {e}"));
+        }
+    };
+
+    // Keep the in-process active-project pointer correct: the project_id is
+    // unchanged, only its workspace moved. If a hook had published this project
+    // as active, republish it under the destination workspace so the next event
+    // resolves cleanly (rather than tripping the pairing trigger first).
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.set(dst_ws, src_proj);
+    }
+    // Proactively drop any stale per-cwd cache entry for the moved project.
+    if let Some(evict) = &state.on_project_moved {
+        evict(src_proj);
+    }
+
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "true-move: scope-manifest backfill failed after move");
+    }
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    );
+
+    let report = MoveProjectReport {
+        from: format!("{}/{}", req.from_workspace, req.project),
+        to: format!("{}/{}", req.to_workspace, req.project),
+        merged_into_existing: false,
+        moved_via: "true-move",
+        pages_copied: summary.pages_moved,
+        pages_skipped: Vec::new(),
+        // Nothing is purged in a true move — the source rows ARE the
+        // destination rows, just re-stamped.
+        source_purged: false,
+        source_pages_deleted: 0,
+        source_sessions_deleted: 0,
+        source_observations_deleted: 0,
+        source_handoffs_deleted: 0,
+        source_embeddings_deleted: 0,
+        files_deleted: Vec::new(),
+        files_failed: Vec::new(),
+        // A true move never copies pages, so it never has a path conflict.
+        conflicts: Vec::new(),
+        pre_checkpoint,
+        checkpoint,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// Token inserted between the original stem and the source-workspace
+/// slug when copy-purge merges conflicting page paths
+/// (`<stem>-from-<src_workspace>.md`). The literal also appears in
+/// `docs/lifecycle-ops.md`; keep these two in sync.
+const DEDUP_FROM_TOKEN: &str = "-from-";
+
+/// Char allowlist for the source-workspace slug embedded in a deduped
+/// destination path. ASCII alphanumeric plus `-` / `_` keeps the slug
+/// safe inside a filesystem path component on every supported platform
+/// (Windows treats `:`, `*`, `?`, `<`, `>`, `|` as illegal; Linux
+/// tolerates more but UTF-8 mojibake in filenames is a maintenance
+/// hazard). Everything else collapses to a single `-` separator,
+/// preserving readability without introducing path-traversal vectors.
+fn is_dedup_slug_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Pick a destination path that collides with neither an existing destination
+/// page nor one already claimed in this run. Keeps the source page's stem and
+/// appends `<DEDUP_FROM_TOKEN><src_workspace>` (then `-2`, `-3`, …). Used by
+/// the copy-purge merge to keep BOTH pages when a path conflicts.
+async fn dedup_dest_path(
+    state: &AdminState,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    src_path: &str,
+    src_workspace: &str,
+    used: &std::collections::HashSet<String>,
+) -> PagePath {
+    let (stem, ext) = match src_path.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (src_path.to_string(), String::new()),
+    };
+    let slug: String = src_workspace
+        .chars()
+        .map(|c| if is_dedup_slug_char(c) { c } else { '-' })
+        .collect();
+    let base = format!("{stem}{DEDUP_FROM_TOKEN}{slug}");
+    let mut n = 0u32;
+    loop {
+        let cand = if n == 0 {
+            format!("{base}{ext}")
+        } else {
+            format!("{base}-{n}{ext}")
+        };
+        let collides = used.contains(&cand)
+            || matches!(
+                state.reader.page_body_by_ids(dst_ws, dst_proj, &cand).await,
+                Ok(Some(_))
+            );
+        if !collides && let Ok(p) = PagePath::new(cand) {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+fn page_copy_differs(
+    existing: &engram_store::StoredPageBody,
+    source: &Markdown,
+    source_title: &str,
+    source_tier: Tier,
+    source_pinned: bool,
+) -> bool {
+    let source_frontmatter = match serde_json::to_string(&source.frontmatter) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    existing.body != source.body
+        || existing.frontmatter_json != source_frontmatter
+        || existing.title != source_title
+        || existing.tier != source_tier.as_str()
+        || existing.pinned != source_pinned
+}
+
+async fn handle_move_project(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    Json(req): Json<MoveProjectRequest>,
+) -> impl IntoResponse {
+    // Destructive: it purges the source after copying. Require confirm.
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    // A same-workspace "move" would get-or-create the SAME project as both
+    // source and destination, copy it onto itself, then purge it — data
+    // loss. Reject; in-workspace renames go through rename-project.
+    if req.from_workspace == req.to_workspace {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "from_workspace and to_workspace are identical; use rename-project instead"
+            })),
+        );
+    }
+
+    // Resolve the SOURCE without auto-creating — 404 on a typo.
+    let (src_ws, src_proj) =
+        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    // Live-session guard: refuse to move the project the hook router is
+    // currently writing to. A live session's next observation/log would carry
+    // the now-stale workspace id (the (workspace_id, project_id) trigger would
+    // make it fail, but the operator should consciously opt in). `force: true`
+    // proceeds — safe because the move republishes the active pointer below.
+    if !req.force && state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{}/{} is the active session's project; a live move risks stale-cache writes. \
+                     Re-run with force=true to proceed.",
+                    req.from_workspace, req.project
+                )
+            })),
+        );
+    }
+
+    // Detect MERGE: does the destination workspace already hold a same-named
+    // project? (find_workspace may be None when the dest ws doesn't exist yet.)
+    let merged_into_existing = match state.reader.find_workspace(req.to_workspace.clone()).await {
+        Ok(Some(dst_ws)) => matches!(
+            state.reader.find_project(dst_ws, req.project.clone()).await,
+            Ok(Some(_))
+        ),
+        Ok(None) => false,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let pre_checkpoint = match checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    ) {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    // FRESH destination (no same-named project there) → lossless TRUE MOVE.
+    // Re-stamp the source project's workspace_id across every domain table in
+    // one transaction (same project_id), then rename its on-disk dir. This
+    // keeps sessions/observations/handoffs and the full supersession history,
+    // and is O(1) instead of O(pages) — no per-page re-write, re-embed, or
+    // admission webhook. The copy+purge path below is reserved for the MERGE
+    // case, where two project_ids can't be re-stamped into one
+    // (UNIQUE(workspace_id, name) collision).
+    // Carry the authenticated actor into both legs (move admission + the
+    // source-purge admission) so a scope-guard webhook authorizes by user.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+
+    if !merged_into_existing {
+        return true_move_project(&state, &req, src_ws, src_proj, pre_checkpoint, actor).await;
+    }
+
+    // MERGE: the destination already holds a same-named project. Get-or-create
+    // it (auto-creating the destination workspace) and copy the source's
+    // latest pages into it, then purge the source.
+    let (dst_ws, dst_proj) = match create_ws_proj(&state, &req.to_workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    copy_purge_merge(
+        &state,
+        &req,
+        src_ws,
+        src_proj,
+        dst_ws,
+        dst_proj,
+        pre_checkpoint,
+        actor,
+    )
+    .await
+}
+
+/// One source page, with everything the copy loop and the block
+/// pre-check both need. Built in ONE pass over the source listing so
+/// the previous two-pass implementation's double-IO (pre-scan + copy
+/// loop each calling `page_meta` + `page_body_by_ids` + `read_page`)
+/// collapses to a single read per page.
+struct PreparedSourcePage {
+    path: PagePath,
+    /// Path as a String — only needed for reports / `pages_skipped`
+    /// and `dedup` lookups; kept here so we don't keep recomputing.
+    path_str: String,
+    title: String,
+    tier: Tier,
+    pinned: bool,
+    /// `Some(md)` when the on-disk source survived parsing; `None` when
+    /// reading or parsing failed and the page must be skipped (the
+    /// safety guard at the end of the merge will refuse to purge).
+    md: Option<Markdown>,
+    /// `true` when the destination already holds this path with a
+    /// DIFFERENT page (body / frontmatter / title / tier / pinned).
+    /// `false` when there's no destination row, the destination
+    /// matches verbatim (no-op supersession), or the source itself
+    /// couldn't be parsed and we'd skip it anyway.
+    dest_conflict: bool,
+}
+
+/// Load every source page (metadata + body) and pre-classify whether
+/// its path collides with a different page at the destination. Both
+/// the `Block` pre-check and the copy loop drive off the returned
+/// vector, so each page is read at most once.
+async fn prepare_source_pages(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    summaries: &[engram_store::PageSummary],
+) -> Vec<PreparedSourcePage> {
+    let mut out = Vec::with_capacity(summaries.len());
+    for s in summaries {
+        let Ok(path) = PagePath::new(s.path.clone()) else {
+            // Unparseable path — record a "skip" entry so the copy
+            // loop can report it without re-trying the lookup.
+            out.push(PreparedSourcePage {
+                path: PagePath::new("invalid.md".to_string()).expect("valid placeholder"),
+                path_str: s.path.clone(),
+                title: s.title.clone(),
+                tier: Tier::Semantic,
+                pinned: false,
+                md: None,
+                dest_conflict: false,
+            });
+            continue;
+        };
+        let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
+        let pinned = matches!(
+            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            Ok(Some(ref m)) if m.pinned
+        );
+        let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
+        // Compute the conflict decision once. The check is "is there a
+        // DIFFERENT page at this path?", which requires both the dest
+        // body and the source markdown — when either is missing, treat
+        // as no-conflict and let the copy loop's natural-path branch
+        // handle it (it'll either supersede a no-op or skip with a
+        // missing-md guard).
+        let dest_conflict = matches!(
+            (
+                state
+                    .reader
+                    .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
+                    .await,
+                &md,
+            ),
+            (Ok(Some(existing)), Some(md_ref))
+                if page_copy_differs(&existing, md_ref, &s.title, tier, pinned)
+        );
+        out.push(PreparedSourcePage {
+            path,
+            path_str: s.path.clone(),
+            title: s.title.clone(),
+            tier,
+            pinned,
+            md,
+            dest_conflict,
+        });
+    }
+    out
+}
+
+/// Execute the copy-purge merge once the destination has been
+/// resolved. Pulled out of `handle_move_project` so the orchestrator
+/// reads as "validate → branch → copy_purge_merge", and the copy
+/// loop's per-page IO runs through a pre-computed `PreparedSourcePage`
+/// instead of fetching the same metadata twice.
+// Merge-path orchestration: state + req + the four namespaced ids
+// (src/dst ws+proj) + pre-checkpoint + the authenticated actor. Bundling
+// the ids into a struct would obscure more than the arity warning, matching
+// the existing `#[allow]`s on the equivalent store-layer helpers.
+#[allow(clippy::too_many_arguments)]
+async fn copy_purge_merge(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    pre_checkpoint: Option<String>,
+    actor: engram_core::ActorContext,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Enumerate the source's latest pages (authoritative on is_latest).
+    let summaries = match state
+        .reader
+        .list_pages(&req.from_workspace, &req.project)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Single pass over the source: load each page's metadata + body
+    // AND classify the destination conflict, so the block pre-check
+    // and the copy loop don't re-query the same rows.
+    let prepared =
+        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+
+    // Under the default `block` policy, abort the WHOLE move now —
+    // before anything is copied — so the source stays intact and the
+    // operator resolves the conflicts or re-runs with an explicit
+    // overwrite/duplicate. Drives off the cached `dest_conflict_body`
+    // computed by `prepare_source_pages`.
+    if req.on_conflict == OnConflict::Block {
+        let blocking: Vec<String> = prepared
+            .iter()
+            .filter(|p| p.dest_conflict)
+            .map(|p| p.path_str.clone())
+            .collect();
+        if !blocking.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "destination already has pages at these paths with different content; \
+                              resolve them or re-run with on_conflict=overwrite or on_conflict=duplicate",
+                    "conflicts": blocking,
+                })),
+            );
+        }
+    }
+
+    // Carry the source page embeddings over verbatim instead of recomputing
+    // them — embedding is the dominant per-page cost of a bulk move. Writes go
+    // through an embedder-less Wiki so `write_page` never re-embeds; we then
+    // store each source vector against the new page id. Only embeddings
+    // computed with the CURRENTLY configured embedder ({provider,model,dim})
+    // are loaded (load_embeddings filters on them), so the "one model per
+    // index" invariant holds; any page lacking a current-model embedding is
+    // simply copied without one (backfill later via `engram embed`).
+    let copy_wiki = state.wiki.clone().without_embedder();
+    let mut src_embeddings: std::collections::HashMap<String, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let embed_meta: Option<(String, String, u32)> = if let Some(embedder) = &state.embedder {
+        let (provider, model, dim) = (
+            embedder.provider().to_string(),
+            embedder.model().to_string(),
+            embedder.dim(),
+        );
+        match state
+            .reader
+            .load_embeddings(src_ws, src_proj, provider.clone(), model.clone(), dim)
+            .await
+        {
+            Ok(rows) => {
+                // Rows arrive grouped by page in chunk_index order, so
+                // pushing preserves each page's chunk sequence.
+                for e in rows {
+                    src_embeddings
+                        .entry(e.path.to_string())
+                        .or_default()
+                        .push(f32_vec_to_bytes(&e.vector));
+                }
+                Some((provider, model, dim))
+            }
+            Err(e) => {
+                warn!(error = %e, "move-project: failed to load source embeddings; copies land without vectors");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // COPY each page through the (embedder-less) write path so sanitization,
+    // link re-resolution, FTS upsert (and admission/git-mirror on deploy) all
+    // fire — minus the per-page embed, which we carry over below. Drives off
+    // the prebuilt `PreparedSourcePage` vec so each page is read at most
+    // once across the whole merge (the previous version re-fetched in the
+    // pre-scan + the copy loop for Block-policy callers).
+    let mut pages_copied = 0u64;
+    let mut pages_skipped: Vec<String> = Vec::new();
+    let mut conflicts: Vec<PathConflict> = Vec::new();
+    let mut used_dest_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in prepared {
+        let Some(md) = p.md else {
+            // Either the path was unparseable or `read_page` failed —
+            // either way we cannot copy it. The presence of a skip
+            // here aborts the purge below.
+            warn!(
+                path = %p.path_str,
+                "move-project: source page unreadable or invalid path; skipping"
+            );
+            pages_skipped.push(p.path_str.clone());
+            continue;
+        };
+        // Apply the on_conflict policy using the cached classification.
+        // `block` was already handled by the pre-scan above so we never
+        // get here with `dest_conflict == true` AND `policy == Block`.
+        let dest_path = if p.dest_conflict {
+            match req.on_conflict {
+                OnConflict::Duplicate => {
+                    let deduped = dedup_dest_path(
+                        state,
+                        dst_ws,
+                        dst_proj,
+                        &p.path_str,
+                        &req.from_workspace,
+                        &used_dest_paths,
+                    )
+                    .await;
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: deduped.as_str().to_string(),
+                    });
+                    deduped
+                }
+                OnConflict::Overwrite => {
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: p.path_str.clone(),
+                    });
+                    p.path.clone()
+                }
+                OnConflict::Block => p.path.clone(), // unreachable
+            }
+        } else if used_dest_paths.contains(p.path_str.as_str()) {
+            // The natural path is already claimed by an earlier
+            // de-duplicated page; pick another to avoid clobbering it.
+            let deduped = dedup_dest_path(
+                state,
+                dst_ws,
+                dst_proj,
+                &p.path_str,
+                &req.from_workspace,
+                &used_dest_paths,
+            )
+            .await;
+            conflicts.push(PathConflict {
+                path: p.path_str.clone(),
+                moved_to: deduped.as_str().to_string(),
+            });
+            deduped
+        } else {
+            p.path.clone()
+        };
+        used_dest_paths.insert(dest_path.as_str().to_string());
+        let new_page_id = match copy_wiki
+            .write_page(WritePageRequest {
+                workspace_id: dst_ws,
+                project_id: dst_proj,
+                path: dest_path.clone(),
+                frontmatter: md.frontmatter,
+                body: md.body,
+                tier: p.tier,
+                pinned: p.pinned,
+                // Preserve the stored title verbatim (PageSummary.title is
+                // the DB-derived title), rather than re-deriving it.
+                title: Some(p.title.clone()),
+                // None → the write_page admission chain resolves the
+                // workspace/project NAMES from the destination IDs, so the
+                // git-mirror lands the copy under the destination path.
+                admission_ctx: None,
+                author_id: None,
+                actor: actor.clone(),
+            })
+            .await
+        {
+            Ok(pid) => pid,
+            // ANY copy failure aborts BEFORE the purge — the source survives.
+            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
+        };
+        // Carry the source embedding chunk set over (skip the re-embed)
+        // when the source had one for the current model.
+        if let (Some((provider, model, dim)), Some(chunks)) =
+            (&embed_meta, src_embeddings.get(&p.path_str))
+            && let Err(e) = state
+                .writer
+                .store_embedding(
+                    new_page_id,
+                    chunks.clone(),
+                    provider.clone(),
+                    model.clone(),
+                    *dim,
+                )
+                .await
+        {
+            warn!(path = %p.path_str, error = %e, "move-project: failed to carry embedding; page copied without it");
+        }
+        pages_copied += 1;
+    }
+
+    // Safety: a skipped (unreadable) source page blocks the purge — purging
+    // now would destroy data we failed to copy. Report and let the operator
+    // fix + re-run (re-running is idempotent: copied pages just supersede).
+    if !pages_skipped.is_empty() {
+        let checkpoint = checkpoint_or_warn(
+            &state.wiki,
+            format!(
+                "move-project-partial {}/{} -> {}/{}",
+                req.from_workspace, req.project, req.to_workspace, req.project
+            ),
+        );
+        let report = MoveProjectReport {
+            from: format!("{}/{}", req.from_workspace, req.project),
+            to: format!("{}/{}", req.to_workspace, req.project),
+            // copy_purge_merge is only reached from the merge branch
+            // of handle_move_project; the destination project pre-existed.
+            merged_into_existing: true,
+            moved_via: "copy-purge",
+            pages_copied,
+            pages_skipped,
+            source_purged: false,
+            source_pages_deleted: 0,
+            source_sessions_deleted: 0,
+            source_observations_deleted: 0,
+            source_handoffs_deleted: 0,
+            source_embeddings_deleted: 0,
+            files_deleted: Vec::new(),
+            files_failed: Vec::new(),
+            conflicts,
+            pre_checkpoint,
+            checkpoint,
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    // PURGE the source — only reached when every page copied successfully.
+    // Admission must run BEFORE the DB destruction so a `failure_policy =
+    // reject` webhook can still abort the second leg of the move while the
+    // source is intact (mirrors `handle_purge_project`'s ordering). The
+    // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
+    // which ran admit AFTER the rows were gone — reject came too late.
+    let label = format!("{}/{}", req.from_workspace, req.project);
+    let purge_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(src_ws, src_proj, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove the source's on-disk dir, then dispatch the non-blocking
+    // purge webhook. Pass the workspace/project NAMES we cached in
+    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
+    // name-resolution lookup at dispatch time would find nothing.
+    let proj_root_str = state
+        .wiki
+        .project_root(src_ws, src_proj)
+        .display()
+        .to_string();
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_failed: Vec<String> = Vec::new();
+    match state.wiki.remove_project_dir(src_ws, src_proj).await {
+        Ok(()) => files_deleted.push(proj_root_str),
+        Err(e) => {
+            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
+            files_failed.push(proj_root_str);
+        }
+    }
+    // See `handle_purge_project` for the rationale on `partial_failure`.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+
+    // The source project_id was just purged; if it was the published active
+    // project, the pointer now dangles — clear it so the next hook re-resolves
+    // to the (new) project rather than the deleted id.
+    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
+        state.active_project.clear();
+    }
+    // Proactively drop any stale per-cwd cache entry for the purged source
+    // project (its project_id no longer exists).
+    if let Some(evict) = &state.on_project_moved {
+        evict(src_proj);
+    }
+
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "copy-purge move: scope-manifest backfill failed after move");
+    }
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "move-project {}/{} -> {}/{}",
+            req.from_workspace, req.project, req.to_workspace, req.project
+        ),
+    );
+
+    let report = MoveProjectReport {
+        from: label,
+        to: format!("{}/{}", req.to_workspace, req.project),
+        // copy_purge_merge is only reached from the merge branch.
+        merged_into_existing: true,
+        moved_via: "copy-purge",
+        pages_copied,
+        pages_skipped: Vec::new(),
+        source_purged: true,
+        source_pages_deleted: summary.pages_deleted,
+        source_sessions_deleted: summary.sessions_deleted,
+        source_observations_deleted: summary.observations_deleted,
+        source_handoffs_deleted: summary.handoffs_deleted,
+        source_embeddings_deleted: summary.embeddings_deleted,
+        files_deleted,
+        files_failed,
+        conflicts,
+        pre_checkpoint,
+        checkpoint,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// write-page
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/write-page`.
+#[derive(Deserialize)]
+struct WritePageAdminRequest {
+    /// Workspace name (auto-created if absent).
+    workspace: String,
+    /// Project name (auto-created if absent).
+    project: String,
+    /// Relative wiki path (e.g. `concepts/foo.md`).
+    path: String,
+    /// Markdown body. The server frames it with frontmatter; pass plain body content.
+    body: String,
+    /// Optional title; derived from first H1 or path stem when absent.
+    #[serde(default)]
+    title: Option<String>,
+    /// Semantic kind (`fact`, `rule`, `decision`, `gotcha`). Stored in
+    /// the page frontmatter; the reader falls back to a path-derived
+    /// kind when absent.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Tier name (`working`, `episodic`, `semantic`, `procedural`).
+    /// When absent, the page keeps the `tier` of the frontmatter base
+    /// (existing page or passthrough), falling back to `semantic`.
+    #[serde(default)]
+    tier: Option<String>,
+    /// Tags to attach to the page.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Pin the page so the decay sweep skips it.
+    #[serde(default)]
+    pinned: bool,
+    /// Full frontmatter passthrough. When present, this map is the
+    /// authoritative base — keys omitted here are dropped from the
+    /// page. When absent, the existing page's frontmatter is the base,
+    /// so a body-only edit preserves custom keys (`source`, `status`,
+    /// … on migrated pages). Either way the dedicated fields above
+    /// (`title`/`kind`/`tags`/`pinned`/`tier`) override their
+    /// frontmatter keys when provided.
+    #[serde(default)]
+    frontmatter: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// JSON response body for `POST /admin/write-page`.
+#[derive(Serialize)]
+struct WritePageResponse {
+    /// UUID of the written page.
+    page_id: String,
+    /// Canonical wiki path.
+    path: String,
+    /// Post-write checkpoint, if the write changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+async fn handle_write_page(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<WritePageAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Validate an explicitly supplied tier before any side effects
+    // (workspace/project auto-create, existing-page read).
+    let explicit_tier: Option<Tier> = match req.tier.as_deref() {
+        None => None,
+        Some(s) => Some(s.parse().map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("unknown tier '{s}'")
+                })),
+            )
+        })?),
+    };
+
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+
+    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+
+    // Frontmatter base: explicit passthrough wins; otherwise the
+    // existing page's frontmatter, so a body-only edit cannot strip
+    // custom keys. A read failure just means a new page → empty base.
+    let mut fm = match req.frontmatter {
+        Some(map) => map,
+        None => match state.wiki.read_page(ws, proj, &path) {
+            Ok(md) => match md.frontmatter {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            },
+            Err(_) => serde_json::Map::new(),
+        },
+    };
+    // Attribution is stamped fresh by `Wiki::write_page` from the
+    // resolved actor; a stale block must not survive the merge.
+    fm.remove("last_modified_by");
+    if let Some(title) = &req.title {
+        fm.insert("title".into(), serde_json::Value::String(title.clone()));
+    }
+    if let Some(kind) = req.kind.as_deref() {
+        let kind = kind.trim();
+        if !kind.is_empty() {
+            fm.insert("kind".into(), serde_json::Value::String(kind.to_string()));
+        }
+    }
+    if !req.tags.is_empty() {
+        fm.insert(
+            "tags".into(),
+            serde_json::Value::Array(
+                req.tags
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if req.pinned {
+        fm.insert("pinned".into(), serde_json::Value::Bool(true));
+    }
+    // No explicit tier → keep the base's tier (existing page or
+    // passthrough); `semantic` only for pages without one.
+    let tier = match explicit_tier {
+        Some(t) => t,
+        None => match fm.get("tier").and_then(serde_json::Value::as_str) {
+            None => Tier::Semantic,
+            Some(s) => s.parse().map_err(|_| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": format!("unknown tier '{s}' in frontmatter")
+                    })),
+                )
+            })?,
+        },
+    };
+    let frontmatter = if fm.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(fm)
+    };
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+    let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+        Some(AdmissionContext {
+            op: AdmissionOp::WritePage,
+            skip_webhooks,
+            ..AdmissionContext::default()
+        })
+    } else {
+        None
+    };
+
+    let page_id = state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter,
+            body: req.body,
+            tier,
+            pinned: req.pinned,
+            title: req.title,
+            admission_ctx,
+            author_id,
+            actor,
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "write-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(WritePageResponse {
+                page_id: page_id.to_string(),
+                path: path.to_string(),
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// delete-page
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/delete-page`.
+///
+/// Unlike `memory_delete_page` (MCP), this endpoint REQUIRES explicit
+/// `workspace` so cross-workspace ambiguity can never silently route a
+/// delete to the wrong slot.
+#[derive(Deserialize)]
+struct DeletePageAdminRequest {
+    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    workspace: String,
+    /// Project name within the workspace. Required.
+    project: String,
+    /// Relative wiki path (e.g. `concepts/foo.md`).
+    path: String,
+}
+
+/// JSON response body for `POST /admin/delete-page`.
+#[derive(Serialize)]
+struct DeletePageResponse {
+    /// Canonical wiki path of the deletion target.
+    path: String,
+    /// Always `true` on a successful (resolved-scope) call. `Wiki::delete_page`
+    /// itself is idempotent — a missing file is treated as already-deleted —
+    /// so the boolean reports "the call succeeded", not "a row was removed".
+    /// The structural defense is in the 404 returned when `(workspace, project)`
+    /// fails to resolve (so a stale or wrong-scope call never returns a misleading
+    /// `deleted: true`).
+    deleted: bool,
+    /// Pre-delete checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_checkpoint: Option<String>,
+    /// Post-delete checkpoint, if the delete changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+async fn handle_delete_page(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<DeletePageAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+
+    // Use the no-create lookup (same as purge/rename/move): a delete on a
+    // typo'd workspace/project must return 404, NOT silently auto-create
+    // empty containers and then return `deleted: true` for nothing.
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let pre_checkpoint = checkpoint_or_500(
+        &state.wiki,
+        format!(
+            "pre-delete-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    )?;
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+    let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+        Some(AdmissionContext {
+            actor,
+            op: AdmissionOp::Delete,
+            skip_webhooks,
+            ..AdmissionContext::default()
+        })
+    } else {
+        None
+    };
+
+    state
+        .wiki
+        .delete_page(ws, proj, &path, admission_ctx)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "delete-page {}/{}: {}",
+            req.workspace,
+            req.project,
+            path.as_str()
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(DeletePageResponse {
+                path: path.to_string(),
+                deleted: true,
+                pre_checkpoint,
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// user management (root-only)
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/users`.
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// JSON response for `POST /admin/users` and `…/rotate-token`.
+/// Carries the plaintext token EXACTLY once — the client (CLI or
+/// admin browser) must surface it to the operator and never persist
+/// it; only the SHA-256 digest is kept in the DB. Subsequent reads
+/// (`GET /admin/users`) omit the token field entirely.
+#[derive(Debug, Serialize)]
+struct UserWithTokenResponse {
+    user: engram_core::User,
+    token: String,
+}
+
+/// JSON response for `GET /admin/users` and lifecycle ops that don't
+/// issue a new token (expire, revive).
+#[derive(Debug, Serialize)]
+struct UserResponse {
+    user: engram_core::User,
+}
+
+/// JSON response for `GET /admin/users`.
+#[derive(Debug, Serialize)]
+struct UserListResponse {
+    users: Vec<engram_core::User>,
+}
+
+/// Gate any handler in this section on a root-level request. Returns
+/// the matching error response for the actor's tier (401 anonymous,
+/// 403 user) or `Ok(())` for root.
+fn require_root(
+    level: engram_core::AuthLevel,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    level
+        .authorize(Capability::UserManagement, true)
+        .map_err(|e| {
+            (
+                authz_status(e),
+                Json(serde_json::json!({ "error": e.message() })),
+            )
+        })
+}
+
+/// Get the active token-pepper. Returns 503 when multi-user wasn't
+/// configured — same shape as `/admin/embed` returns when no embedder
+/// is wired.
+fn require_pepper(
+    state: &AdminState,
+) -> Result<&engram_store::TokenPepper, (StatusCode, Json<serde_json::Value>)> {
+    state.token_pepper.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "multi-user not enabled (set [auth].token_pepper in config or run `engram init`)"
+            })),
+        )
+    })
+}
+
+/// Handler for `POST /admin/users`.
+///
+/// Validates the input, generates a fresh 32-byte token, hashes it with
+/// the per-server pepper, and inserts the row. Returns
+/// `UserWithTokenResponse` so the caller can display the plaintext
+/// token exactly once.
+async fn handle_create_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<engram_core::AuthLevel>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let pepper = require_pepper(&state)?;
+
+    let mut new_user = engram_core::NewUser {
+        username: req.username,
+        name: req.name,
+        email: req.email,
+    };
+    new_user
+        .validate()
+        .map_err(|e| validation_error(e.to_string()))?;
+
+    let token = engram_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = engram_store::hash_token(&token, pepper);
+
+    let user_id = state
+        .writer
+        .create_user(new_user.clone(), token_hash)
+        .await
+        .map_err(map_user_store_err)?;
+
+    // Round-trip through the reader so we surface the same canonical
+    // shape `GET /admin/users` returns (incl. created_at).
+    let user = state
+        .reader
+        .find_user_by_id(user_id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
+    ))
+}
+
+/// Handler for `GET /admin/users`. Includes users with expired tokens
+/// (the response's `token_expired_at` field distinguishes them); the
+/// CLI list renderer shows an "expired" flag.
+async fn handle_list_users(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<engram_core::AuthLevel>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let users = state
+        .reader
+        .list_users()
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserListResponse { users }).unwrap_or_default()),
+    ))
+}
+
+/// Handler for `POST /admin/users/:username/expire`. Idempotent: the
+/// first call stamps `token_expired_at = now()`, subsequent calls
+/// leave the original timestamp untouched (via COALESCE in the store).
+async fn handle_expire_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<engram_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .expire_user_token(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    // Re-read to surface the new token_expired_at in the response.
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after expire".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+/// Handler for `POST /admin/users/:username/revive`. Clears
+/// `token_expired_at`. Idempotent (revive on an active user is a no-op).
+async fn handle_revive_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<engram_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .revive_user_token(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after revive".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+/// Handler for `POST /admin/users/:username/rotate-token`. Issues a
+/// fresh token, hashes it with the server pepper, replaces the row's
+/// `token_hash`, and implicitly clears `token_expired_at` (rotating
+/// makes the new token usable immediately even if the prior one was
+/// expired). Returns the plaintext token once.
+async fn handle_rotate_user_token(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<engram_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let pepper = require_pepper(&state)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+
+    let token = engram_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = engram_store::hash_token(&token, pepper);
+
+    let updated = state
+        .writer
+        .rotate_user_token(user.id, token_hash)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "user vanished mid-rotation" })),
+        ));
+    }
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after rotate".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
+    ))
+}
+
+/// Shared lookup helper: 404 when the user doesn't exist, else returns
+/// the row. Used by every per-username handler so error shapes stay
+/// uniform across `expire` / `revive` / `rotate-token`.
+async fn lookup_user_by_username(
+    state: &AdminState,
+    username: &str,
+) -> Result<engram_core::User, (StatusCode, Json<serde_json::Value>)> {
+    let found = state
+        .reader
+        .find_user_by_username(username.to_string())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    found.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no such user: {username}") })),
+        )
+    })
+}
+
+/// Convert a username/email validation error into a 400 response.
+fn validation_error(msg: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": msg })),
+    )
+}
+
+/// Map StoreError to the right HTTP status. UNIQUE violations on
+/// username / email become 409; everything else is a 500.
+fn map_user_store_err(e: engram_store::StoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        engram_store::StoreError::Duplicate(msg) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        engram_store::StoreError::Memory(engram_core::MemoryError::InvalidUsername(msg))
+        | engram_store::StoreError::Memory(engram_core::MemoryError::InvalidEmail(msg)) => {
+            validation_error(msg)
+        }
+        other => internal_err(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use engram_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use engram_llm::{ChatRequest, ChatResponse, LlmResult};
+    use engram_store::Store;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    struct FakeAutoImproveLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeAutoImproveLlm {
+        fn name(&self) -> &'static str {
+            "fake-auto-improve"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "two staged proposals",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "_slots/current-focus.md",
+                        "title": "Current Focus",
+                        "kind": "slot",
+                        "confidence": 0.95,
+                        "rationale": "The current focus should be updated from the session.",
+                        "evidence": [{"page":"session", "quote":"focus changed"}],
+                        "body_markdown": "# Current Focus\n\nupdated focus proposal"
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/new-auto-improve.md",
+                        "title": "New Auto Improve Lesson",
+                        "kind": "note",
+                        "confidence": 0.93,
+                        "rationale": "The session contains a durable lesson worth adding.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# New Auto Improve Lesson\n\nnew page proposal"
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_provider_health_block() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["providers"]["llm"]["status"], "disabled");
+        assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    fn read_page_test_router() -> (TempDir, Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+        (tmp, router)
+    }
+
+    fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
+        admin_state_for_store_with_llm(tmp, store, wiki, None)
+    }
+
+    fn admin_state_for_store_with_llm(
+        tmp: &TempDir,
+        store: &Store,
+        wiki: Wiki,
+        llm: Option<Arc<dyn LlmProvider>>,
+    ) -> AdminState {
+        AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        }
+    }
+
+    async fn stage_pending_write(
+        store: &Store,
+        workspace: &str,
+        project: &str,
+        path: &str,
+        body: &str,
+    ) -> (WorkspaceId, ProjectId, AutoImproveProposalId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace(workspace)
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .unwrap();
+        let staged = store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("summary".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({"mode":"stage"}),
+                proposal_actor: engram_core::ActorContext {
+                    agent: Some("auto_improve".into()),
+                    ..engram_core::ActorContext::default()
+                },
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new(path).unwrap(),
+                    kind: "note".into(),
+                    title: "Pending title".into(),
+                    confidence: 0.9,
+                    rationale: "rationale".into(),
+                    evidence_json: serde_json::json!([{"source":"test"}]),
+                    body_markdown: body.into(),
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+        (ws, proj, staged.proposal_ids[0])
+    }
+
+    async fn post_write_page(router: &Router, ws: &str, project: &str, path: &str, body: &str) {
+        post_write_page_with_actor(router, ws, project, path, body, None).await;
+    }
+
+    async fn post_write_page_with_actor(
+        router: &Router,
+        ws: &str,
+        project: &str,
+        path: &str,
+        body: &str,
+        actor: Option<&'static str>,
+    ) {
+        let req_body = serde_json::json!({
+            "workspace": ws,
+            "project": project,
+            "path": path,
+            "body": body,
+            "title": "Read-back fixture",
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/admin/write-page")
+            .header("content-type", "application/json");
+        if let Some(user) = actor {
+            builder = builder.extension(engram_core::ActorContext {
+                user: Some(user.into()),
+                ..engram_core::ActorContext::default()
+            });
+        }
+        let resp = router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "write-page setup failed");
+    }
+
+    #[tokio::test]
+    async fn read_page_path_mode_returns_full_body() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "audit", "notes/foo.md", "hello body").await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/foo.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "notes/foo.md");
+        assert_eq!(json["title"], "Read-back fixture");
+        assert!(
+            json["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hello body"),
+            "body must round-trip; got {:?}",
+            json["body"]
+        );
+        assert_eq!(json["workspace"], "default");
+        assert_eq!(json["project"], "audit");
+    }
+
+    #[tokio::test]
+    async fn auto_improve_requires_llm_provider() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "audit", None)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "audit",
+                            "session_id": "00000000-0000-0000-0000-000000000000"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LLM provider not configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_missing_scope_does_not_fall_back_before_llm_check() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "missing",
+                            "project": "missing",
+                            "session_id": "00000000-0000-0000-0000-000000000000"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_contamination_partial_scope_fails_closed() {
+        let (_tmp, router) = read_page_test_router();
+
+        for uri in [
+            "/admin/audit-contamination?workspace=default",
+            "/admin/audit-contamination?project=engram",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("workspace and project must be provided together")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_improve_auto_approves_by_default_and_uses_concrete_operations() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: engram_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "focus changed and durable lesson".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["approval_required"], false);
+        assert_eq!(json["approval_policy"], "auto_approve");
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 2);
+        for proposal in proposals {
+            assert_eq!(proposal["status"], "approved");
+            assert!(proposal["page_id"].as_str().is_some());
+            let path = proposal["sidecar_path"].as_str().unwrap();
+            assert!(
+                std::path::Path::new(path).exists(),
+                "sidecar file must be written: {path}"
+            );
+        }
+
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Approved), 10)
+            .await
+            .unwrap();
+        assert_eq!(staged.len(), 2, "DB proposal rows must be approved");
+        let slot = staged
+            .iter()
+            .find(|p| p.target_path.as_str() == "_slots/current-focus.md")
+            .expect("slot proposal staged");
+        let note = staged
+            .iter()
+            .find(|p| p.target_path.as_str() == "notes/new-auto-improve.md")
+            .expect("note proposal staged");
+        assert_eq!(slot.operation, AutoImproveProposalOperation::Update);
+        assert_eq!(note.operation, AutoImproveProposalOperation::Create);
+
+        let existing = store
+            .reader
+            .page_body_by_ids(ws, proj, "_slots/current-focus.md")
+            .await
+            .unwrap()
+            .expect("existing target remains present");
+        assert_eq!(existing.body, "# Current Focus\n\nupdated focus proposal");
+        let note_page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/new-auto-improve.md")
+            .await
+            .unwrap()
+            .expect("auto-approve writes absent target page");
+        assert_eq!(
+            note_page.body,
+            "# New Auto Improve Lesson\n\nnew page proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "focus changed and durable lesson".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.auto_improve_review_config.eval = engram_consolidate::AutoImproveEvalConfig {
+            enabled: true,
+            command: String::new(),
+            timeout_secs: 1,
+            targets: vec!["notes".into()],
+            min_delta: 0.0,
+        };
+        let router = admin_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rejected_candidates_count"], 1);
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_require_approval_keeps_proposals_pending() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "durable lesson".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.auto_improve_require_approval = true;
+        let router = admin_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["approval_required"], true);
+        assert_eq!(json["approval_policy"], "manual");
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert!(proposals.iter().all(|p| p["status"] == "pending"));
+
+        let pending = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/new-auto-improve.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "manual approval mode must not write target pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_removed_mode_fields_fail_closed() {
+        let (_tmp, router) = read_page_test_router();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": "00000000-0000-0000-0000-000000000000",
+                            "dry_run": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("removed")
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_dry_run_returns_report_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/curator")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workspace"], "default");
+        assert_eq!(json["project"], "scratch");
+        assert_eq!(json["dry_run"], true);
+        assert!(json["findings"].as_array().unwrap().is_empty());
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dry-run must not stage proposals"
+        );
+        assert!(
+            store
+                .reader
+                .list_pages("default", "scratch")
+                .await
+                .unwrap()
+                .is_empty(),
+            "dry-run must not write pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_stage_creates_one_report_proposal_and_approval_writes_report_only() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/curator")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "stage": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let proposal_ids = json["proposal_ids"].as_array().unwrap();
+        assert_eq!(proposal_ids.len(), 1);
+        let sidecar_paths = json["sidecar_paths"].as_array().unwrap();
+        assert_eq!(sidecar_paths.len(), 1);
+        let sidecar_path = sidecar_paths[0].as_str().unwrap();
+        assert!(std::path::Path::new(sidecar_path).exists());
+
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(staged.len(), 1);
+        let summary = &staged[0];
+        assert_eq!(summary.kind, "curator_report");
+        assert_eq!(summary.title, "Curator Report");
+        assert_eq!(summary.operation, AutoImproveProposalOperation::Create);
+        assert!(summary.target_path.as_str().starts_with("notes/curator-"));
+        assert!(summary.target_path.as_str().ends_with(".md"));
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, summary.target_path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "stage must not write target page"
+        );
+
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, summary.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.events[0].event, "staged");
+        assert_eq!(detail.events[0].actor_json["agent"], "curator");
+        assert!(detail.body_markdown.starts_with("# Curator Report"));
+        assert!(detail.body_markdown.contains("Report-only"));
+
+        let approve_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{}/approve?workspace=default&project=scratch",
+                        summary.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve_resp.status(), StatusCode::OK);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, summary.target_path.as_str())
+            .await
+            .unwrap()
+            .expect("approval writes curator report page");
+        assert!(page.body.starts_with("# Curator Report"));
+        assert_eq!(
+            store
+                .reader
+                .list_pages("default", "scratch")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_writes_list_detail_diff_and_reject_use_stored_proposal() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws, _proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/pending.md",
+            "# Pending\n\nproposed body",
+        )
+        .await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let list_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/pending-writes?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], proposal_id.to_string());
+        assert_eq!(list[0]["status"], "pending");
+
+        let detail_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let body = to_bytes(detail_resp.into_body(), usize::MAX).await.unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["summary"]["target_path"], "notes/pending.md");
+        assert_eq!(detail["body_markdown"], "# Pending\n\nproposed body");
+
+        let diff_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diff_resp.status(), StatusCode::OK);
+        let body = to_bytes(diff_resp.into_body(), usize::MAX).await.unwrap();
+        let diff: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(diff["diff"].as_str().unwrap().contains("proposed body"));
+
+        let reject_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                    ))
+                    .header("content-type", "application/json")
+                    .extension(engram_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..engram_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(_ws, _proj, "notes/pending.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "reject must not write the target page"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_approve_writes_stored_body() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/approved.md",
+            "# Stored\n\nfrom stored proposal",
+        )
+        .await;
+        wiki.write_auto_improve_sidecar(ws, proj, proposal_id)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                    ))
+                    .extension(engram_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..engram_core::ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/approved.md")
+            .await
+            .unwrap()
+            .expect("approve writes target page");
+        assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
+    }
+
+    #[tokio::test]
+    async fn read_page_missing_path_returns_404() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/nope.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn read_page_traversal_rejected_with_400() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=../etc/passwd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn read_page_without_path_or_query_returns_400() {
+        let (_tmp, router) = read_page_test_router();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Bug E regression: purge deletes the project's DB rows first, so by the
+    /// time the admission chain fires, name-resolution from the (now gone)
+    /// project row would yield an empty name and a name-based mirror would
+    /// purge the wrong path. The handler must seed the admission context with
+    /// the request's workspace/project names. We capture the `purge_project`
+    /// webhook and assert it carries the real project name.
+    #[tokio::test]
+    async fn purge_project_admission_carries_the_project_name() {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use engram_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let app = Router::new().route(
+            "/sync",
+            post(
+                move |headers: HeaderMap, Json(payload): Json<serde_json::Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        if headers.get("X-Memory-Op").and_then(|v| v.to_str().ok())
+                            == Some("purge_project")
+                        {
+                            *cap.lock().unwrap() = Some(
+                                payload["ctx"]["project"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "mirror".into(),
+            url: format!("{base}/sync"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Ignore,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "doomed",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "purge should succeed");
+
+        // Let the async notify land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("doomed"),
+            "purge admission must carry the real project name, not an empty/_unscoped placeholder"
+        );
+    }
+
+    /// Scope-guard / attribution regression: a destructive admin op must carry
+    /// the authenticated actor into the admission context, so a scope-guard
+    /// webhook can authorize by user. In prod a purge ran with an empty actor
+    /// (`AdmissionContext { ..Default::default() }`) and scope-guard rejected it
+    /// with `403 user '' not allowed to purge_project`.
+    #[tokio::test]
+    async fn purge_project_admission_carries_the_actor() {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use engram_core::ActorContext;
+        use engram_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let app = Router::new().route(
+            "/sync",
+            post(
+                move |headers: HeaderMap, Json(payload): Json<serde_json::Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        if headers.get("X-Memory-Op").and_then(|v| v.to_str().ok())
+                            == Some("purge_project")
+                        {
+                            *cap.lock().unwrap() = Some(
+                                payload["ctx"]["actor"]["user"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "mirror".into(),
+            url: format!("{base}/sync"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Ignore,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "doomed",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "purge should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("alice"),
+            "purge admission must carry the authenticated actor (empty actor → scope-guard 403 in prod)"
+        );
+    }
+
+    /// End-to-end reproduction of the prod scope-guard scenario: a
+    /// `Reject`-policy admission webhook that authorizes `purge_project` by
+    /// `ctx.actor.user` (the real scope-guard shape). Before the fix the handler
+    /// sent an empty actor, so the guard returned 403 and the purge 500'd; with
+    /// the actor propagated, a matching user is allowed and the purge succeeds.
+    /// Both branches run in one test so the second (allowed) purge returning
+    /// `200` — not `404` — also proves the first (denied) purge left the project
+    /// intact.
+    #[tokio::test]
+    async fn scope_guard_blocks_purge_without_actor_allows_with_actor() {
+        use axum::routing::post;
+        use engram_core::ActorContext;
+        use engram_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+
+        // scope-guard emulation: allow `purge_project` only when the admission
+        // payload's actor is "alice"; deny (403) otherwise.
+        let app = Router::new().route(
+            "/guard",
+            post(|Json(payload): Json<serde_json::Value>| async move {
+                if payload["ctx"]["actor"]["user"].as_str() == Some("alice") {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "scope-guard".into(),
+            url: format!("{base}/guard"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
+
+        let purge_req = |actor: Option<&'static str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/admin/purge-project")
+                .header("content-type", "application/json");
+            if let Some(user) = actor {
+                builder = builder.extension(ActorContext {
+                    user: Some(user.into()),
+                    ..ActorContext::default()
+                });
+            }
+            builder
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "workspace": "default",
+                        "project": "doomed",
+                        "confirm": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+
+        // Case A — empty actor → scope-guard 403 → handler 500, project intact.
+        let denied = router.clone().oneshot(purge_req(None)).await.unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "empty actor must be rejected by scope-guard (the prod bug)"
+        );
+
+        // Case B — actor=alice → scope-guard 204 → purge succeeds (200). A 200
+        // here (not 404) also proves Case A left the project intact.
+        let allowed = router
+            .clone()
+            .oneshot(purge_req(Some("alice")))
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.status(),
+            StatusCode::OK,
+            "matching actor must be authorized and the purge succeed"
+        );
+    }
+
+    /// Merge moves copy source pages through `Wiki::write_page` before purging
+    /// the source. That copy path must carry the authenticated actor too;
+    /// otherwise a scope-guard webhook that gates `write_page` by user still
+    /// rejects `/admin/move-project` even though purge/move admission was fixed.
+    #[tokio::test]
+    async fn move_project_merge_copy_admission_carries_the_actor() {
+        use axum::routing::post;
+        use engram_core::ActorContext;
+        use engram_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+
+        let app = Router::new().route(
+            "/guard",
+            post(|Json(payload): Json<serde_json::Value>| async move {
+                if payload["ctx"]["actor"]["user"].as_str() == Some("alice") {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "scope-guard".into(),
+            url: format!("{base}/guard"),
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+
+        post_write_page_with_actor(
+            &router,
+            "src",
+            "merged",
+            "notes/source.md",
+            "source body",
+            Some("alice"),
+        )
+        .await;
+        // Same project name in the destination workspace forces the copy-purge
+        // merge path instead of the true-move path.
+        post_write_page_with_actor(
+            &router,
+            "dst",
+            "merged",
+            "notes/existing.md",
+            "existing body",
+            Some("alice"),
+        )
+        .await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from_workspace": "src",
+                            "project": "merged",
+                            "to_workspace": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "merge move should succeed");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["merged_into_existing"], true);
+        assert_eq!(json["moved_via"], "copy-purge");
+        assert_eq!(json["source_purged"], true);
+    }
+
+    // ── user-management endpoints (P1.4) ──────────────────────────
+
+    /// Test router that has a token pepper configured (so user-management
+    /// endpoints don't return 503), runs the standard auth middleware
+    /// upstream so `Extension<AuthLevel>` is populated, and is reachable
+    /// as Root via a fixed bearer token.
+    fn user_admin_test_router(root_token: &'static str) -> (TempDir, Router) {
+        use engram_core::ActorContext;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let pepper = engram_store::TokenPepper::new("test-pepper-admin");
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(pepper),
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+        // Wrap in a middleware that stamps the AuthLevel ourselves —
+        // the real auth middleware lives in engram-cli, and this
+        // crate can't depend on it. The wrapper matches the Bearer
+        // header against `root_token`: match → Root, present-but-no-
+        // match → User (so we can test 403), absent → Anonymous.
+        let router = router.layer(axum::middleware::from_fn(
+            move |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let bearer = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.strip_prefix("Bearer "))
+                    .map(str::to_string);
+                let level = match bearer.as_deref() {
+                    Some(t) if t == root_token => engram_core::AuthLevel::Root,
+                    Some(_) => engram_core::AuthLevel::User,
+                    None => engram_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+        (tmp, router)
+    }
+
+    async fn post_create_user(
+        router: &Router,
+        root_token: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn admin_route_samples() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+        vec![
+            ("POST", "/admin/backup", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/bootstrap",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "sources": [],
+                    "dry_run": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/auto-improve",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": "00000000-0000-0000-0000-000000000000",
+                    "dry_run": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/auto-improve/report",
+                serde_json::json!({"workspace": "default", "project": "scratch"}),
+            ),
+            ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/audit-contamination", serde_json::Value::Null),
+            ("GET", "/admin/search?q=test", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/read-page?workspace=default&project=scratch&path=notes/x.md",
+                serde_json::Value::Null,
+            ),
+            ("POST", "/admin/reorg", serde_json::json!({"dry_run": true})),
+            (
+                "POST",
+                "/admin/lint",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/forget-sweep",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/embed",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/curator",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/commit",
+                serde_json::json!({"message": "test"}),
+            ),
+            ("GET", "/admin/checkpoints?limit=1", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/pending-writes?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/diff?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/approve?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/reject?workspace=default&project=scratch",
+                serde_json::json!({"reason": "no"}),
+            ),
+            (
+                "POST",
+                "/admin/restore-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md",
+                    "rev": "HEAD"
+                }),
+            ),
+            (
+                "POST",
+                "/admin/purge-project",
+                serde_json::json!({"workspace": "default", "project": "scratch", "confirm": true}),
+            ),
+            (
+                "POST",
+                "/admin/rename-project",
+                serde_json::json!({"workspace": "default", "from": "scratch", "to": "renamed"}),
+            ),
+            (
+                "POST",
+                "/admin/move-project",
+                serde_json::json!({
+                    "from_workspace": "default",
+                    "to_workspace": "archive",
+                    "project": "scratch",
+                    "confirm": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/write-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md",
+                    "body": "body"
+                }),
+            ),
+            (
+                "POST",
+                "/admin/delete-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md"
+                }),
+            ),
+            ("GET", "/admin/users", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/users",
+                serde_json::json!({"username": "alice"}),
+            ),
+            ("POST", "/admin/users/alice/expire", serde_json::Value::Null),
+            ("POST", "/admin/users/alice/revive", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/users/alice/rotate-token",
+                serde_json::Value::Null,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn multiuser_admin_routes_reject_db_user_tier() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+
+        for (method, uri, payload) in admin_route_samples() {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", "Bearer db-user-token");
+            let body = if payload.is_null() {
+                Body::empty()
+            } else {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&payload).unwrap())
+            };
+            let resp = router
+                .clone()
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must be root-only for DB users in multi-user mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiuser_admin_routes_reject_anonymous() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for (method, uri, payload) in admin_route_samples() {
+            let mut builder = Request::builder().method(method).uri(uri);
+            let body = if payload.is_null() {
+                Body::empty()
+            } else {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&payload).unwrap())
+            };
+            let resp = router
+                .clone()
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require authentication in multi-user mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiuser_operational_admin_routes_allow_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_user_happy_path_returns_token_once() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({
+                "username": "alice",
+                "name": "Alice Smith",
+                "email": "Alice@Example.com"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["username"], "alice");
+        // Email was normalised to lowercase by NewUser::validate.
+        assert_eq!(json["user"]["email"], "alice@example.com");
+        assert_eq!(json["user"]["name"], "Alice Smith");
+        // Plaintext token is surfaced exactly once — 43 chars (32 bytes
+        // URL-safe-base64).
+        let token = json["token"].as_str().unwrap();
+        assert_eq!(token.len(), 43);
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_duplicate_username_with_409() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        let resp = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_invalid_email_with_400() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice", "email": "not-an-email"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_user_as_anonymous_returns_401() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        // No Authorization header → middleware stamps Anonymous tier.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"username": "alice"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_user_as_user_tier_returns_403() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = post_create_user(
+            &router,
+            "not-the-root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn list_users_returns_added_users_in_insertion_order() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for n in ["alice", "bob", "carol"] {
+            let _ =
+                post_create_user(&router, "root-token", serde_json::json!({"username": n})).await;
+        }
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let users = json["users"].as_array().unwrap();
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0]["username"], "alice");
+        assert_eq!(users[1]["username"], "bob");
+        assert_eq!(users[2]["username"], "carol");
+        // Tokens are NEVER surfaced by the list endpoint.
+        for u in users {
+            assert!(u.get("token").is_none(), "list must not leak tokens");
+        }
+    }
+
+    #[tokio::test]
+    async fn expire_then_revive_round_trips() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+
+        // Expire.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/expire")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["user"]["token_expired_at"].is_i64());
+
+        // Revive.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/revive")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["user"]["token_expired_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn expire_unknown_user_returns_404() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/ghost/expire")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_issues_a_distinct_token() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let create_resp = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        let body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let original_token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/rotate-token")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let new_token = json["token"].as_str().unwrap();
+        assert_eq!(new_token.len(), 43);
+        assert_ne!(new_token, original_token, "rotate must change the token");
+    }
+
+    #[tokio::test]
+    async fn create_user_returns_503_when_pepper_not_configured() {
+        // Same as user_admin_test_router but with token_pepper = None,
+        // covering the "rung 1-only" backward-compat install.
+        use engram_core::ActorContext;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: engram_core::ActiveProject::new(),
+            on_project_moved: None,
+        });
+        // Inject a Root level so we're past the require_root gate;
+        // the 503 must come from require_pepper.
+        let router = router.layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(engram_core::AuthLevel::Root);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"username": "alice"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = tmp;
+    }
+
+    // ---------------------------------------------------------------------
+    // delete-page
+    // ---------------------------------------------------------------------
+
+    /// Helper: POST /admin/delete-page and return (status, body json).
+    async fn post_delete_page(
+        router: &Router,
+        ws: &str,
+        project: &str,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req_body = serde_json::json!({
+            "workspace": ws,
+            "project": project,
+            "path": path,
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn delete_page_removes_existing_page() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "audit", "notes/doomed.md", "bye body").await;
+
+        // Confirm the page is reachable before delete.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "setup precondition: page must exist before delete"
+        );
+
+        let (status, json) = post_delete_page(&router, "default", "audit", "notes/doomed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"], "notes/doomed.md");
+        assert_eq!(json["deleted"], true);
+
+        // Read-back must now 404.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/read-page?workspace=default&project=audit&path=notes/doomed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "page must be gone after delete"
+        );
+    }
+
+    /// A delete request whose `(workspace, project)` doesn't resolve to a
+    /// real `(WorkspaceId, ProjectId)` must NOT report success. The shared
+    /// `resolve_ws_proj` returns the unresolved-scope error; the handler
+    /// surfaces it as a 4xx/5xx — never as `deleted: true`. This guards the
+    /// Bug 5 regression where MCP `memory_delete_page` returned `true` for
+    /// a scope it never touched.
+    #[tokio::test]
+    async fn delete_page_unknown_workspace_does_not_fake_success() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, json) =
+            post_delete_page(&router, "no-such-ws", "audit", "notes/whatever.md").await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "delete on unresolved scope must not return 200/deleted=true; got body {json:?}",
+        );
+        assert!(
+            json.get("deleted").and_then(|v| v.as_bool()) != Some(true),
+            "body must not claim deleted=true on unresolved scope; got {json:?}"
+        );
+    }
+
+    /// `Wiki::delete_page` is idempotent for a path that doesn't exist
+    /// inside an EXISTING (workspace, project) — the file is just not there
+    /// to quarantine. The handler reports `deleted: true` (i.e. "the call
+    /// succeeded") rather than 404, matching the documented MCP semantics.
+    #[tokio::test]
+    async fn delete_page_idempotent_for_missing_file_in_existing_scope() {
+        let (_tmp, router) = read_page_test_router();
+        // Seed the project so (workspace, project) resolves, but skip the
+        // page we'll try to delete.
+        post_write_page(&router, "default", "audit", "notes/keep.md", "keeper").await;
+
+        let (status, json) =
+            post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_page_traversal_rejected_with_422() {
+        let (_tmp, router) = read_page_test_router();
+        let (status, _) = post_delete_page(&router, "default", "audit", "../etc/passwd").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}

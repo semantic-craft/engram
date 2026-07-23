@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Regenerate every hook script under hooks/*/*.sh.
+#
+# The 21 hook scripts (3 agents × 7 events) are nearly identical —
+# only the `event=` query string and the agent name in comments
+# differ. Maintaining them by hand drifts; this script is the single
+# source of truth.
+#
+# Adding a new lifecycle event:
+#   1. Add a row to the EVENTS array below.
+#   2. Add the matching variant to CLAUDE_CODE_EVENTS in
+#      crates/engram-cli/src/commands/render_shared.rs
+#      (keep them in sync — the Rust constant drives the install-hooks
+#      JSON config, this script drives the on-disk scripts).
+#   3. Run `bin/regen-hooks`.
+#   4. Commit both changes together.
+#
+# Run from anywhere; resolves the repo root from $0.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+HOOKS_DIR="$ROOT/hooks"
+
+# Map: agent dir → agent= query string the server expects.
+declare -A AGENT_QUERY=(
+    [claude-code]="claude-code"
+    [codex]="codex"
+    [opencode]="open-code"
+)
+
+# Map: agent dir → human-readable name used in script comments.
+declare -A AGENT_LABEL=(
+    [claude-code]="Claude Code"
+    [codex]="codex"
+    [opencode]="opencode"
+)
+
+# Each row: (filename-no-extension, event-query-value). Keep in sync
+# with crates/engram-cli/src/commands/render_shared.rs.
+EVENTS=(
+    "session-start:session-start"
+    "user-prompt-submit:user-prompt"
+    "pre-tool-use:pre-tool-use"
+    "post-tool-use:post-tool-use"
+    "pre-compact:pre-compact"
+    "stop:stop"
+    "session-end:session-end"
+)
+
+write_simple_hook() {
+    local dir=$1 event_file=$2 event_q=$3
+    local agent_q="${AGENT_QUERY[$dir]}"
+    local agent_label="${AGENT_LABEL[$dir]}"
+    cat > "$HOOKS_DIR/$dir/$event_file.sh" <<EOF
+#!/bin/sh
+# $agent_label $event_q hook.
+# Forwards the event JSON to the engram server. Adds an
+# Authorization: Bearer header when ENGRAM_AUTH_TOKEN is set in
+# this hook's environment (set it via install-hooks --auth-token).
+SERVER="\${ENGRAM_HOOK_URL:-http://127.0.0.1:49374}"
+post_hook() {
+    if [ -n "\${ENGRAM_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 0.5 -X POST "\$1" \\
+            -H "Content-Type: application/json" \\
+            -H "Authorization: Bearer \$ENGRAM_AUTH_TOKEN" \\
+            --data-binary @-
+    else
+        curl -s --max-time 0.5 -X POST "\$1" \\
+            -H "Content-Type: application/json" \\
+            --data-binary @-
+    fi
+}
+post_hook "\$SERVER/hook?event=$event_q&agent=$agent_q" >/dev/null 2>&1 || true
+exit 0
+EOF
+}
+
+write_session_start_hook() {
+    local dir=$1
+    local agent_q="${AGENT_QUERY[$dir]}"
+    local agent_label="${AGENT_LABEL[$dir]}"
+    cat > "$HOOKS_DIR/$dir/session-start.sh" <<EOF
+#!/bin/sh
+# $agent_label SessionStart hook.
+#
+# 1. Forwards the event JSON to the engram server (fire-and-forget).
+# 2. Synchronously fetches any pending cross-agent handoff and prints
+#    it to stdout — agent CLIs prepend session-start hook stdout to
+#    the next session, so the resuming agent sees prior context with
+#    no human in the loop.
+#
+# Both calls carry an Authorization: Bearer header when
+# ENGRAM_AUTH_TOKEN is set in this hook's environment.
+SERVER="\${ENGRAM_HOOK_URL:-http://127.0.0.1:49374}"
+PAYLOAD=\$(cat)
+
+post_hook() {
+    if [ -n "\${ENGRAM_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 0.5 -X POST "\$1" \\
+            -H "Content-Type: application/json" \\
+            -H "Authorization: Bearer \$ENGRAM_AUTH_TOKEN" \\
+            --data-binary @-
+    else
+        curl -s --max-time 0.5 -X POST "\$1" \\
+            -H "Content-Type: application/json" \\
+            --data-binary @-
+    fi
+}
+
+get_handoff() {
+    if [ -n "\${ENGRAM_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 1.0 "\$1" \\
+            -H "Authorization: Bearer \$ENGRAM_AUTH_TOKEN"
+    else
+        curl -s --max-time 1.0 "\$1"
+    fi
+}
+
+echo "\$PAYLOAD" | post_hook "\$SERVER/hook?event=session-start&agent=$agent_q" >/dev/null 2>&1 || true
+get_handoff "\$SERVER/handoff?agent=$agent_q" 2>/dev/null || true
+exit 0
+EOF
+}
+
+written=0
+for dir in claude-code codex opencode; do
+    mkdir -p "$HOOKS_DIR/$dir"
+    for row in "${EVENTS[@]}"; do
+        IFS=':' read -r event_file event_q <<< "$row"
+        case "$event_file" in
+            session-start)
+                write_session_start_hook "$dir"
+                ;;
+            *)
+                write_simple_hook "$dir" "$event_file" "$event_q"
+                ;;
+        esac
+        written=$((written + 1))
+    done
+done
+
+chmod +x "$HOOKS_DIR"/*/*.sh
+
+echo "✓ Regenerated $written hook scripts across $(ls "$HOOKS_DIR" | wc -l) agents."
+echo "  Verify the change:  git diff hooks/"
+echo "  Restore on regret:  git restore hooks/"
