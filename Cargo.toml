@@ -1,0 +1,137 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/engram-core",
+    "crates/engram-store",
+    "crates/engram-wiki",
+    "crates/engram-mcp",
+    "crates/engram-hooks",
+    "crates/engram-llm",
+    "crates/engram-consolidate",
+    "crates/engram-web",
+    "crates/engram-cli",
+    # Live A/B harness — not part of the shipped binary, but in
+    # the workspace so it shares deps + builds with the rest.
+    "evals",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/semantic-craft/engram"
+authors = ["Xianwei Zhang"]
+
+[workspace.dependencies]
+# Inter-crate dependencies.
+engram-core = { path = "crates/engram-core", version = "2.0.0" }
+engram-store = { path = "crates/engram-store", version = "2.0.0" }
+engram-wiki = { path = "crates/engram-wiki", version = "2.0.0" }
+engram-mcp = { path = "crates/engram-mcp", version = "2.0.0" }
+engram-hooks = { path = "crates/engram-hooks", version = "2.0.0" }
+engram-llm = { path = "crates/engram-llm", version = "2.0.0" }
+engram-consolidate = { path = "crates/engram-consolidate", version = "2.0.0" }
+engram-web = { path = "crates/engram-web", version = "2.0.0" }
+
+# (Workspace shared deps follow below)
+
+# Error handling.
+anyhow = "1"
+thiserror = "2"
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps existing JSON key order intact when we
+# round-trip user config files via `install-mcp --apply`. Without it,
+# `~/.claude.json` (which has dozens of CC-managed keys) would be
+# alphabetised on every write — semantically equivalent but a giant
+# cosmetic diff the user didn't ask for.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+
+# Async runtime.
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+
+# Logging / tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# Time & IDs.
+jiff = { version = "0.2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+
+# Config & CLI.
+figment = { version = "0.10", features = ["toml", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+# Format-preserving TOML editor for install-mcp --apply against
+# Codex's config.toml. Plain `toml` round-trips destroy comments;
+# `toml_edit` doesn't.
+toml_edit = "0.22"
+
+# Secrets + constant-time / RNG primitives for bearer-token auth.
+secrecy = { version = "0.10", features = ["serde"] }
+subtle = "2"
+getrandom = "0.3"
+base64 = "0.22"
+
+# Storage.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+refinery = { version = "0.8", features = ["rusqlite"] }
+sha2 = "0.10"
+parking_lot = "0.12"
+
+# Filesystem watcher + process inspection.
+notify = "8"
+notify-debouncer-full = "0.6"
+sysinfo = "0.32"
+fs2 = "0.4"
+
+# Windows NTFS file-index (inode equivalent) for own-write detection.
+winapi-util = "0.1"
+
+# MCP server SDK.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+schemars = "1"
+axum = "0.8"
+# Direct dep so tests can use `Router::oneshot` via `ServiceExt`.
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Backup / restore archive format.
+tar = "0.4"
+flate2 = "1"
+
+# Text munging / hook payload sanitisation.
+regex = "1"
+
+# Wiki git versioning.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+
+# LLM provider HTTP.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Testing.
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Pedantic is opt-in per-crate once code stabilises; too noisy for early skeleton.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,246 @@
+name: release
+
+# Triggered when a version tag is pushed, e.g. git push public v2.0.0.
+# Builds the macOS (Apple Silicon) tarball and the Windows zip on
+# GitHub-hosted runners, then creates the GitHub Release. Public repos
+# get free standard hosted-runner minutes, so no self-hosted machines
+# are involved.
+#
+# Linux, Docker, and AUR are deliberately not release targets; that
+# packaging was inherited from upstream ai-memory and has been removed
+# from the repo.
+#
+# The CI workflow validates fmt / clippy / test. This workflow assumes
+# that passed on the same commit and only performs release publication.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Use the committed static/tailwind.css (crates/engram-web/build.rs).
+  TAILWIND_SKIP: "1"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  validate-version:
+    name: validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(awk -F ' *= *' '
+            /^\[workspace.package\]$/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $2);
+              print $2;
+              exit;
+            }
+          ' Cargo.toml)"
+          if [ -z "$manifest_version" ]; then
+            echo "could not read [workspace.package].version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag version v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
+            exit 1
+          fi
+          echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: macos aarch64 binary
+    needs: validate-version
+    # Apple Silicon (arm64) only — the users this ships to are all arm64
+    # Macs. macos-14 is a native arm64 hosted runner.
+    runs-on: macos-14
+    env:
+      matrix_artifact: engram-macos-aarch64
+      matrix_target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release -p engram-cli --target ${{ env.matrix_target }}
+
+      # macOS users get the binary, hooks bundle, default config template, and
+      # the docs a macOS user needs (install.md + macos.md).
+      - name: Create release tarball
+        env:
+          RELEASE_ARTIFACT: ${{ env.matrix_artifact }}
+          RELEASE_TARGET: ${{ env.matrix_target }}
+        run: |
+          set -euo pipefail
+          artifact="$RELEASE_ARTIFACT"
+          mkdir -p "dist/$artifact"
+          cp "target/$RELEASE_TARGET/release/engram" "dist/$artifact/engram"
+          cp -a hooks "dist/$artifact/hooks"
+          mkdir -p "dist/$artifact/crates/engram-cli/templates"
+          cp crates/engram-cli/templates/config.default.toml \
+            "dist/$artifact/crates/engram-cli/templates/config.default.toml"
+          mkdir -p "dist/$artifact/docs"
+          cp README.md LICENSE "dist/$artifact/"
+          cp docs/install.md "dist/$artifact/docs/install.md"
+          cp docs/macos.md "dist/$artifact/docs/macos.md"
+          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
+
+      - name: Smoke test release tarball
+        env:
+          RELEASE_ARTIFACT: ${{ env.matrix_artifact }}
+        run: |
+          set -euo pipefail
+          artifact="$RELEASE_ARTIFACT"
+          smoke="dist/smoke-$artifact"
+          mkdir -p "$smoke"
+          tar -xzf "$artifact.tar.gz" -C "$smoke"
+          "$smoke/engram" --version
+          for path in \
+            hooks \
+            crates/engram-cli/templates/config.default.toml \
+            docs/install.md \
+            docs/macos.md \
+            README.md \
+            LICENSE
+          do
+            test -e "$smoke/$path" || { echo "macOS release tarball missing $path" >&2; exit 1; }
+          done
+          grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.matrix_artifact }}
+          path: |
+            ${{ env.matrix_artifact }}.tar.gz
+            ${{ env.matrix_artifact }}.tar.gz.sha256
+
+  windows:
+    name: windows x86_64 binary
+    needs: validate-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p engram-cli
+
+      # Ships the `.exe`, the full hooks bundle (the .ps1 + .sh scripts), the
+      # default config template, and the docs a Windows user needs
+      # (install.md + windows.md). Zipped (native
+      # Windows archive) with a sha256sum-format checksum so the release body's
+      # checksums block stays uniform across platforms.
+      - name: Create release zip
+        shell: pwsh
+        env:
+          RELEASE_ARTIFACT: engram-windows-x86_64
+        run: |
+          $artifact = $env:RELEASE_ARTIFACT
+          $stage = "dist/$artifact"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/engram.exe "$stage/engram.exe"
+          Copy-Item -Recurse hooks "$stage/hooks"
+          New-Item -ItemType Directory -Force -Path "$stage/crates/engram-cli/templates" | Out-Null
+          Copy-Item crates/engram-cli/templates/config.default.toml `
+            "$stage/crates/engram-cli/templates/config.default.toml"
+          New-Item -ItemType Directory -Force -Path "$stage/docs" | Out-Null
+          Copy-Item README.md, LICENSE $stage
+          Copy-Item docs/install.md "$stage/docs/install.md"
+          Copy-Item docs/windows.md "$stage/docs/windows.md"
+          $zip = "$artifact.zip"
+          # Pipe the staged items in (rather than a "$stage/*" glob) so the
+          # archive is rooted at the files themselves — engram.exe, hooks/,
+          # etc. land at the zip root, mirroring the macOS tarball layout.
+          Get-ChildItem $stage | Compress-Archive -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+
+      - name: Smoke test release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "engram-windows-x86_64.zip"
+          $smoke = "dist/smoke-windows-zip"
+          Expand-Archive $zip -DestinationPath $smoke -Force
+          & "$smoke/engram.exe" --version
+          foreach ($path in @(
+            "hooks",
+            "crates/engram-cli/templates/config.default.toml",
+            "docs/install.md",
+            "docs/windows.md",
+            "README.md",
+            "LICENSE"
+          )) {
+            if (-not (Test-Path "$smoke/$path")) {
+              throw "Windows release zip missing $path"
+            }
+          }
+          $checksum = Get-Content "$zip.sha256" -Raw
+          if ($checksum -notmatch '^[0-9a-f]{64}  engram-windows-x86_64\.zip\r?\n?$') {
+            throw "Windows release zip checksum is not sha256sum format"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engram-windows-x86_64
+          path: |
+            engram-windows-x86_64.zip
+            engram-windows-x86_64.zip.sha256
+
+  github-release:
+    name: github release
+    needs: [macos, windows, validate-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: engram-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release body
+        run: |
+          {
+            echo "## Checksums (SHA256)"
+            echo '```'
+            cat artifacts/*.sha256
+            echo '```'
+            echo ""
+            echo "## Install"
+            echo '```bash'
+            echo "# macOS aarch64/x86_64 (no toolchain): download the matching engram-macos-<arch>.tar.gz below,"
+            echo "# extract it, and follow the bundled docs/macos.md."
+            echo ""
+            echo "# Windows x86_64 (no toolchain): download engram-windows-x86_64.zip below,"
+            echo "# extract it, and follow the bundled docs/windows.md."
+            echo ""
+            echo "# From source"
+            echo "cargo install --git https://github.com/semantic-craft/engram --tag ${GITHUB_REF_NAME}"
+            echo '```'
+          } > body.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file body.md \
+            --latest

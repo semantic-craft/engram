@@ -1,0 +1,36 @@
+[package]
+name = "engram-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LLM provider trait with typed Anthropic, OpenAI, Gemini, OpenAI OAuth, GitHub Copilot and OpenAI-compat clients."
+
+[dependencies]
+engram-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+base64.workspace = true
+uuid.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile.workspace = true
+# In-process HTTP mock for the openai-compat strict-fallback tests.
+# Scoped to dev-dependencies so production binaries don't pull it in.
+wiremock = "0.6"
+
+[lints]
+workspace = true

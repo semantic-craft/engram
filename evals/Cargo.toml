@@ -1,0 +1,27 @@
+[package]
+name = "engram-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "engram-eval"
+path = "src/main.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-llm.workspace = true
+engram-consolidate.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+jiff.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

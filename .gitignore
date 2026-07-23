@@ -1,0 +1,74 @@
+# Rust build artefacts.
+/target/
+/companions/*/target/
+/dist/
+**/*.rs.bk
+**/*.rs.orig
+
+# Local environment overrides.
+.env
+.env.local
+/.local-data/
+
+# Editor / OS noise.
+.DS_Store
+*.tmp
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local debugging.
+*.log
+flamegraph.svg
+perf.data*
+
+# Sandbox marker (not project content).
+.ai-jail
+.claude/
+.slim/deepwork/
+evals/runs/
+
+# engram atomic-write backups (apply_atomic in apply_shared.rs)
+*.bak-*
+# >>> dev-link (Matt Pocock skills — machine-local symlinks, do not commit) >>>
+/.agents/skills/ask-matt
+/.agents/skills/code-review
+/.agents/skills/codebase-design
+/.agents/skills/diagnosing-bugs
+/.agents/skills/domain-modeling
+/.agents/skills/grill-with-docs
+/.agents/skills/implement
+/.agents/skills/improve-codebase-architecture
+/.agents/skills/prototype
+/.agents/skills/research
+/.agents/skills/resolving-merge-conflicts
+/.agents/skills/setup-matt-pocock-skills
+/.agents/skills/tdd
+/.agents/skills/to-spec
+/.agents/skills/to-tickets
+/.agents/skills/triage
+/.agents/skills/wayfinder
+/.agents/skills/git-guardrails-claude-code
+/.agents/skills/migrate-to-shoehorn
+/.agents/skills/scaffold-exercises
+/.agents/skills/setup-pre-commit
+/.agents/skills/grill-me
+/.agents/skills/grilling
+/.agents/skills/handoff
+/.agents/skills/teach
+/.agents/skills/writing-great-skills
+/.agents/skills/edit-article
+/.agents/skills/obsidian-vault
+/.agents/skills/claude-handoff
+/.agents/skills/loop-me
+/.agents/skills/setup-ts-deep-modules
+/.agents/skills/wizard
+/.agents/skills/writing-beats
+/.agents/skills/writing-fragments
+/.agents/skills/writing-shape
+/.agents/skills/grilling-frontend-prototyping
+/.codex/skills
+/.copilot/skills
+/.opencode/skills
+# <<< dev-link <<<

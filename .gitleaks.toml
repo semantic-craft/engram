@@ -1,0 +1,69 @@
+# gitleaks configuration for engram.
+#
+# Wired into CI via `.github/workflows/ci.yml`'s `gitleaks` job. Runs
+# on every push and PR; fails the build if a credential-shaped value
+# lands in any tracked file.
+#
+# The default ruleset (Google API keys, Anthropic, OpenAI, Slack, AWS,
+# GitHub PATs, …) covers what engram's own sanitiser covers. We
+# inherit it and only ADD an allowlist for the specific test fixtures
+# we deliberately ship.
+#
+# Lesson from M18: a previous iteration of sanitize.rs used a live
+# Gemini key as a test fixture and Google's automated scanner caught
+# it within hours of push. This config exists so the next time a fake
+# fixture is added, it follows the same shape the allowlist accepts —
+# and any DRIFT from those shapes (i.e. a real key showing up) fails
+# CI loudly before push.
+
+title = "engram secret-scan config"
+
+[extend]
+useDefault = true
+
+# Fail-closed: do NOT add any path-based allowlist that would exempt
+# whole directories. Every exemption below is a specific string with a
+# rationale.
+
+[allowlist]
+description = "Deliberate test fixtures + documented placeholders"
+regexes = [
+    # ---- Test fixtures inside `sanitize.rs` ----
+    # Every sanitize-test uses an obvious "0123456789…" / "abcdef…" /
+    # "deadbeefcafebabe" pattern so a reader can tell at a glance
+    # that the value is fake.
+    '''AIzaSy0123456789[A-Za-z0-9_\-]+''',
+    '''sk-or-v1-deadbeefcafebabe[0-9a-f]+''',
+    '''sk-ant-leak-[0-9a-f]+''',
+    '''sk-leak-[0-9a-f]+''',
+    '''ghp_FAKE[A-Z0-9]+''',
+    '''github_pat_FAKE[A-Z0-9_]+''',
+    '''AKIAFAKE[A-Z0-9]+''',
+    '''Bearer abcdef0123456789ABCDEF0123456789''',
+    '''xoxb-1234567890-abcdefghij''',
+
+    # ---- Canary string used by the e2e test in tests/e2e/ ----
+    '''sk-canary-LEAK_ME_PLEASE_[a-z0-9_]+''',
+
+    # ---- Documented placeholders in README/docs/.env.production.example ----
+    '''sk-(ant-|or-v1-|)\.\.\.''',
+    '''sk-or-v1-REPLACE_ME''',
+    '''sk-REPLACE_ME''',
+    '''REPLACE_WITH_OUTPUT_OF_GENERATE_AUTH_TOKEN''',
+
+    # ---- Redaction-test fixtures (predate the fake-shape convention) ----
+    # These two prove the scrubber / wiki actually redact a secret before
+    # it is stored; both values are obvious sequential/hex fakes. Anchored
+    # exact matches, so a real key (which won't match) still fails CI.
+    #   sanitize.rs::scrubs_generic_env_var_assignments
+    '''^abcdef123456$''',
+    #   wiki.rs GitHub-token redaction test
+    '''^ghp_1234567890abcdef1234567890abcdef1234$''',
+]
+
+# Path-based exemptions — kept minimal. tests/e2e/ uses a few canary
+# strings we want to ship intentionally; the regexes above already
+# cover them but excluding the path is cheap defence-in-depth.
+paths = [
+    '''tests/e2e/.*\.sh''',
+]
