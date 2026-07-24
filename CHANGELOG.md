@@ -12,6 +12,12 @@ below start from the fork.
 
 ### Changed
 
+- Public CI and release workflows now use only standard GitHub-hosted
+  runners, immutable action SHAs, read-only default permissions, and
+  one-day artifact retention. Pull-request jobs do not read repository
+  secrets; full-history secret scanning downloads a checksum-pinned
+  Gitleaks binary.
+
 - Forked from ai-memory v1.8.0 and rebranded as **Engram**: crates
   (`engram-*`), binary (`engram`), env prefix (`ENGRAM_*`), default
   data dir (`…/engram`), packaging/service/docker references, and new

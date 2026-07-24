@@ -24,8 +24,7 @@ env:
   TAILWIND_SKIP: "1"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   validate-version:
@@ -34,7 +33,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - id: version
         run: |
@@ -69,9 +70,11 @@ jobs:
       matrix_artifact: engram-macos-aarch64
       matrix_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-apple-darwin
 
@@ -122,21 +125,24 @@ jobs:
           done
           grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.matrix_artifact }}
           path: |
             ${{ env.matrix_artifact }}.tar.gz
             ${{ env.matrix_artifact }}.tar.gz.sha256
+          retention-days: 1
 
   windows:
     name: windows x86_64 binary
     needs: validate-version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Build release binary
         run: cargo build --release -p engram-cli
@@ -196,19 +202,22 @@ jobs:
             throw "Windows release zip checksum is not sha256sum format"
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: engram-windows-x86_64
           path: |
             engram-windows-x86_64.zip
             engram-windows-x86_64.zip.sha256
+          retention-days: 1
 
   github-release:
     name: github release
     needs: [macos, windows, validate-version]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: engram-*
           path: artifacts
@@ -237,7 +246,7 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" artifacts/* \
             --repo "$GITHUB_REPOSITORY" \
