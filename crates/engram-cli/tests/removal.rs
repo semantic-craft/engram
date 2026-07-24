@@ -42,6 +42,15 @@ fn normalize_path_text(value: impl AsRef<str>) -> String {
     value.as_ref().replace('\\', "/")
 }
 
+/// The CLI canonicalises `ENGRAM_DATA_DIR` before printing it (config.rs
+/// `canonicalise_or_keep`), so preview lines carry the canonical spelling:
+/// `/private/var/...` on macOS, and the `\\?\` verbatim form with 8.3 short
+/// names resolved on Windows. Canonicalise the expected side the same way so
+/// the comparison matches exactly instead of relying on a substring accident.
+fn canonical_data_dir(path: &Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
     command_with_home(home)
         .args(args)
@@ -716,14 +725,18 @@ fn uninstall_dry_run_previews_purge() {
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("would purge"), "stdout was: {stdout}");
+    let previewed_root = canonical_data_dir(data.path());
     for sub in ["wiki", "db", "raw"] {
-        let p = data.path().join(sub);
+        let previewed = previewed_root.join(sub);
         assert!(
-            stdout.contains(&p.display().to_string()),
+            stdout.contains(&previewed.display().to_string()),
             "missing {sub} in: {stdout}"
         );
         // Dry-run must not delete.
-        assert!(p.join("f.txt").exists(), "{sub} must be untouched");
+        assert!(
+            data.path().join(sub).join("f.txt").exists(),
+            "{sub} must be untouched"
+        );
     }
 }
 
