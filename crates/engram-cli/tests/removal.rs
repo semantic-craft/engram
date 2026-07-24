@@ -718,8 +718,13 @@ fn uninstall_dry_run_previews_purge() {
     assert!(stdout.contains("would purge"), "stdout was: {stdout}");
     for sub in ["wiki", "db", "raw"] {
         let p = data.path().join(sub);
+        let expected = std::fs::canonicalize(&p).unwrap();
         assert!(
-            normalize_path_text(&stdout).contains(&normalize_path_text(p.display().to_string())),
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix("would purge "))
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .any(|path| path == expected),
             "missing {sub} in: {stdout}"
         );
         // Dry-run must not delete.
