@@ -39,7 +39,7 @@ fn command_with_home(home: &Path) -> Command {
 }
 
 fn normalize_path_text(value: impl AsRef<str>) -> String {
-    value.as_ref().replace('\\', "/")
+    value.as_ref().replace(r"\\?\", "").replace('\\', "/")
 }
 
 fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
@@ -718,8 +718,13 @@ fn uninstall_dry_run_previews_purge() {
     assert!(stdout.contains("would purge"), "stdout was: {stdout}");
     for sub in ["wiki", "db", "raw"] {
         let p = data.path().join(sub);
+        let expected = std::fs::canonicalize(&p).unwrap();
         assert!(
-            stdout.contains(&p.display().to_string()),
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix("would purge "))
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .any(|path| path == expected),
             "missing {sub} in: {stdout}"
         );
         // Dry-run must not delete.
