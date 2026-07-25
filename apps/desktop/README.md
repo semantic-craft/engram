@@ -38,4 +38,9 @@ npm install
 npm run tauri dev    # needs the Engram daemon running locally
 ```
 
-Build a release bundle with `npm run tauri build`.
+Build a release bundle with `npm run build:release`. It wraps
+`tauri build` with `--remap-path-prefix` so the binary carries no
+absolute build paths (Rust embeds them in panic/tracing metadata,
+which would leak the builder's home directory and username), then
+fails the build if any such path survives. Don't ship bundles from a
+bare `npm run tauri build`.
