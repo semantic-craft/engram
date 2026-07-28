@@ -66,6 +66,59 @@ full page before acting: rules are constraints, gotchas are preflight warnings,
 procedures are checklists, and decisions are settled architecture unless the
 user explicitly asks to revisit them.
 
+## Audit project instruction chains
+
+Run the instruction doctor before deciding which project instruction file to
+maintain:
+
+```bash
+engram instructions doctor
+engram instructions doctor --json
+```
+
+The command is deterministic and read-only. It does not load Engram
+configuration, construct an LLM provider, open the wiki or SQLite store, create
+an audit record, or modify instruction files. The human report is intended for
+terminal diagnosis; `--json` emits the same facts as a versioned schema for
+automation.
+
+Claude Code and Codex are formally supported. For Claude Code, the report
+models ancestor, root, local, imported, `.claude/rules/`, and descendant
+on-demand sources, including `paths` frontmatter and the five-hop `@path`
+import limit. For Codex, it models root-to-current-directory selection,
+`AGENTS.override.md` precedence, configured fallback filenames, and
+the `project_doc_max_bytes` limit. Global instruction files themselves remain
+outside this project-scoped inventory. Recognized files for other harnesses are
+inventory-only and carry `support = "best_effort"`; the doctor does not infer
+their loading order.
+
+Formal support follows the current primary documentation for
+[Claude Code instruction loading](https://code.claude.com/docs/en/memory) and
+[Codex `AGENTS.md` discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
+
+Each source includes line, byte, and estimated-token counts plus symlink,
+Engram marker, and routing-asset status. Each chain entry includes its order,
+classification (`canonical`, `adapter`, `tool_specific`, `path_scoped`, or
+`override`), load mode, effective state, loaded bytes, and the reason for the
+decision. Split independent files and near-duplicate `CLAUDE.md` / `AGENTS.md`
+files remain ambiguous unless an import, thin pointer, safe in-repository
+symlink, or explicit configuration establishes one source. Malformed,
+duplicate, crossed, nested, or incomplete routing markers are reported only;
+the doctor never repairs them.
+
+To make the source-of-truth choice explicit, add this to the repository-root
+`.engram.toml`:
+
+```toml
+[instructions]
+canonical = "AGENTS.md"
+```
+
+The path must be repository-relative, must remain inside the repository, and
+must name a readable file. This declaration affects doctor classification
+only; it does not change Claude Code or Codex loading behavior and does not
+change `install-instructions` output.
+
 ## Install the routing snippet and Agent Skills
 
 From an agent, say:

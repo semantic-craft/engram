@@ -278,13 +278,21 @@ auto-improve-report  curator              pending-writes       embed
 generate-auth-token  setup-agent          bootstrap
 install-instructions install-skills        reorg
 rename-project       move-project         audit-contamination
-uninstall            auth                 user
+instructions         uninstall            auth                 user
 ```
 
 Run `engram --help` for the full tree.
 
 `auto-improve-report` is read-only by default; `--stage` creates one pending
 telemetry report page for audit/approval without staging learning-memory edits.
+
+`instructions doctor` is a read-only pre-runtime fast path. It inventories the
+repository and models Claude Code and Codex loading without resolving Engram
+configuration, constructing an LLM provider, or opening the store. Its only
+environment reads are the harness-owned `HOME` / `USERPROFILE` and
+`CODEX_HOME` locations required to read Codex's project-discovery settings.
+It never invokes the routing installer; malformed markers and asset drift are
+diagnostics, not repair requests.
 
 ## Cross-cutting invariants
 
