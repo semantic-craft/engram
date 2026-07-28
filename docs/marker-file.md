@@ -81,6 +81,12 @@ inject_on_session_start = "true"
 # listed by path so the agent can `memory_query` them. Clamped
 # server-side to [500, 20000]; defaults to 4000.
 max_chars = 4000
+
+# Optional. Declares the repository instruction source of truth for
+# `engram instructions doctor`. The path is relative to the repository root.
+# This does not alter hook scope resolution or agent loading behavior.
+[instructions]
+canonical = "AGENTS.md"
 ```
 
 **Naming rules** for `workspace` and `project`, validated server-side:
@@ -106,6 +112,13 @@ subagent captures stored as usual. Top-level (non-subagent) sessions are
 always stored regardless. This is per-project on purpose: there is no
 server-global switch, so opting one noisy project in never sheds subagent
 captures for the others on a shared instance.
+
+`instructions.canonical` is consumed only by `engram instructions doctor`,
+from the `.engram.toml` at the Git repository root. It must be a readable,
+repository-relative path that does not contain `..`. An explicit value wins
+over the doctor's import, pointer, symlink, and similarity inference. It is
+descriptive rather than operative: Claude Code and Codex still follow their
+own loading rules, and the routing installer remains unchanged.
 
 ## Four canonical examples
 

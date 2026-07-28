@@ -19,6 +19,7 @@ mod cli;
 mod commands;
 mod config;
 mod http_client;
+mod instruction_steward;
 mod logging;
 mod process_guard;
 
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
     let command = match command {
         Command::Hook(args) => return commands::hook::run(data_dir, args).await,
         Command::HookDrain(_args) => return commands::hook::run_drain(data_dir).await,
+        Command::Instructions(args) => return commands::instructions::run(args),
         other => other,
     };
 
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
         Command::SetupAgent(args) => commands::setup_agent::run(&config, args),
         Command::Bootstrap(args) => commands::bootstrap::run(&config, args).await,
         Command::InstallInstructions(args) => commands::install_instructions::run(&config, args),
+        Command::Instructions(args) => commands::instructions::run(args),
         Command::InstallSkills(args) => commands::install_skills::run(&config, args),
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,

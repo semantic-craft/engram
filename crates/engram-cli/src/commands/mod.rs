@@ -27,6 +27,7 @@ pub mod install_hooks;
 pub mod install_instructions;
 pub mod install_mcp;
 pub mod install_skills;
+pub mod instructions;
 pub mod lint;
 pub mod llm_test;
 pub mod move_project;

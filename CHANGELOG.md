@@ -8,6 +8,18 @@ v1.8.0. History up to the fork point is preserved verbatim in
 [`docs/upstream-changelog.md`](docs/upstream-changelog.md); entries
 below start from the fork.
 
+## Unreleased
+
+### Added
+
+- `engram instructions doctor` provides a deterministic, read-only audit of
+  Claude Code and Codex project instruction loading. Human-readable and JSON
+  reports identify canonical, adapter, tool-specific, path-scoped, and
+  override sources; show effective load order and size estimates; and diagnose
+  routing marker health and managed-asset drift without changing files or
+  initializing Engram runtime state. Other recognized harness files are
+  explicitly reported as best-effort.
+
 ## 2.0.0 - 2026-07-19
 
 ### Changed
