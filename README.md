@@ -479,8 +479,23 @@ Useful entry points:
   `/wiki/web`. Set `--web-slug /` if you want the browser or custom SPA at
   `/wiki` itself.
 
-Install the managed routing package once so agents proactively call the
-right MCP tool for those prompts:
+Audit the current project's Claude Code and Codex instruction loading before
+installing or editing routing:
+
+```bash
+engram instructions doctor
+engram instructions doctor --json
+```
+
+The doctor is deterministic and completely read-only. It reports effective
+load order, canonical/adapter relationships, nested rules, size estimates,
+marker health, and routing-asset drift without loading an LLM provider or
+opening Engram's store. See
+[`docs/usage.md`](docs/usage.md#audit-project-instruction-chains) for the
+supported loading semantics and structured report.
+
+Install the managed routing package once so agents proactively call the right
+MCP tool for those prompts:
 
 ```bash
 engram install-instructions
