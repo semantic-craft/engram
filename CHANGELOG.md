@@ -26,6 +26,15 @@ below start from the fork.
   Recommendations protect non-inferable project knowledge and identify root,
   path-rule, Agent Skill, Wiki, enforcement, or no-change destinations; file
   length alone never produces a removal recommendation.
+- `engram instructions propose` stages proposal-only project instruction
+  changes from an explicitly selected `_rules/` Wiki page or deterministic
+  doctor finding. These DB-backed `project_instruction` records preserve the
+  target layer, operation, base hash, exact anchor or owned region, proposed
+  content, unified diff, token delta, rationale, evidence provenance, actor,
+  and timestamps in the existing pending-writes review surface. They can be
+  listed, shown, diffed, or rejected, but cannot be approved or applied yet;
+  staging and rejection never change repository files, Wiki pages, or Git
+  state. Existing Wiki proposals retain their sidecar and Wiki mutation path.
 
 ## 2.0.0 - 2026-07-19
 
