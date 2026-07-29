@@ -233,7 +233,7 @@ jobs:
             echo ""
             echo "## Install"
             echo '```bash'
-            echo "# macOS aarch64/x86_64 (no toolchain): download the matching engram-macos-<arch>.tar.gz below,"
+            echo "# macOS Apple Silicon (no toolchain): download engram-macos-aarch64.tar.gz below,"
             echo "# extract it, and follow the bundled docs/macos.md."
             echo ""
             echo "# Windows x86_64 (no toolchain): download engram-windows-x86_64.zip below,"
