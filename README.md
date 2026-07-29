@@ -508,6 +508,14 @@ engram instructions propose \
 engram instructions propose \
   --finding generic_harness_guidance --source AGENTS.md --line 12
 
+# Optional: one bounded provider call over authoritative Engram evidence.
+engram instructions propose \
+  --rule _rules/single-writer.md --target AGENTS.md --semantic
+engram instructions propose \
+  --correction "full gate before merging" --target AGENTS.md --semantic
+engram instructions propose \
+  --review-finding _lint/2026-07-29.md --target AGENTS.md --semantic
+
 engram pending-writes list
 engram pending-writes show <proposal-id>
 engram pending-writes diff <proposal-id>
@@ -529,6 +537,20 @@ Wiki scheduler, provider, and auto-approval configuration never auto-approves a
 evidence and secret-shaped content before storage or edit. See
 [`docs/usage.md`](docs/usage.md#stage-project-instruction-proposals) for the
 operation and provenance model.
+
+`--semantic` is opt-in and keeps the deterministic no-provider `--rule` and
+`--finding` paths intact. It accepts an explicitly selected rule page, an
+approved durable rule page, a correction repeated in user prompts from at
+least two project sessions, or a durable `_lint/` review page. The provider may
+classify duplication, conflict, and placement, but every finding and proposal
+must cite an exact substring of server-loaded evidence. One call, bounded
+evidence/input/output, one proposal, final-body size, and changed-character
+limits are enforced and reported. Assistant/model echo, external web or issue
+instructions, transient or resolved state, secret-shaped content, and unsafe
+removal of team/deployment/internal-tool/migration/business/security context
+are rejected; rejected model candidates enter the existing rejection buffer.
+The bridge adds an admin route, not a repository-writing MCP tool, and neither
+the scheduler nor provider can approve, apply, or write repository content.
 
 Install the managed routing package once so agents proactively call the right
 MCP tool for those prompts:

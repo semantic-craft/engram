@@ -43,6 +43,19 @@ below start from the fork.
   instruction block, so contradictory or larger statements are not mistaken
   for the selected rule. Existing Wiki proposals retain their sidecar and Wiki
   mutation path.
+- `engram instructions propose --semantic` adds opt-in, provider-backed
+  duplication/conflict/placement assistance over authoritative durable Engram
+  evidence: explicit or approved rule pages, repeated project user
+  corrections, durable lint findings, and bound doctor findings. It enforces
+  exact citations plus fixed provider-call, evidence, input/output, proposal,
+  final-body, and changed-character budgets; filters assistant echo, external
+  web/issue instructions, transient state, secrets, and unsafe protected-context
+  removal; and records rejected model candidates in the existing rejection
+  buffer. Accepted output still becomes only a DB-backed pending
+  `project_instruction` proposal requiring the independent human approval
+  binding. The deterministic no-LLM doctor/proposal paths are unchanged, the
+  scheduler gains no approval/apply/repository-write authority, and no new MCP
+  tool or repository-writing surface is added.
 
 ## 2.0.0 - 2026-07-19
 

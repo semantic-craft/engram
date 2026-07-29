@@ -224,6 +224,74 @@ mod tests {
             .unwrap_or(0)
     }
 
+    #[tokio::test]
+    async fn reader_distinguishes_approved_wiki_rule_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let path = "_rules/full-gate.md";
+        assert!(
+            !store
+                .reader
+                .wiki_page_was_approved_proposal(ws, proj, path)
+                .await
+                .unwrap()
+        );
+        let mut rule = proposal(
+            path,
+            AutoImproveProposalOperation::Create,
+            "Always run the full gate.",
+        );
+        rule.kind = "rule".into();
+        let staged = store
+            .writer
+            .stage_auto_improve_run(stage_input(ws, proj, vec![rule]))
+            .await
+            .unwrap();
+        store
+            .writer
+            .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: staged.proposal_ids[0],
+                page: sample_page(ws, proj, path, "Always run the full gate."),
+                actor: ActorContext::default(),
+                author_id: None,
+                checkpoint: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .wiki_page_was_approved_proposal(ws, proj, path)
+                .await
+                .unwrap()
+        );
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, path, "A later manual rewrite."))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .reader
+                .wiki_page_was_approved_proposal(ws, proj, path)
+                .await
+                .unwrap(),
+            "approval provenance must bind to the current latest page version"
+        );
+    }
+
     // Issue #157: the documented safety invariant "pinned pages are never
     // rewritten by auto-improvement" is enforced at the single apply point
     // every flow shares (manual approval AND require_approval=false

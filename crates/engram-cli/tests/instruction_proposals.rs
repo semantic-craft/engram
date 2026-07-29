@@ -2,9 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +31,17 @@ struct Server {
 
 impl Server {
     fn start(data_dir: &Path, project: &str, addr: &str) -> Self {
-        let mut child = Command::new(bin())
+        Self::start_with_provider(data_dir, project, addr, None)
+    }
+
+    fn start_with_provider(
+        data_dir: &Path,
+        project: &str,
+        addr: &str,
+        provider_url: Option<&str>,
+    ) -> Self {
+        let mut command = Command::new(bin());
+        command
             .args([
                 "--data-dir",
                 data_dir.to_str().unwrap(),
@@ -44,9 +57,15 @@ impl Server {
                 project,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if let Some(provider_url) = provider_url {
+            command
+                .env("ENGRAM_LLM_PROVIDER", "openai-compat")
+                .env("ENGRAM_LLM_MODEL", "fake-semantic-model")
+                .env("ENGRAM_LLM_BASE_URL", provider_url)
+                .env("ENGRAM_LLM_COMPAT_STRICT", "true");
+        }
+        let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if TcpStream::connect(addr).is_ok() {
@@ -60,6 +79,82 @@ impl Server {
         let _ = child.kill();
         let _ = child.wait();
         panic!("engram server did not become ready at {addr}");
+    }
+}
+
+struct FakeProvider {
+    addr: String,
+    calls: Arc<AtomicUsize>,
+    stopping: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeProvider {
+    fn start(structured: Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_calls = Arc::clone(&calls);
+        let worker_stopping = Arc::clone(&stopping);
+        let content = serde_json::to_string(&structured).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": "fake-semantic",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "fake-semantic-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20 }
+        }))
+        .unwrap();
+        let worker = thread::spawn(move || {
+            while !worker_stopping.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                worker_calls.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            addr,
+            calls,
+            stopping,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/v1", self.addr)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for FakeProvider {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(&self.addr);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -293,6 +388,137 @@ fn durable_rule_stages_reviewable_proposal_without_touching_repository_or_wiki_t
         rule["body"],
         "# Single writer\n\nKeep SQLite writes behind the single writer actor."
     );
+}
+
+#[test]
+fn semantic_rule_assistance_is_bounded_cited_and_manual_only() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(
+        repository.path().join("AGENTS.md"),
+        "# Rules\n\nNever run the full gate before merging.\n",
+    )
+    .unwrap();
+    let provider = FakeProvider::start(serde_json::json!({
+        "summary": "The durable rule conflicts with the current root instruction.",
+        "findings": [
+            {
+                "kind": "semantic_conflict",
+                "message": "The selected rule requires the full gate while the target forbids it.",
+                "citations": [{
+                    "source": "_rules/full-gate.md",
+                    "quote": "Always run the full gate before merging."
+                }]
+            },
+            {
+                "kind": "placement",
+                "message": "The rule is universal project policy and belongs in root instructions.",
+                "citations": [{
+                    "source": "_rules/full-gate.md",
+                    "quote": "Always run the full gate before merging."
+                }]
+            }
+        ],
+        "proposal": {
+            "operation": "update",
+            "target_context_layer": "root_instructions",
+            "proposed_content": "# Rules\n\nAlways run the full gate before merging.\n",
+            "rationale": "Resolve the cited conflict in favor of the explicit durable rule.",
+            "citations": [{
+                "source": "_rules/full-gate.md",
+                "quote": "Always run the full gate before merging."
+            }]
+        },
+        "rejected_candidates": []
+    }));
+    let project = "instruction-semantic";
+    let addr = reserve_addr();
+    let provider_url = provider.url();
+    let server = Server::start_with_provider(data.path(), project, &addr, Some(&provider_url));
+    let wrote = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            "_rules/full-gate.md",
+            "--kind",
+            "rule",
+            "--body",
+            "# Full gate\n\nAlways run the full gate before merging.",
+        ],
+    );
+    assert!(wrote.status.success());
+
+    let repository_before = snapshot(repository.path());
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/full-gate.md",
+            "--target",
+            "AGENTS.md",
+            "--semantic",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        provider.calls(),
+        1,
+        "semantic assistance has a one-call budget"
+    );
+    assert_eq!(proposal["status"], "pending");
+    assert_eq!(proposal["target_kind"], "project_instruction");
+    assert_eq!(proposal["manual_approval_required"], true);
+    assert_eq!(proposal["semantic_assistance"]["provider_calls"], 1);
+    assert_eq!(proposal["semantic_assistance"]["proposal_count"], 1);
+    assert_eq!(proposal["semantic_assistance"]["evidence_count"], 1);
+    assert!(
+        proposal["semantic_assistance"]["changed_chars"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(snapshot(repository.path()), repository_before);
+
+    let shown = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            proposal["proposal_id"].as_str().unwrap(),
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(shown["summary"]["status"], "pending");
+    assert_eq!(shown["summary"]["target_kind"], "project_instruction");
+    assert_eq!(shown["provenance"][0]["kind"], "explicit_user_rule");
+    assert_eq!(shown["provenance"][1]["kind"], "semantic_analysis");
+    assert_eq!(snapshot(repository.path()), repository_before);
 }
 
 #[test]

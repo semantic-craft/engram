@@ -318,6 +318,20 @@ invokes a repository or Wiki mutation, and local application remains a separate
 phase. Wiki scheduler/provider/auto-approval settings cannot enter this manual
 approval path.
 
+The optional `--semantic` branch adds one read-only provider review in
+`engram-consolidate::instruction_semantic`. The admin boundary authoritatively
+loads a selected durable rule, an approved Wiki rule proposal, repeated
+project-scoped user corrections, a durable lint-report finding, or a bound
+doctor finding. The reviewer receives bounded quoted evidence and the target
+snapshot, then validates exact citations, output and changed-character budgets,
+and protected-context preservation before returning at most one proposal.
+Only the existing single writer actor can persist that proposal, and it always
+lands as pending `project_instruction` data. Rejections enter the existing
+auto-improvement rejection buffer. This is an authenticated admin/CLI route,
+not a new MCP tool; the scheduler does not call it and has no repository write,
+approval, or apply path. The zero-LLM doctor and explicit proposal routes remain
+unchanged.
+
 ## Cross-cutting invariants
 
 Carved in M0/M1; every milestone has to respect them. Each comes from
