@@ -572,17 +572,33 @@ fn apply_approved_locally(
                     MANUAL_REVIEW_REPAIR,
                 )
             })?;
-    if target_identity.existed != base_target_existed {
+    let approved_identity_for_current_target = repository_identity_sha256(
+        &report.repository_root,
+        &detail.summary.logical_target,
+        &target_identity.canonical_target,
+        base_target_existed,
+    )
+    .map_err(|error| {
+        apply_failed(
+            "repository_identity_failed",
+            error.to_string(),
+            MANUAL_REVIEW_REPAIR,
+        )
+    })?;
+    if approved_identity_for_current_target != expected_repository_identity {
         return Err(apply_conflict(
-            "target_changed",
-            "instruction target existence changed after proposal staging",
+            "different_repository",
+            "approved proposal belongs to a different repository or canonical target; refusing local apply",
             RESTAGE_REPAIR,
         ));
     }
-    if target_identity.sha256 != expected_repository_identity {
+    let possible_completed_creation = operation == AutoImproveProposalOperation::Add
+        && !base_target_existed
+        && target_identity.existed;
+    if target_identity.existed != base_target_existed && !possible_completed_creation {
         return Err(apply_conflict(
-            "different_repository",
-            "approved proposal belongs to a different repository; refusing local apply",
+            "target_changed",
+            "instruction target existence changed after proposal staging",
             RESTAGE_REPAIR,
         ));
     }
@@ -618,6 +634,7 @@ fn apply_approved_locally(
                 &report.repository_root,
                 &detail.summary.logical_target,
                 &target,
+                false,
             )?;
         }
         let (apply_report, receipt_path) = if base_content == detail.proposed_content {
@@ -672,6 +689,7 @@ fn apply_approved_locally(
         &report.repository_root,
         &detail.summary.logical_target,
         &target,
+        operation == AutoImproveProposalOperation::Add && !base_target_existed,
     )?;
     prepare_apply_receipt_storage(&report.repository_root).map_err(|error| {
         apply_failed(
@@ -735,13 +753,28 @@ fn apply_approved_locally(
     };
     let post_write_identity_error =
         match repository_target_identity(&report.repository_root, &detail.summary.logical_target) {
-            Ok(identity)
-                if identity.sha256 == target_identity.sha256
-                    && identity.canonical_target == target =>
-            {
-                None
+            Ok(identity) => {
+                let projected = repository_identity_sha256(
+                    &report.repository_root,
+                    &detail.summary.logical_target,
+                    &identity.canonical_target,
+                    base_target_existed,
+                );
+                let bytes_match = fs::read(&target)
+                    .is_ok_and(|bytes| bytes == detail.proposed_content.as_bytes());
+                if identity.existed
+                    && identity.canonical_target == target
+                    && projected.is_ok_and(|sha256| sha256 == expected_repository_identity)
+                    && bytes_match
+                {
+                    None
+                } else {
+                    Some(
+                        "logical target, symlink resolution, or bytes changed during write"
+                            .to_owned(),
+                    )
+                }
             }
-            Ok(_) => Some("logical target or symlink resolution changed during write".to_owned()),
             Err(error) => Some(format!(
                 "canonical target identity recheck failed after write: {error}"
             )),
@@ -1457,6 +1490,7 @@ fn ensure_clean_git_target(
     repository_root: &Path,
     logical_target: &str,
     resolved_target: &Path,
+    allow_missing_target: bool,
 ) -> std::result::Result<(), LocalApplyFailure> {
     let repository = git2::Repository::open(repository_root).map_err(|error| {
         apply_failed(
@@ -1482,13 +1516,19 @@ fn ensure_clean_git_target(
         targets.push(relative.to_path_buf());
     }
     for target in targets {
-        let status = repository.status_file(&target).map_err(|error| {
-            apply_failed(
-                "git_status_failed",
-                format!("could not inspect instruction target Git state: {error}"),
-                MANUAL_REVIEW_REPAIR,
-            )
-        })?;
+        let status = match repository.status_file(&target) {
+            Ok(status) => status,
+            Err(error) if allow_missing_target && error.code() == git2::ErrorCode::NotFound => {
+                continue;
+            }
+            Err(error) => {
+                return Err(apply_failed(
+                    "git_status_failed",
+                    format!("could not inspect instruction target Git state: {error}"),
+                    MANUAL_REVIEW_REPAIR,
+                ));
+            }
+        };
         if status != git2::Status::CURRENT {
             return Err(apply_conflict(
                 "dirty_instruction_target",
@@ -1711,6 +1751,30 @@ fn repository_target_identity(
     if !canonical_target.starts_with(&canonical_root) {
         bail!("instruction target resolves outside the canonical repository root");
     }
+    let sha256 =
+        repository_identity_sha256(&canonical_root, logical_target, &canonical_target, existed)?;
+    Ok(RepositoryTargetIdentity {
+        sha256,
+        canonical_target,
+        existed,
+    })
+}
+
+fn repository_identity_sha256(
+    repository_root: &Path,
+    logical_target: &str,
+    canonical_target: &Path,
+    existed: bool,
+) -> Result<String> {
+    let canonical_root = fs::canonicalize(repository_root).with_context(|| {
+        format!(
+            "resolving canonical repository root {}",
+            repository_root.display()
+        )
+    })?;
+    if !canonical_target.starts_with(&canonical_root) {
+        bail!("instruction target resolves outside the canonical repository root");
+    }
     let canonical_root = canonical_root.to_str().ok_or_else(|| {
         anyhow::anyhow!(
             "canonical repository root {} is not valid UTF-8",
@@ -1730,11 +1794,7 @@ fn repository_target_identity(
     identity.update([0]);
     identity.update(canonical_target.as_bytes());
     identity.update([u8::from(existed)]);
-    Ok(RepositoryTargetIdentity {
-        sha256: format!("{:x}", identity.finalize()),
-        canonical_target: PathBuf::from(canonical_target),
-        existed,
-    })
+    Ok(format!("{:x}", identity.finalize()))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
