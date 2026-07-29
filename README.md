@@ -583,7 +583,13 @@ engram install-instructions
 ```
 
 That command writes or updates the slim `<!-- engram:start -->` block and
-the managed engram Agent Skills that carry the detailed routing guidance.
+the managed engram Agent Skills that carry the detailed routing guidance. The
+always-loaded block only points at project-instruction maintenance; the
+`engram-project-instruction-maintenance` Skill progressively discloses the
+doctor → propose → review → approve → local-apply workflow. It requires an
+explicit human review and approval, keeps proposal state on the server, keeps
+repository apply on the local host, and never treats staging, committing,
+pushing, or merging as part of instruction maintenance.
 See [`docs/usage.md`](docs/usage.md) for handoff examples, proactive query
 routing, bootstrap details, web UI screenshots, and the raw-wiki inspection
 commands. CLI URL/auth configuration lives in

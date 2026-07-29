@@ -26,6 +26,7 @@ use tower::ServiceExt;
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
 const TOOLS_CALL_STATUS: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_status","arguments":{}}}"#;
+const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#;
 
 /// Build a `/mcp` router exactly like `serve.rs` does, toggling stateful
 /// mode. Returns the `Store` too so the writer actor stays alive for the
@@ -130,6 +131,44 @@ async fn stateless_initialize_returns_json_result() {
     assert!(
         body.contains("serverInfo") || body.contains("protocolVersion"),
         "initialize result should carry server info: {body}"
+    );
+}
+
+/// Project-instruction application remains a local CLI capability. A remote
+/// server may expose proposal storage through authenticated admin routes, but
+/// its MCP tool list must stay at the existing 16 tools and carry no repository
+/// apply authority.
+#[tokio::test]
+async fn stateless_remote_mcp_has_no_repository_instruction_write_tool() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router.clone().oneshot(post(TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&body).expect("tools/list must return JSON");
+    let tools = json["result"]["tools"]
+        .as_array()
+        .expect("tools/list result must contain tools");
+    assert_eq!(
+        tools.len(),
+        16,
+        "the MCP tool surface must remain unchanged"
+    );
+
+    let names: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"memory_install_self_routing"),
+        "the existing read-only routing installer must remain available"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains("instruction_apply")
+            && !name.contains("project_instruction")
+            && *name != "instructions"),
+        "remote MCP must not gain repository instruction write authority: {names:?}"
     );
 }
 
