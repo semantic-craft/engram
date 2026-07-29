@@ -43,7 +43,8 @@ use crate::ops;
 pub enum AutoImproveProposalStatus {
     /// Staged and awaiting an operator decision.
     Pending,
-    /// Approved and applied — `applied_page_id` points at the written page.
+    /// Approved. Wiki proposals are already applied; project-instruction
+    /// proposals are only authorized/apply-ready and keep `applied_page_id` null.
     Approved,
     /// Rejected by an operator with a reason.
     Rejected,
@@ -357,8 +358,39 @@ pub struct AutoImproveProposalDetail {
     /// Complete source selection and evidence provenance.
     #[serde(rename = "provenance")]
     pub provenance_json: serde_json::Value,
+    /// Repository target content captured when an instruction proposal was staged.
+    pub base_content: Option<String>,
+    /// Hash binding the currently reviewable instruction proposal fields.
+    pub approval_sha256: Option<String>,
+    /// Latest persisted human-review revision (`0` is the staged wording).
+    pub review_revision: Option<i64>,
+    /// Append-only wording revisions for project-instruction proposals.
+    pub revisions: Vec<ProjectInstructionProposalRevision>,
     /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
+}
+
+/// One immutable wording revision of a project-instruction proposal.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectInstructionProposalRevision {
+    /// Monotonic proposal-local revision (`0` is the staged wording).
+    pub revision: i64,
+    /// Full wording reviewed at this revision.
+    pub proposed_content: String,
+    /// SHA-256 of `proposed_content`.
+    pub proposed_content_sha256: String,
+    /// Unified diff against the immutable staged base content.
+    pub unified_diff: String,
+    /// Estimated token delta against the immutable staged base content.
+    pub estimated_token_delta: i64,
+    /// Hash binding all fields that approval authorizes.
+    pub approval_sha256: String,
+    /// Actor that staged or edited this revision.
+    pub actor: serde_json::Value,
+    /// Acting user, when identified.
+    pub author_id: Option<UserId>,
+    /// Revision time (Unix microseconds).
+    pub at: i64,
 }
 
 /// One proposal-only project-instruction change to persist.
@@ -376,6 +408,8 @@ pub struct StageProjectInstructionProposal {
     pub target_context_layer: String,
     /// Stage-time SHA-256 of target content.
     pub base_sha256: [u8; 32],
+    /// Stage-time target content retained so later human edits can be re-diffed.
+    pub base_content: String,
     /// `exact_anchor` or `owned_region`.
     pub boundary_kind: String,
     /// Exact anchor or owned-region identifier.
@@ -403,6 +437,90 @@ pub struct StageProjectInstructionProposal {
 pub struct StagedProjectInstructionProposal {
     /// Persisted proposal id.
     pub proposal_id: AutoImproveProposalId,
+}
+
+/// Edit the wording of one pending project-instruction proposal.
+#[derive(Debug, Clone)]
+pub struct EditProjectInstructionProposal {
+    /// Owning workspace (scope check).
+    pub workspace_id: WorkspaceId,
+    /// Owning project (scope check).
+    pub project_id: ProjectId,
+    /// Proposal to edit.
+    pub proposal_id: AutoImproveProposalId,
+    /// Approval hash the reviewer actually inspected.
+    pub expected_approval_sha256: [u8; 32],
+    /// Replacement full target content.
+    pub proposed_content: String,
+    /// Reviewing actor, separate from the proposing actor.
+    pub actor: ActorContext,
+    /// Reviewing user, when identified.
+    pub author_id: Option<UserId>,
+}
+
+/// Result of editing a project-instruction proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditProjectInstructionProposalResult {
+    /// A new immutable revision was appended.
+    Updated {
+        /// Newly assigned review revision.
+        revision: i64,
+        /// New approval binding hash.
+        approval_sha256: [u8; 32],
+        /// Recalculated token delta.
+        estimated_token_delta: i64,
+    },
+    /// The requested wording already matches the current revision.
+    Unchanged {
+        /// Current review revision.
+        revision: i64,
+        /// Current approval binding hash.
+        approval_sha256: [u8; 32],
+        /// Current token delta.
+        estimated_token_delta: i64,
+    },
+    /// The request was stale or the proposal had already reached a terminal state.
+    Conflict {
+        /// Stable operator-facing reason.
+        reason: String,
+    },
+}
+
+/// Approve one project-instruction proposal without applying its target.
+#[derive(Debug, Clone)]
+pub struct ApproveProjectInstructionProposal {
+    /// Owning workspace (scope check).
+    pub workspace_id: WorkspaceId,
+    /// Owning project (scope check).
+    pub project_id: ProjectId,
+    /// Proposal to authorize for later local apply.
+    pub proposal_id: AutoImproveProposalId,
+    /// Approval hash the reviewer actually inspected.
+    pub expected_approval_sha256: [u8; 32],
+    /// Reviewing actor, separate from the proposing actor.
+    pub actor: ActorContext,
+    /// Reviewing user, when identified.
+    pub author_id: Option<UserId>,
+}
+
+/// Result of DB-only project-instruction approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveProjectInstructionProposalResult {
+    /// Transitioned from pending to approved/apply-ready.
+    Approved {
+        /// Approval binding hash authorized by the reviewer.
+        approval_sha256: [u8; 32],
+    },
+    /// The same approval was already recorded; no audit event was duplicated.
+    AlreadyApproved {
+        /// Existing approval binding hash.
+        approval_sha256: [u8; 32],
+    },
+    /// The request was stale or the proposal had another terminal state.
+    Conflict {
+        /// Stable operator-facing reason.
+        reason: String,
+    },
 }
 
 /// One append-only status-history entry for a proposal.
@@ -567,6 +685,127 @@ pub enum ApproveAutoImproveProposalResult {
 #[must_use]
 pub fn artifact_path_for(proposal_id: AutoImproveProposalId) -> String {
     format!("_pending/auto-improve/{proposal_id}.md")
+}
+
+/// Build the deterministic unified diff used for project-instruction review.
+#[must_use]
+pub fn project_instruction_unified_diff(path: &str, before: &str, after: &str) -> String {
+    if before == after {
+        return String::new();
+    }
+
+    const CONTEXT_LINES: usize = 3;
+    let before_lines: Vec<_> = before.split_inclusive('\n').collect();
+    let after_lines: Vec<_> = after.split_inclusive('\n').collect();
+    let mut common_prefix = 0;
+    while common_prefix < before_lines.len()
+        && common_prefix < after_lines.len()
+        && before_lines[common_prefix] == after_lines[common_prefix]
+    {
+        common_prefix += 1;
+    }
+    let mut common_suffix = 0;
+    while common_suffix < before_lines.len().saturating_sub(common_prefix)
+        && common_suffix < after_lines.len().saturating_sub(common_prefix)
+        && before_lines[before_lines.len() - common_suffix - 1]
+            == after_lines[after_lines.len() - common_suffix - 1]
+    {
+        common_suffix += 1;
+    }
+
+    let old_change_end = before_lines.len() - common_suffix;
+    let new_change_end = after_lines.len() - common_suffix;
+    let context_start = common_prefix.saturating_sub(CONTEXT_LINES);
+    let old_context_end = (old_change_end + CONTEXT_LINES).min(before_lines.len());
+    let new_context_end = (new_change_end + CONTEXT_LINES).min(after_lines.len());
+    let before_count = old_context_end - context_start;
+    let after_count = new_context_end - context_start;
+    let before_start = if before_count == 0 {
+        0
+    } else {
+        context_start + 1
+    };
+    let after_start = if after_count == 0 {
+        0
+    } else {
+        context_start + 1
+    };
+    let mut output = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{before_start},{before_count} +{after_start},{after_count} @@\n"
+    );
+    append_diff_lines(
+        &mut output,
+        ' ',
+        &before_lines[context_start..common_prefix],
+    );
+    append_diff_lines(
+        &mut output,
+        '-',
+        &before_lines[common_prefix..old_change_end],
+    );
+    append_diff_lines(
+        &mut output,
+        '+',
+        &after_lines[common_prefix..new_change_end],
+    );
+    append_diff_lines(
+        &mut output,
+        ' ',
+        &before_lines[old_change_end..old_context_end],
+    );
+    output
+}
+
+fn append_diff_lines(output: &mut String, prefix: char, lines: &[&str]) {
+    for line in lines {
+        output.push(prefix);
+        output.push_str(line);
+        if !line.ends_with('\n') {
+            output.push('\n');
+            output.push_str("\\ No newline at end of file\n");
+        }
+    }
+}
+
+/// Estimate the context-token delta used by instruction proposals.
+#[must_use]
+pub fn project_instruction_token_delta(before: &str, after: &str) -> i64 {
+    fn estimated_tokens(body: &str) -> i64 {
+        i64::try_from(body.len().div_ceil(4)).unwrap_or(i64::MAX)
+    }
+    estimated_tokens(after) - estimated_tokens(before)
+}
+
+/// Hash every field whose meaning is authorized by human approval.
+#[must_use]
+pub fn project_instruction_approval_sha256(
+    operation: AutoImproveProposalOperation,
+    logical_target: &str,
+    target_context_layer: &str,
+    base_sha256: &[u8; 32],
+    boundary_kind: &str,
+    boundary_value: &str,
+    proposed_content: &str,
+) -> [u8; 32] {
+    fn update_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"engram-project-instruction-approval-v1");
+    for field in [
+        operation.as_str().as_bytes(),
+        logical_target.as_bytes(),
+        target_context_layer.as_bytes(),
+        base_sha256.as_slice(),
+        boundary_kind.as_bytes(),
+        boundary_value.as_bytes(),
+        proposed_content.as_bytes(),
+    ] {
+        update_field(&mut hasher, field);
+    }
+    hasher.finalize().into()
 }
 
 /// Ensure a scheduler-state row exists for the scope, seeding the watermark
@@ -926,6 +1165,23 @@ pub fn stage_project_instruction_proposal(
             "project-instruction proposal requires provenance".into(),
         ));
     }
+    if sha256(input.base_content.as_bytes()) != input.base_sha256 {
+        return Err(StoreError::InvalidState(
+            "project-instruction base content hash does not match".into(),
+        ));
+    }
+    let expected_diff = project_instruction_unified_diff(
+        input.logical_target.as_str(),
+        &input.base_content,
+        &input.proposed_content,
+    );
+    let expected_token_delta =
+        project_instruction_token_delta(&input.base_content, &input.proposed_content);
+    if input.unified_diff != expected_diff || input.estimated_token_delta != expected_token_delta {
+        return Err(StoreError::InvalidState(
+            "project-instruction derived review fields do not match content".into(),
+        ));
+    }
 
     let now = Timestamp::now().as_microsecond();
     let run_id = AutoImproveRunId::new();
@@ -933,6 +1189,15 @@ pub fn stage_project_instruction_proposal(
     let actor_json = serde_json::to_string(&input.proposing_actor)?;
     let provenance_json = serde_json::to_string(&input.provenance_json)?;
     let body_sha256 = sha256(input.proposed_content.as_bytes());
+    let approval_sha256 = project_instruction_approval_sha256(
+        input.operation,
+        input.logical_target.as_str(),
+        &input.target_context_layer,
+        &input.base_sha256,
+        &input.boundary_kind,
+        &input.boundary_value,
+        &input.proposed_content,
+    );
     let tx = conn.transaction()?;
 
     tx.query_row(
@@ -989,10 +1254,12 @@ pub fn stage_project_instruction_proposal(
           target_updated_at_at_stage, staged_at, edit_mode, patch_json, \
           expected_base_body_sha256, materialized_base_body_sha256, target_kind, \
           proposal_operation, logical_target, target_context_layer, base_sha256, \
-          boundary_kind, boundary_value, unified_diff, estimated_token_delta, provenance_json) \
+          boundary_kind, boundary_value, unified_diff, estimated_token_delta, provenance_json, \
+          base_content, approval_sha256) \
          VALUES (?1, ?2, ?3, ?4, 'pending', 'update', ?5, 'project_instruction', ?6, 1.0, \
                  ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, NULL, ?12, 'full_page', NULL, NULL, \
-                 NULL, 'project_instruction', ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 NULL, 'project_instruction', ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, \
+                 ?22, ?23)",
         params![
             proposal_id.as_bytes(),
             run_id.as_bytes(),
@@ -1015,6 +1282,25 @@ pub fn stage_project_instruction_proposal(
             input.unified_diff.as_str(),
             input.estimated_token_delta,
             serde_json::to_string(&input.provenance_json)?,
+            input.base_content.as_str(),
+            approval_sha256.as_slice(),
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO project_instruction_proposal_revisions \
+         (proposal_id, revision, proposed_content, proposed_content_sha256, unified_diff, \
+          estimated_token_delta, approval_sha256, actor_json, author_id, at) \
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            proposal_id.as_bytes(),
+            input.proposed_content.as_str(),
+            body_sha256.as_slice(),
+            input.unified_diff.as_str(),
+            input.estimated_token_delta,
+            approval_sha256.as_slice(),
+            serde_json::to_string(&input.proposing_actor)?,
+            input.proposing_author_id.map(|id| id.as_bytes().to_vec()),
+            now,
         ],
     )?;
     insert_event_in_tx(
@@ -1027,11 +1313,339 @@ pub fn stage_project_instruction_proposal(
             "target_kind": "project_instruction",
             "operation": input.operation.as_str(),
             "logical_target": input.logical_target.as_str(),
+            "review_revision": 0,
+            "approval_sha256": hex_bytes(&approval_sha256),
         }),
         now,
     )?;
     tx.commit()?;
     Ok(StagedProjectInstructionProposal { proposal_id })
+}
+
+/// Replace the wording of one pending project-instruction proposal and append
+/// an immutable revision plus audit event. Repository and Wiki targets are not
+/// consulted or mutated.
+///
+/// # Errors
+/// Returns a store error when persisted proposal metadata is malformed or the
+/// SQLite transaction fails. Stale and terminal requests return a typed
+/// [`EditProjectInstructionProposalResult::Conflict`].
+pub fn edit_project_instruction_proposal(
+    conn: &mut Connection,
+    input: &EditProjectInstructionProposal,
+) -> StoreResult<EditProjectInstructionProposalResult> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let proposal = tx
+        .query_row(
+            "SELECT status, target_kind, proposal_operation, logical_target, \
+                    target_context_layer, base_sha256, boundary_kind, boundary_value, \
+                    base_content, approval_sha256, body_markdown, estimated_token_delta \
+             FROM auto_improve_proposals \
+             WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![
+                input.proposal_id.as_bytes(),
+                input.workspace_id.as_bytes(),
+                input.project_id.as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        status,
+        target_kind,
+        operation,
+        logical_target,
+        target_context_layer,
+        base_sha256,
+        boundary_kind,
+        boundary_value,
+        base_content,
+        approval_sha256,
+        current_content,
+        current_token_delta,
+    )) = proposal
+    else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal not found in scope".into(),
+        });
+    };
+    if target_kind != PendingProposalTargetKind::ProjectInstruction.as_str() {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "Wiki proposals do not support instruction wording edits".into(),
+        });
+    }
+    if status != AutoImproveProposalStatus::Pending.as_str() {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: format!("project-instruction proposal is terminal: {status}"),
+        });
+    }
+    let Some(operation) = operation else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(logical_target) = logical_target else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(target_context_layer) = target_context_layer else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(base_sha256) = base_sha256 else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(boundary_kind) = boundary_kind else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(boundary_value) = boundary_value else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(base_content) = base_content else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let Some(approval_sha256) = approval_sha256 else {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let base_sha256 = bytes32(base_sha256)?;
+    let approval_sha256 = bytes32(approval_sha256)?;
+    if approval_sha256 != input.expected_approval_sha256 {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "stale project-instruction review hash".into(),
+        });
+    }
+    let revision: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(revision), -1) \
+         FROM project_instruction_proposal_revisions WHERE proposal_id = ?1",
+        params![input.proposal_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if revision < 0 {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    }
+    if current_content == input.proposed_content {
+        return Ok(EditProjectInstructionProposalResult::Unchanged {
+            revision,
+            approval_sha256,
+            estimated_token_delta: current_token_delta.unwrap_or_default(),
+        });
+    }
+
+    let operation = AutoImproveProposalOperation::from_str(&operation)?;
+    let unified_diff =
+        project_instruction_unified_diff(&logical_target, &base_content, &input.proposed_content);
+    let estimated_token_delta =
+        project_instruction_token_delta(&base_content, &input.proposed_content);
+    let new_approval_sha256 = project_instruction_approval_sha256(
+        operation,
+        &logical_target,
+        &target_context_layer,
+        &base_sha256,
+        &boundary_kind,
+        &boundary_value,
+        &input.proposed_content,
+    );
+    let proposed_content_sha256 = sha256(input.proposed_content.as_bytes());
+    let next_revision = revision + 1;
+    let changed = tx.execute(
+        "UPDATE auto_improve_proposals \
+         SET body_markdown = ?1, body_sha256 = ?2, unified_diff = ?3, \
+             estimated_token_delta = ?4, approval_sha256 = ?5 \
+         WHERE id = ?6 AND workspace_id = ?7 AND project_id = ?8 \
+           AND status = 'pending' AND approval_sha256 = ?9",
+        params![
+            input.proposed_content.as_str(),
+            proposed_content_sha256.as_slice(),
+            unified_diff.as_str(),
+            estimated_token_delta,
+            new_approval_sha256.as_slice(),
+            input.proposal_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            approval_sha256.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "stale project-instruction review hash".into(),
+        });
+    }
+    tx.execute(
+        "INSERT INTO project_instruction_proposal_revisions \
+         (proposal_id, revision, proposed_content, proposed_content_sha256, unified_diff, \
+          estimated_token_delta, approval_sha256, actor_json, author_id, at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            input.proposal_id.as_bytes(),
+            next_revision,
+            input.proposed_content.as_str(),
+            proposed_content_sha256.as_slice(),
+            unified_diff.as_str(),
+            estimated_token_delta,
+            new_approval_sha256.as_slice(),
+            serde_json::to_string(&input.actor)?,
+            input.author_id.map(|id| id.as_bytes().to_vec()),
+            now,
+        ],
+    )?;
+    insert_event_in_tx(
+        &tx,
+        input.proposal_id,
+        "edited",
+        &input.actor,
+        input.author_id,
+        &serde_json::json!({
+            "review_revision": next_revision,
+            "previous_approval_sha256": hex_bytes(&approval_sha256),
+            "approval_sha256": hex_bytes(&new_approval_sha256),
+            "estimated_token_delta": estimated_token_delta,
+        }),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(EditProjectInstructionProposalResult::Updated {
+        revision: next_revision,
+        approval_sha256: new_approval_sha256,
+        estimated_token_delta,
+    })
+}
+
+/// Mark a project-instruction proposal approved/apply-ready without touching
+/// repository files, Wiki files, Wiki index rows, or Git state.
+///
+/// # Errors
+/// Returns a store error when persisted metadata is malformed or the SQLite
+/// transaction fails. Stale and terminal requests return a typed conflict.
+pub fn approve_project_instruction_proposal(
+    conn: &mut Connection,
+    input: &ApproveProjectInstructionProposal,
+) -> StoreResult<ApproveProjectInstructionProposalResult> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let proposal = tx
+        .query_row(
+            "SELECT status, target_kind, approval_sha256 \
+             FROM auto_improve_proposals \
+             WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![
+                input.proposal_id.as_bytes(),
+                input.workspace_id.as_bytes(),
+                input.project_id.as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, target_kind, approval_sha256)) = proposal else {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal not found in scope".into(),
+        });
+    };
+    if target_kind != PendingProposalTargetKind::ProjectInstruction.as_str() {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: "Wiki proposals must use the Wiki approval path".into(),
+        });
+    }
+    let Some(approval_sha256) = approval_sha256 else {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: "project-instruction proposal predates editable review metadata".into(),
+        });
+    };
+    let approval_sha256 = bytes32(approval_sha256)?;
+    if approval_sha256 != input.expected_approval_sha256 {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: "stale project-instruction review hash".into(),
+        });
+    }
+    if status == AutoImproveProposalStatus::Approved.as_str() {
+        return Ok(ApproveProjectInstructionProposalResult::AlreadyApproved { approval_sha256 });
+    }
+    if status != AutoImproveProposalStatus::Pending.as_str() {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: format!("project-instruction proposal is terminal: {status}"),
+        });
+    }
+
+    let actor_json = serde_json::to_string(&input.actor)?;
+    let changed = tx.execute(
+        "UPDATE auto_improve_proposals \
+         SET status = 'approved', decided_at = ?1, decision_reason = NULL, \
+             decided_by_author_id = ?2, decided_by_actor_json = ?3, \
+             applied_page_id = NULL, checkpoint = NULL \
+         WHERE id = ?4 AND workspace_id = ?5 AND project_id = ?6 \
+           AND status = 'pending' AND target_kind = 'project_instruction' \
+           AND approval_sha256 = ?7",
+        params![
+            now,
+            input.author_id.map(|id| id.as_bytes().to_vec()),
+            actor_json,
+            input.proposal_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            approval_sha256.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(ApproveProjectInstructionProposalResult::Conflict {
+            reason: "stale project-instruction review hash".into(),
+        });
+    }
+    let review_revision: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(revision), 0) \
+         FROM project_instruction_proposal_revisions WHERE proposal_id = ?1",
+        params![input.proposal_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    insert_event_in_tx(
+        &tx,
+        input.proposal_id,
+        "approved",
+        &input.actor,
+        input.author_id,
+        &serde_json::json!({
+            "apply_ready": true,
+            "review_revision": review_revision,
+            "approval_sha256": hex_bytes(&approval_sha256),
+        }),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(ApproveProjectInstructionProposalResult::Approved { approval_sha256 })
 }
 
 /// Mark a pending proposal `failed`, record the rejection fingerprint, and
@@ -1575,6 +2189,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
+}
+
+fn hex_bytes(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 pub(crate) fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<AutoImproveProposalSummary> {

@@ -31,10 +31,15 @@ below start from the fork.
   doctor finding. These DB-backed `project_instruction` records preserve the
   target layer, operation, base hash, exact anchor or owned region, proposed
   content, unified diff, token delta, rationale, evidence provenance, actor,
-  and timestamps in the existing pending-writes review surface. They can be
-  listed, shown, diffed, or rejected, but cannot be approved or applied yet;
-  staging and rejection never change repository files, Wiki pages, or Git
-  state. Durable-rule no-change detection requires a complete normalized
+  and timestamps in the existing pending-writes review surface. Reviewers can
+  now edit the proposed wording with server-side diff/token/hash recomputation;
+  append-only revisions retain the original proposal and each editing actor.
+  Independent, optimistic-hash-bound approval records a separate deciding actor
+  and advances only the DB row to `approved`/apply-ready. Staging, editing,
+  approval, and rejection never change repository files, Wiki pages, or Git
+  state, and Wiki scheduler/provider/auto-approval settings cannot bypass the
+  human gate. Applying approved instructions remains unimplemented.
+  Durable-rule no-change detection requires a complete normalized
   instruction block, so contradictory or larger statements are not mistaken
   for the selected rule. Existing Wiki proposals retain their sidecar and Wiki
   mutation path.

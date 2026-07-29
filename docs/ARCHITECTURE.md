@@ -31,7 +31,10 @@ index for search, sessions, observations, handoffs, audit, and embeddings.
 Auto-improvement sits on the provider-backed maintenance side: the server
 schedules reviews for newly completed sessions in every project, records
 validated proposals in the pending-writes audit trail, and auto-approves them
-through the normal wiki write path by default. Scheduler ticks are
+through the normal wiki write path by default. This automatic policy applies
+only to `wiki_page` proposals; DB-only `project_instruction` proposals always
+require an explicit, hash-bound human approval and still do not write their
+target. Scheduler ticks are
 non-overlapping; long all-project review passes delay the next tick instead of
 starting another copy. Scheduling and approval are separate. Admins can set
 `[auto_improve.scheduler] enabled = false` to stop background review, or
@@ -298,7 +301,7 @@ deterministic content categories, evidence, recommended actions and destination
 layers without opening the Wiki, proposal store, index, or audit state. The
 classification layer is diagnostic only and has no repository-write path.
 
-`instructions propose` is the stateful, proposal-only bridge from one explicit
+`instructions propose` is the stateful, human-review bridge from one explicit
 `_rules/` page or selected doctor finding. The local CLI reads the repository
 snapshot, but the admin boundary validates evidence and secret shape, resolves
 the existing workspace/project without creating a scope, and computes the base
@@ -306,9 +309,14 @@ hash, unified diff, and token delta. The single writer actor stores a
 `project_instruction` row and audit event in the expanded pending-proposal
 tables. No repository content is sent through `Wiki::write_page`, no pending
 sidecar is created, and the Wiki approval function rejects this target kind.
-List/show/diff/reject share the existing authenticated, scoped review surface;
-editing, approval, and local application are deliberately separate later
-phases.
+List/show/diff/edit/approve/reject share the existing authenticated, scoped
+review surface. Each edit binds to the current approval hash, recomputes derived
+review fields from the stored base, and appends a reviewer-attributed revision.
+Approval binds to the exact current revision and stores a separate deciding
+actor, but only advances the SQLite record to `approved`/apply-ready. It never
+invokes a repository or Wiki mutation, and local application remains a separate
+phase. Wiki scheduler/provider/auto-approval settings cannot enter this manual
+approval path.
 
 ## Cross-cutting invariants
 

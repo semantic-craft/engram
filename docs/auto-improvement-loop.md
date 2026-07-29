@@ -384,7 +384,8 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `engram instructions propose --rule ...` / `--finding ...` | Stage one evidence-backed, DB-only `project_instruction` proposal; never edit repository or Wiki content. |
 | `engram pending-writes list` | Show staged Wiki and project-instruction changes. |
 | `engram pending-writes diff <id>` | Show the stored target-appropriate diff. |
-| `engram pending-writes approve <id>` | Apply a `wiki_page` proposal through the normal Wiki mutation path; `project_instruction` approval is intentionally unavailable in the proposal-only phase. |
+| `engram pending-writes edit <id> --content <text>` | Replace pending `project_instruction` wording under an optimistic approval hash; recompute diff/token delta and append a reviewer-attributed revision without changing a target. |
+| `engram pending-writes approve <id>` | Apply a `wiki_page` proposal through its existing Wiki mutation path, or mark the exact current `project_instruction` revision `approved`/apply-ready without applying it. |
 | `engram pending-writes reject <id>` | Record reviewer, reason, and terminal state without mutating the target. |
 
 Pending Wiki proposals remain visible as markdown under
@@ -392,8 +393,13 @@ Pending Wiki proposals remain visible as markdown under
 workflow. Project-instruction proposals intentionally have no Wiki sidecar:
 SQLite holds their target kind, operation, logical target/layer, base hash,
 approved boundary, proposed content, diff, token delta, provenance, actor, and
-audit events. This prevents proposal staging from turning repository policy
-into durable Wiki content or accidentally entering the Wiki mutation path.
+audit events. Append-only project-instruction revision rows preserve original
+and edited content, recalculated review fields, approval binding, and editing
+actor separately from the proposer and final decider. Approval changes only the
+proposal state to apply-ready. This prevents proposal review from turning
+repository policy into durable Wiki content or accidentally entering the Wiki
+mutation path. Auto-improvement scheduler, provider, evaluation, and Wiki
+auto-approval settings do not bypass this explicit human approval boundary.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the
@@ -481,17 +487,21 @@ Tests:
 
 ### Project-instruction proposal bridge
 
-Status: proposal-only staging, list/show/diff, and rejection are implemented.
+Status: proposal staging, list/show/diff, human edit, independent approval, and
+rejection are implemented. Applying approved repository instructions is not.
 
 The bridge extends pending-proposal rows compatibly with
 `target_kind = "project_instruction"`. It accepts only an explicitly selected
 durable `_rules/` page or deterministic doctor finding, rejects weak or
 secret-shaped evidence before storage, and records derived review data and full
 provenance through the single writer actor. Existing `wiki_page` rows retain
-their defaults, sidecars, and approval behavior. Project-instruction staging and
-rejection are DB-only, persist across restart, and never alter repository files,
-Wiki pages, or Git state. Human editing/approval and hash-checked local apply
-are intentionally outside this phase.
+their defaults, sidecars, and approval behavior. Project-instruction staging,
+editing, approval, and rejection are DB-only, persist across restart, and never
+alter repository files, Wiki pages, or Git state. Edits append revision history
+and refresh the diff, token delta, and approval hash. Explicit approval records
+a separate actor and makes only that revision apply-ready; scheduler and Wiki
+auto-approval configuration cannot invoke it. Hash-checked local apply remains
+outside this phase.
 
 ### Phase 3: Background Scheduler
 

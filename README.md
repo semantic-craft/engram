@@ -511,14 +511,22 @@ engram instructions propose \
 engram pending-writes list
 engram pending-writes show <proposal-id>
 engram pending-writes diff <proposal-id>
+engram pending-writes edit <proposal-id> --content "reviewed instruction wording"
+engram pending-writes approve <proposal-id>
 engram pending-writes reject <proposal-id> --reason "keep this in the Wiki"
 ```
 
-This is a proposal-only bridge. A staged `project_instruction` record is not an
+This is a human-review bridge. A staged `project_instruction` record is not an
 active rule: it lives in SQLite, creates no Wiki sidecar, and cannot use the
-Wiki approval path. Staging, inspection, and rejection leave repository files
-and Git state untouched. The server rejects missing or non-durable evidence and
-secret-shaped content before storage. See
+Wiki approval path. Reviewers may replace its proposed wording; the server
+recomputes the diff, token delta, content hash, and approval binding and keeps
+every revision with its own actor. Approval records a separate deciding actor
+and moves only the DB record to `approved`/apply-ready. Staging, editing,
+approval, and rejection leave repository files, Wiki pages, and Git state
+untouched; applying the approved proposal is a separate, unimplemented phase.
+Wiki scheduler, provider, and auto-approval configuration never auto-approves a
+`project_instruction` proposal. The server rejects missing or non-durable
+evidence and secret-shaped content before storage or edit. See
 [`docs/usage.md`](docs/usage.md#stage-project-instruction-proposals) for the
 operation and provenance model.
 
