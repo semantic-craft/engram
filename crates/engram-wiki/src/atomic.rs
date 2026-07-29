@@ -7,8 +7,78 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::{WikiError, WikiResult};
+
+const PERSIST_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
+
+#[cfg(windows)]
+const WINDOWS_SHARING_VIOLATION: i32 = 32;
+
+fn retry_io_with_backoff<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    mut is_retryable: impl FnMut(&std::io::Error) -> bool,
+    delays: &[Duration],
+    mut wait: impl FnMut(Duration),
+) -> std::io::Result<T> {
+    for &delay in delays {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable(&error) => wait(delay),
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
+
+fn is_transient_windows_persist_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(WINDOWS_SHARING_VIOLATION)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+pub(crate) fn persist_tempfile(tmp: tempfile::NamedTempFile, path: &Path) -> WikiResult<File> {
+    let mut pending = Some(tmp);
+    let result = retry_io_with_backoff(
+        || {
+            let current = match pending.take() {
+                Some(file) => file,
+                None => return Err(std::io::Error::other("temporary file state missing")),
+            };
+            match current.persist(path) {
+                Ok(file) => Ok(file),
+                Err(error) => {
+                    pending = Some(error.file);
+                    Err(error.error)
+                }
+            }
+        },
+        is_transient_windows_persist_error,
+        &PERSIST_RETRY_DELAYS,
+        std::thread::sleep,
+    );
+
+    match result {
+        Ok(file) => Ok(file),
+        Err(error) => match pending {
+            Some(file) => Err(tempfile::PersistError { error, file }.into()),
+            None => Err(WikiError::Io(error)),
+        },
+    }
+}
 
 /// Atomically replace the file at `path` with `bytes`.
 ///
@@ -33,7 +103,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> WikiResult<u64> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_data()?;
 
-    let persisted: File = tmp.persist(path)?;
+    let persisted = persist_tempfile(tmp, path)?;
     persisted.sync_data()?;
 
     // Best-effort: fsync the parent so the rename is durable too.
@@ -70,7 +140,64 @@ fn inode_of(_path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn retry_io_with_backoff_retries_only_requested_errors() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let result = retry_io_with_backoff(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(32))
+                } else {
+                    Ok("persisted")
+                }
+            },
+            |error| error.raw_os_error() == Some(32),
+            &[Duration::from_millis(10), Duration::from_millis(20)],
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, "persisted");
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            waits,
+            [Duration::from_millis(10), Duration::from_millis(20)]
+        );
+    }
+
+    #[test]
+    fn retry_io_with_backoff_returns_non_retryable_error_immediately() {
+        let mut attempts = 0;
+        let error = retry_io_with_backoff(
+            || {
+                attempts += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(5))
+            },
+            |error| error.raw_os_error() == Some(32),
+            &[Duration::from_millis(10)],
+            |_| panic!("non-retryable errors must not wait"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_windows_sharing_violations_are_retryable() {
+        assert!(is_transient_windows_persist_error(
+            &std::io::Error::from_raw_os_error(WINDOWS_SHARING_VIOLATION)
+        ));
+        assert!(!is_transient_windows_persist_error(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+    }
 
     #[test]
     fn writes_atomically_and_creates_parents() {

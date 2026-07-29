@@ -1452,7 +1452,7 @@ fn persist_tmp_with_rollback_snapshot(
     path: &Path,
 ) -> WikiResult<InstalledFile> {
     let previous = snapshot_existing_file(path)?;
-    let persisted = tmp.persist(path)?;
+    let persisted = atomic::persist_tempfile(tmp, path)?;
     persisted.sync_data()?;
     sync_parent_best_effort(path);
     Ok(InstalledFile {
