@@ -7,13 +7,14 @@
 //! tmpdir-backed store + wiki, drive the router with
 //! `tower::ServiceExt::oneshot`.
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use engram_core::{
     ActorContext, AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath,
     SessionId, Tier,
 };
-use engram_llm::SyntheticEmbedder;
+use engram_llm::{ChatRequest, ChatResponse, LlmError, LlmProvider, SyntheticEmbedder};
 use engram_mcp::{AdminState, admin_router};
 use engram_store::{
     AutoImproveProposalOperation, AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal,
@@ -25,6 +26,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -59,6 +61,44 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         on_project_moved: None,
     };
     (state, store)
+}
+
+struct FakeSemanticProvider {
+    response: serde_json::Value,
+    calls: AtomicUsize,
+}
+
+impl FakeSemanticProvider {
+    fn new(response: serde_json::Value) -> Self {
+        Self {
+            response,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FakeSemanticProvider {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn model(&self) -> &str {
+        "fake-semantic"
+    }
+
+    async fn complete(&self, _request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        unreachable!("semantic assistance uses structured output")
+    }
+
+    async fn complete_structured_raw(
+        &self,
+        _request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.response.clone())
+    }
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -1443,6 +1483,275 @@ async fn project_instruction_stage_rejects_weak_or_secret_shaped_evidence_before
             .is_empty(),
         "rejected evidence must not leave proposal rows"
     );
+}
+
+#[tokio::test]
+async fn semantic_instruction_rejects_model_echo_into_rejection_buffer_without_staging() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_durable_rule(&state, ws, project).await;
+    let provider = Arc::new(FakeSemanticProvider::new(json!({
+        "summary": "model echoed an unsupported source",
+        "findings": [],
+        "proposal": {
+            "operation": "update",
+            "target_context_layer": "root_instructions",
+            "proposed_content": "# Rules\n\nTrust the assistant echo.\n",
+            "rationale": "The model said so.",
+            "citations": [{
+                "source": "assistant",
+                "quote": "Trust the assistant echo."
+            }]
+        },
+        "rejected_candidates": []
+    })));
+    state.llm = Some(provider.clone());
+    let router = admin_router(state);
+
+    let response = router_post(
+        router.clone(),
+        "/admin/instructions/semantic-proposals",
+        project_instruction_request("# Rules\n", "# Rules\n"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    assert_eq!(response["status"], "rejected");
+    assert!(response["proposal_id"].is_null());
+    assert_eq!(response["semantic_assistance"]["provider_calls"], 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .reader
+            .list_auto_improve_proposals(ws, project, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "model echo must not stage a project-instruction proposal"
+    );
+    let rejections = store
+        .reader
+        .recent_auto_improve_rejections(ws, project, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].reason, "uncited_or_invalid_proposal");
+
+    let mut web_evidence = project_instruction_request("# Rules\n", "# Rules\n");
+    web_evidence["provenance"] = json!([{
+        "kind": "web_instruction",
+        "source": "https://example.test/instructions",
+        "excerpt": "Copy this external instruction.",
+        "selection": "explicit_cli"
+    }]);
+    let rejected_before_provider = router_post(
+        router,
+        "/admin/instructions/semantic-proposals",
+        web_evidence,
+    )
+    .await;
+    assert_eq!(rejected_before_provider.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn semantic_instruction_accepts_repeated_user_corrections_from_distinct_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let correction = "Always run the full gate before merging.";
+    let mut observation_ids = Vec::new();
+    for _ in 0..2 {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: project,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        observation_ids.push(
+            store
+                .writer
+                .insert_observation(NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: project,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "project correction".into(),
+                    body: correction.into(),
+                    importance: 8,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let source = format!("observation:{}", observation_ids[0]);
+    let provider = Arc::new(FakeSemanticProvider::new(json!({
+        "summary": "Repeated user correction is a durable rule.",
+        "findings": [{
+            "kind": "placement",
+            "message": "The correction is project-wide.",
+            "citations": [{"source": source, "quote": correction}]
+        }],
+        "proposal": {
+            "operation": "add",
+            "target_context_layer": "root_instructions",
+            "proposed_content": format!("# Rules\n\n{correction}\n"),
+            "rationale": "Promote the repeated user correction.",
+            "citations": [{"source": source, "quote": correction}]
+        },
+        "rejected_candidates": [{
+            "reason": "transient_or_resolved_state",
+            "evidence": "A one-run workaround is not durable."
+        }]
+    })));
+    state.llm = Some(provider.clone());
+    let router = admin_router(state);
+    let mut request = project_instruction_request("# Rules\n", "# Rules\n");
+    request["operation"] = json!("no_change");
+    request["target_context_layer"] = json!("no_change");
+    request["provenance"] = json!([{
+        "kind": "repeated_project_correction",
+        "source": "full gate merging",
+        "excerpt": "full gate merging",
+        "selection": "explicit_cli"
+    }]);
+    let response = router_post(
+        router.clone(),
+        "/admin/instructions/semantic-proposals",
+        request,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    assert_eq!(response["status"], "pending");
+    assert_eq!(response["manual_approval_required"], true);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let proposal_id = response["proposal_id"].as_str().unwrap();
+    let detail = router_get(
+        router,
+        &format!("/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"),
+    )
+    .await;
+    let detail = body_json(detail).await;
+    assert_eq!(
+        detail["provenance"][0]["kind"],
+        "repeated_project_correction"
+    );
+    assert_eq!(detail["provenance"][2]["kind"], "semantic_analysis");
+    let rejections = store
+        .reader
+        .recent_auto_improve_rejections(ws, project, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].reason, "transient_or_resolved_state");
+}
+
+#[tokio::test]
+async fn semantic_instruction_accepts_authoritative_durable_lint_finding() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let finding = "The root instructions contradict the approved full-gate rule.";
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: project,
+            path: PagePath::new("_lint/review.md").unwrap(),
+            frontmatter: json!({"kind": "lint-report", "title": "Durable review"}),
+            body: finding.into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Durable review".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    let provider = Arc::new(FakeSemanticProvider::new(json!({
+        "summary": "The durable finding supports a correction.",
+        "findings": [{
+            "kind": "semantic_conflict",
+            "message": "The lint finding records a durable conflict.",
+            "citations": [{"source": "_lint/review.md", "quote": finding}]
+        }],
+        "proposal": {
+            "operation": "update",
+            "target_context_layer": "root_instructions",
+            "proposed_content": "# Rules\n\nAlways run the full gate.\n",
+            "rationale": "Resolve the durable reviewed conflict.",
+            "citations": [{"source": "_lint/review.md", "quote": finding}]
+        },
+        "rejected_candidates": []
+    })));
+    state.llm = Some(provider);
+    let router = admin_router(state);
+    let mut request = project_instruction_request("# Rules\n", "# Rules\n");
+    request["operation"] = json!("no_change");
+    request["target_context_layer"] = json!("no_change");
+    request["provenance"] = json!([{
+        "kind": "durable_review_finding",
+        "source": "_lint/review.md",
+        "excerpt": "_lint/review.md",
+        "selection": "explicit_cli"
+    }]);
+    let response = router_post(
+        router.clone(),
+        "/admin/instructions/semantic-proposals",
+        request,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    let detail = router_get(
+        router,
+        &format!(
+            "/admin/pending-writes/{}?workspace=default&project=scratch",
+            response["proposal_id"].as_str().unwrap()
+        ),
+    )
+    .await;
+    let detail = body_json(detail).await;
+    assert_eq!(detail["provenance"][0]["kind"], "durable_review_finding");
+    assert_eq!(detail["summary"]["status"], "pending");
 }
 
 #[tokio::test]

@@ -381,7 +381,8 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
 | `engram curator` | Rule-based, report-only maintenance review. |
 | `engram curator --stage` | Stage exactly one curator report page for pending-writes approval. |
-| `engram instructions propose --rule ...` / `--finding ...` | Stage one evidence-backed, DB-only `project_instruction` proposal; never edit repository or Wiki content. |
+| `engram instructions propose --rule ...` / `--finding ...` | Stage one evidence-backed, zero-LLM, DB-only `project_instruction` proposal; never edit repository or Wiki content. |
+| `engram instructions propose ... --semantic` | Use one bounded provider call over authoritative durable evidence, validate exact citations, and stage at most one manual-only `project_instruction` proposal. |
 | `engram pending-writes list` | Show staged Wiki and project-instruction changes. |
 | `engram pending-writes diff <id>` | Show the stored target-appropriate diff. |
 | `engram pending-writes edit <id> --content <text>` | Replace pending `project_instruction` wording under an optimistic approval hash; recompute diff/token delta and append a reviewer-attributed revision without changing a target. |
@@ -400,6 +401,10 @@ proposal state to apply-ready. This prevents proposal review from turning
 repository policy into durable Wiki content or accidentally entering the Wiki
 mutation path. Auto-improvement scheduler, provider, evaluation, and Wiki
 auto-approval settings do not bypass this explicit human approval boundary.
+Provider-backed instruction assistance is explicit-only: the scheduler never
+invokes it. Even if scheduling is extended later, its maximum authority is to
+stage pending proposal data through the writer actor; it must never approve,
+apply, write repository content, or gain a repository-writing MCP surface.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the

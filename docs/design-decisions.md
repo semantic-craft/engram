@@ -203,6 +203,15 @@ guidance only. They are installed as ordinary `SKILL.md` files so agents can
 progressively load detailed instructions, but engram does not store durable
 memory in them and does not include a runtime skill router.
 
+Project-instruction semantic assistance deliberately remains an authenticated
+CLI/admin bridge rather than a seventeenth MCP tool. Its provider is advisory:
+the server supplies bounded authoritative evidence, requires exact citations,
+and accepts at most one pending proposal. It has no repository handle. The
+single writer actor persists review data only, and the human approval hash path
+remains separate from Wiki auto-approval. This preserves the narrow tool
+surface and prevents scheduler or model output from acquiring repository-write
+authority.
+
 ## 11. Identity & project scoping (3-tuple from day one)
 
 Lesson from basic-memory's v0.20 trauma: `(workspace, project, page_path)`. Even if v1 ships single-workspace, the schema and every API/tool param encodes the full 3-tuple. No retrofits.
