@@ -101,6 +101,11 @@ below start from the fork.
   finalization failure restores the approved base with the same no-clobber
   protocol and retains recovery artifacts.
 
+- Desktop: `npm run build:release` builds the distributable bundle with
+  `--remap-path-prefix` so release binaries carry no absolute build
+  paths (username leak), and fails if sanitization misses anything.
+  Release DMGs must be built through this script.
+
 ### Fixed
 
 - Local project-instruction apply now compares canonical repository and target
