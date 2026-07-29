@@ -10,6 +10,12 @@ below start from the fork.
 
 ## Unreleased
 
+### Fixed
+
+- macOS desktop release checksum sidecars now record the downloadable DMG
+  filename instead of a repository-relative build path, so users can verify
+  both downloaded assets directly with `shasum -a 256 -c`.
+
 ## Desktop 0.1.1 - 2026-07-29
 
 ### Changed
