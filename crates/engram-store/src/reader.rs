@@ -29,7 +29,7 @@ use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, ProjectInstructionProposalRevision, bytes32, opt_bytes32,
-    summary_from_row_with_metadata, to_sql_err,
+    project_instruction_application_from_row, summary_from_row_with_metadata, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
@@ -3743,7 +3743,8 @@ impl ReaderPool {
                             p.target_context_layer, r.proposal_actor_json, p.base_sha256, \
                             p.boundary_kind, p.boundary_value, p.unified_diff, \
                             p.estimated_token_delta, p.provenance_json, p.base_content, \
-                            p.approval_sha256 \
+                            p.approval_sha256, p.repository_identity_sha256, \
+                            p.base_target_existed \
                      FROM auto_improve_proposals p \
                      JOIN auto_improve_runs r ON r.id = p.run_id \
                      WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
@@ -3783,6 +3784,10 @@ impl ReaderPool {
                         let approval_sha256 = opt_bytes32(row.get(42)?)
                             .map_err(to_sql_err)?
                             .map(hex_bytes);
+                        let repository_identity_sha256 = opt_bytes32(row.get(43)?)
+                            .map_err(to_sql_err)?
+                            .map(hex_bytes);
+                        let base_target_existed = row.get(44)?;
                         Ok(AutoImproveProposalDetail {
                             summary,
                             rationale: row.get(12)?,
@@ -3814,6 +3819,8 @@ impl ReaderPool {
                             materialized_base_body_sha256: opt_bytes32(row.get(29)?)
                                 .map_err(to_sql_err)?,
                             base_sha256,
+                            repository_identity_sha256,
+                            base_target_existed,
                             boundary_kind: row.get(36)?,
                             boundary_value: row.get(37)?,
                             unified_diff: row.get(38)?,
@@ -3824,6 +3831,7 @@ impl ReaderPool {
                             approval_sha256,
                             review_revision: None,
                             revisions: Vec::new(),
+                            application: None,
                             events: Vec::new(),
                         })
                     },
@@ -3864,6 +3872,16 @@ impl ReaderPool {
                 detail.revisions.push(row?);
             }
             detail.review_revision = detail.revisions.last().map(|revision| revision.revision);
+            detail.application = conn
+                .query_row(
+                    "SELECT proposal_id, approval_sha256, before_sha256, after_sha256, outcome, \
+                            backup_path, proposing_actor_json, approving_actor_json, \
+                            applying_actor_json, applied_by_author_id, applied_at \
+                     FROM project_instruction_applications WHERE proposal_id = ?1",
+                    params![proposal_id.as_bytes()],
+                    project_instruction_application_from_row,
+                )
+                .optional()?;
             let mut stmt = conn.prepare(
                 "SELECT id, proposal_id, event, actor_json, author_id, detail_json, at \
                  FROM auto_improve_proposal_events \

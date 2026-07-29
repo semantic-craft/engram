@@ -25,6 +25,7 @@
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
 //! - `POST /admin/instructions/proposals` — stage a DB-only project-instruction proposal.
 //! - `POST /admin/instructions/semantic-proposals` — bounded provider assistance, then stage only.
+//! - `POST /admin/pending-writes/{id}/apply` — record a completed local instruction apply.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -61,10 +62,12 @@ use engram_store::{
     ApproveProjectInstructionProposalResult, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, EditProjectInstructionProposal,
     EditProjectInstructionProposalResult, EmbeddingWrite, NewAutoImproveProposal,
-    PendingProposalTargetKind, ReaderPool, RejectAutoImproveProposal, ScopeResolutionError,
-    StageAutoImproveRun, StageProjectInstructionProposal, StoreError, WriterHandle,
-    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
-    project_instruction_token_delta, project_instruction_unified_diff,
+    PendingProposalTargetKind, ProjectInstructionApplyOutcome, ReaderPool,
+    RecordProjectInstructionApplication, RecordProjectInstructionApplicationResult,
+    RejectAutoImproveProposal, ScopeResolutionError, StageAutoImproveRun,
+    StageProjectInstructionProposal, StoreError, WriterHandle, create_explicit_scope,
+    f32_vec_to_bytes, lookup_existing_scope, project_instruction_token_delta,
+    project_instruction_unified_diff,
 };
 use engram_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use flate2::Compression;
@@ -376,11 +379,23 @@ struct PendingApproveRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PendingApplyRequest {
+    expected_approval_sha256: String,
+    before_sha256: String,
+    after_sha256: String,
+    outcome: ProjectInstructionApplyOutcome,
+    #[serde(default)]
+    backup_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectInstructionProposalRequest {
     workspace: String,
     project: String,
     operation: String,
     logical_target: String,
+    repository_identity_sha256: String,
+    base_target_existed: bool,
     target_context_layer: String,
     boundary_kind: String,
     boundary_value: String,
@@ -550,6 +565,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/admin/pending-writes/{id}/approve",
             post(handle_pending_write_approve),
+        )
+        .route(
+            "/admin/pending-writes/{id}/apply",
+            post(handle_pending_write_apply),
         )
         .route(
             "/admin/pending-writes/{id}/reject",
@@ -1896,6 +1915,12 @@ async fn handle_project_instruction_proposal(
         Ok(path) => path,
         Err(error) => return bad_request(&format!("invalid logical target: {error}")),
     };
+    let repository_identity_sha256 = match hex_to_sha256(&request.repository_identity_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return bad_request(&format!("invalid repository_identity_sha256: {error}"));
+        }
+    };
     if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
         || request.proposed_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
     {
@@ -1912,6 +1937,13 @@ async fn handle_project_instruction_proposal(
         &request.provenance,
     ) {
         return bad_request(&error);
+    }
+    if operation == AutoImproveProposalOperation::NoChange
+        && request.base_content != request.proposed_content
+    {
+        return bad_request(
+            "no-change project-instruction proposals must preserve the exact base content",
+        );
     }
     let sanitizer = Sanitizer::builtin();
     let provenance_text = match serde_json::to_string(&request.provenance) {
@@ -1969,6 +2001,8 @@ async fn handle_project_instruction_proposal(
             project_id,
             operation,
             logical_target,
+            repository_identity_sha256,
+            base_target_existed: request.base_target_existed,
             target_context_layer: request.target_context_layer.clone(),
             base_sha256,
             base_content: request.base_content,
@@ -2029,6 +2063,12 @@ async fn handle_project_instruction_semantic_proposal(
     let logical_target = match PagePath::new(request.logical_target.clone()) {
         Ok(path) => path,
         Err(error) => return bad_request(&format!("invalid logical target: {error}")),
+    };
+    let repository_identity_sha256 = match hex_to_sha256(&request.repository_identity_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return bad_request(&format!("invalid repository_identity_sha256: {error}"));
+        }
     };
     if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES {
         return bad_request("project-instruction target content exceeds the 1 MiB limit");
@@ -2187,6 +2227,8 @@ async fn handle_project_instruction_semantic_proposal(
             project_id,
             operation,
             logical_target,
+            repository_identity_sha256,
+            base_target_existed: request.base_target_existed,
             target_context_layer: proposal.target_context_layer.clone(),
             base_sha256,
             base_content: request.base_content,
@@ -3105,6 +3147,119 @@ async fn handle_pending_write_approve(
         ),
         Err(e) => internal_err(e.to_string()),
     }
+}
+
+async fn handle_pending_write_apply(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+    Json(body): Json<PendingApplyRequest>,
+) -> impl IntoResponse {
+    let (ws, proj, detail) = match pending_detail(&state, &id, &query).await {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
+    if detail.summary.target_kind != PendingProposalTargetKind::ProjectInstruction {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "unsupported_target_kind",
+                "error": "Wiki proposals cannot use the local instruction apply path"
+            })),
+        );
+    }
+    if !matches!(
+        detail.summary.operation,
+        AutoImproveProposalOperation::Add
+            | AutoImproveProposalOperation::Update
+            | AutoImproveProposalOperation::StaleDelete
+            | AutoImproveProposalOperation::NoChange
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "unsupported_operation",
+                "error": format!(
+                    "{} is not supported by the single-target local apply path",
+                    detail.summary.operation.as_str()
+                )
+            })),
+        );
+    }
+    let expected_approval_sha256 = match hex_to_sha256(&body.expected_approval_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid expected_approval_sha256: {error}")
+                })),
+            );
+        }
+    };
+    let before_sha256 = match hex_to_sha256(&body.before_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid before_sha256: {error}")
+                })),
+            );
+        }
+    };
+    let after_sha256 = match hex_to_sha256(&body.after_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid after_sha256: {error}")
+                })),
+            );
+        }
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let result = state
+        .writer
+        .record_project_instruction_application(RecordProjectInstructionApplication {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id: detail.summary.id,
+            expected_approval_sha256,
+            before_sha256,
+            after_sha256,
+            outcome: body.outcome,
+            backup_path: body.backup_path,
+            actor,
+            author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await;
+    let (application, idempotent) = match result {
+        Ok(RecordProjectInstructionApplicationResult::Recorded { application }) => {
+            (application, false)
+        }
+        Ok(RecordProjectInstructionApplicationResult::AlreadyRecorded { application }) => {
+            (application, true)
+        }
+        Err(StoreError::InvalidState(message)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "status": "conflict", "error": message })),
+            );
+        }
+        Err(error) => return internal_err(error.to_string()),
+    };
+    let mut response = serde_json::to_value(application).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = response.as_object_mut() {
+        object.insert("status".into(), serde_json::json!("applied"));
+        object.insert("idempotent".into(), serde_json::json!(idempotent));
+    }
+    (StatusCode::OK, Json(response))
 }
 
 async fn handle_pending_write_reject(
@@ -7528,6 +7683,8 @@ mod tests {
                     "project": "scratch",
                     "operation": "add",
                     "logical_target": "AGENTS.md",
+                    "repository_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "base_target_existed": false,
                     "target_context_layer": "root_instructions",
                     "boundary_kind": "exact_anchor",
                     "boundary_value": "EOF",
@@ -7577,6 +7734,16 @@ mod tests {
                 "POST",
                 "/admin/pending-writes/00000000-0000-0000-0000-000000000000/approve?workspace=default&project=scratch",
                 serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/apply?workspace=default&project=scratch",
+                serde_json::json!({
+                    "expected_approval_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "before_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "after_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "outcome": "no_op"
+                }),
             ),
             (
                 "POST",

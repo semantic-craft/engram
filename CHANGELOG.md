@@ -38,7 +38,7 @@ below start from the fork.
   and advances only the DB row to `approved`/apply-ready. Staging, editing,
   approval, and rejection never change repository files, Wiki pages, or Git
   state, and Wiki scheduler/provider/auto-approval settings cannot bypass the
-  human gate. Applying approved instructions remains unimplemented.
+  human gate.
   Durable-rule no-change detection requires a complete normalized
   instruction block, so contradictory or larger statements are not mistaken
   for the selected rule. Existing Wiki proposals retain their sidecar and Wiki
@@ -56,6 +56,20 @@ below start from the fork.
   binding. The deterministic no-LLM doctor/proposal paths are unchanged, the
   scheduler gains no approval/apply/repository-write authority, and no new MCP
   tool or repository-writing surface is added.
+- `engram instructions apply <proposal-id>` is the first local-only mutation
+  path for an approved project-instruction proposal. The CLI re-resolves the
+  canonical repository target, verifies the staging checkout's hashed identity,
+  recomputes the approval binding, checks the approved boundary and base
+  SHA-256 on the final read, preserves Engram's routing block, and writes
+  through a sibling tempfile plus atomic rename. Single-target apply accepts
+  add/update/stale-delete/no-change but rejects move proposals until their
+  destination mutation exists.
+  Changed files receive a timestamped recovery backup; no-change and repeated
+  applies are idempotent, and a retry can finish a missing audit record when
+  the target already matches and an exact base backup proves the prior update.
+  The single writer actor records proposing,
+  approving, and applying actors, approval/before/after hashes, outcome, and
+  backup path without granting the server or MCP any repository write access.
 
 ## 2.0.0 - 2026-07-19
 

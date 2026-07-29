@@ -387,6 +387,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `engram pending-writes diff <id>` | Show the stored target-appropriate diff. |
 | `engram pending-writes edit <id> --content <text>` | Replace pending `project_instruction` wording under an optimistic approval hash; recompute diff/token delta and append a reviewer-attributed revision without changing a target. |
 | `engram pending-writes approve <id>` | Apply a `wiki_page` proposal through its existing Wiki mutation path, or mark the exact current `project_instruction` revision `approved`/apply-ready without applying it. |
+| `engram instructions apply <id>` | Locally apply one approved `project_instruction` revision with approval/boundary/base-hash checks, atomic replacement, recovery backup, and structured actor/hash audit. |
 | `engram pending-writes reject <id>` | Record reviewer, reason, and terminal state without mutating the target. |
 
 Pending Wiki proposals remain visible as markdown under
@@ -405,6 +406,16 @@ Provider-backed instruction assistance is explicit-only: the scheduler never
 invokes it. Even if scheduling is extended later, its maximum authority is to
 stage pending proposal data through the writer actor; it must never approve,
 apply, write repository content, or gain a repository-writing MCP surface.
+Application is a distinct local-host command. Its recording endpoint receives
+only the successful outcome metadata, never repository content or authority to
+write a repository; MCP gains no new tool. Proposal-id uniqueness makes
+reporting and retries idempotent, while the stored backup path and before/after
+hashes make the local replacement recoverable and auditable. The proposal also retains a
+SHA-256 identity for its staging checkout, which apply must reproduce before a
+filesystem write. The first path supports add/update/stale-delete/no-change and
+rejects move operations until a destination write can be included. When a
+write completed but reporting did not, an exact approved-base backup permits a
+retry to finish the immutable audit instead of rewriting the target.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the
@@ -492,8 +503,8 @@ Tests:
 
 ### Project-instruction proposal bridge
 
-Status: proposal staging, list/show/diff, human edit, independent approval, and
-rejection are implemented. Applying approved repository instructions is not.
+Status: proposal staging, list/show/diff, human edit, independent approval,
+rejection, and the first local CAS apply path are implemented.
 
 The bridge extends pending-proposal rows compatibly with
 `target_kind = "project_instruction"`. It accepts only an explicitly selected
@@ -505,8 +516,13 @@ editing, approval, and rejection are DB-only, persist across restart, and never
 alter repository files, Wiki pages, or Git state. Edits append revision history
 and refresh the diff, token delta, and approval hash. Explicit approval records
 a separate actor and makes only that revision apply-ready; scheduler and Wiki
-auto-approval configuration cannot invoke it. Hash-checked local apply remains
-outside this phase.
+auto-approval configuration cannot invoke it. The explicit local apply command
+re-resolves the target, verifies the approved hash/boundary, preserves the
+routing block, verifies the staging checkout identity, writes atomically with a
+recovery backup, and records the
+proposer, approver, applier, hashes, and outcome. The server/MCP never writes the
+repository. Move operations remain review-only in this first single-target
+executor.
 
 ### Phase 3: Background Scheduler
 

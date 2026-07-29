@@ -171,6 +171,8 @@ pub enum InstructionsCommand {
     Doctor(InstructionsDoctorArgs),
     /// Stage an evidence-backed project-instruction proposal without applying it.
     Propose(Box<InstructionsProposeArgs>),
+    /// Apply an approved project-instruction proposal to the local repository.
+    Apply(InstructionsApplyArgs),
 }
 
 /// Arguments for `instructions doctor`.
@@ -222,6 +224,22 @@ pub struct InstructionsProposeArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Emit the staged proposal identity as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `instructions apply`.
+#[derive(Debug, Args)]
+pub struct InstructionsApplyArgs {
+    /// Approved project-instruction proposal id.
+    pub id: String,
+    /// Existing workspace scope.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Existing project scope. Omit to resolve from the current repository.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit the application report as JSON.
     #[arg(long)]
     pub json: bool,
 }

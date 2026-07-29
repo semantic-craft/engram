@@ -32,9 +32,11 @@ pub use auto_improve::{
     AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
     AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, EditProjectInstructionProposal,
     EditProjectInstructionProposalResult, FailAutoImproveProposal, NewAutoImproveProposal,
-    PendingProposalTargetKind, ProjectInstructionProposalRevision, RejectAutoImproveProposal,
-    StageAutoImproveRun, StageProjectInstructionProposal, StagedAutoImproveRun,
-    StagedProjectInstructionProposal, artifact_path_for, project_instruction_token_delta,
+    PendingProposalTargetKind, ProjectInstructionApplication, ProjectInstructionApplyOutcome,
+    ProjectInstructionProposalRevision, RecordProjectInstructionApplication,
+    RecordProjectInstructionApplicationResult, RejectAutoImproveProposal, StageAutoImproveRun,
+    StageProjectInstructionProposal, StagedAutoImproveRun, StagedProjectInstructionProposal,
+    artifact_path_for, project_instruction_approval_sha256, project_instruction_token_delta,
     project_instruction_unified_diff,
 };
 pub use decay::{DecayParams, retention_score};
@@ -117,8 +119,9 @@ impl Store {
 mod tests {
     use super::*;
     use engram_core::{
-        ActorContext, AgentKind, LinkTarget, NewObservation, NewPage, NewSession, ObservationId,
-        ObservationKind, PageId, PagePath, ProjectId, SessionId, Tier, UserId, WorkspaceId,
+        ActorContext, AgentKind, AutoImproveProposalId, LinkTarget, NewObservation, NewPage,
+        NewSession, ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, Tier,
+        UserId, WorkspaceId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -196,6 +199,97 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(body.as_bytes());
         hasher.finalize().into()
+    }
+
+    fn hash_hex(hash: [u8; 32]) -> String {
+        hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn stage_approved_project_instruction(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        logical_target: &str,
+        operation: AutoImproveProposalOperation,
+        base_content: &str,
+        proposed_content: &str,
+    ) -> (AutoImproveProposalId, [u8; 32]) {
+        let target_context_layer = match operation {
+            AutoImproveProposalOperation::NoChange => "no_change",
+            AutoImproveProposalOperation::MoveToSkill => "agent_skill",
+            AutoImproveProposalOperation::MoveToPathRule => "path_rules",
+            AutoImproveProposalOperation::MoveToWiki => "wiki",
+            AutoImproveProposalOperation::MoveToEnforcement => "enforcement",
+            _ if logical_target.contains('/') => "path_rules",
+            _ => "root_instructions",
+        };
+        let base_sha256 = sha256(base_content);
+        let boundary_kind = "owned_region";
+        let boundary_value = "engram-approved-rules";
+        let approval_sha256 = project_instruction_approval_sha256(
+            operation,
+            logical_target,
+            target_context_layer,
+            &base_sha256,
+            boundary_kind,
+            boundary_value,
+            proposed_content,
+        );
+        let staged = store
+            .writer
+            .stage_project_instruction_proposal(StageProjectInstructionProposal {
+                workspace_id: ws,
+                project_id: proj,
+                operation,
+                logical_target: PagePath::new(logical_target).unwrap(),
+                repository_identity_sha256: sha256("/test/repository"),
+                base_target_existed: !base_content.is_empty(),
+                target_context_layer: target_context_layer.into(),
+                base_sha256,
+                base_content: base_content.into(),
+                boundary_kind: boundary_kind.into(),
+                boundary_value: boundary_value.into(),
+                proposed_content: proposed_content.into(),
+                unified_diff: project_instruction_unified_diff(
+                    logical_target,
+                    base_content,
+                    proposed_content,
+                ),
+                estimated_token_delta: project_instruction_token_delta(
+                    base_content,
+                    proposed_content,
+                ),
+                title: "instruction proposal".into(),
+                rationale: "durable test rule".into(),
+                provenance_json: serde_json::json!([{"kind":"test"}]),
+                proposing_actor: ActorContext {
+                    user: Some("proposer".into()),
+                    ..ActorContext::default()
+                },
+                proposing_author_id: None,
+            })
+            .await
+            .unwrap();
+        let approved = store
+            .writer
+            .approve_project_instruction_proposal(ApproveProjectInstructionProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: staged.proposal_id,
+                expected_approval_sha256: approval_sha256,
+                actor: ActorContext {
+                    user: Some("approver".into()),
+                    ..ActorContext::default()
+                },
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            approved,
+            ApproveProjectInstructionProposalResult::Approved { .. }
+        ));
+        (staged.proposal_id, approval_sha256)
     }
 
     fn latest_snapshot(
@@ -481,6 +575,334 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn project_instruction_application_is_atomic_scoped_and_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let base = "# Rules\n\nold\n";
+        let proposed = "# Rules\n\nnew\n";
+        let (proposal_id, approval_sha256) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "AGENTS.md",
+            AutoImproveProposalOperation::Update,
+            base,
+            proposed,
+        )
+        .await;
+        let input = RecordProjectInstructionApplication {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id,
+            expected_approval_sha256: approval_sha256,
+            before_sha256: sha256(base),
+            after_sha256: sha256(proposed),
+            outcome: ProjectInstructionApplyOutcome::Updated,
+            backup_path: Some("/tmp/AGENTS.md.bak-1".into()),
+            actor: ActorContext {
+                user: Some("applier".into()),
+                ..ActorContext::default()
+            },
+            author_id: None,
+        };
+
+        let mut wrong_scope = input.clone();
+        wrong_scope.project_id = other;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(wrong_scope)
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        let mut wrong_after = input.clone();
+        wrong_after.after_sha256 = sha256("not approved");
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(wrong_after)
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+
+        let application = match store
+            .writer
+            .record_project_instruction_application(input.clone())
+            .await
+            .unwrap()
+        {
+            RecordProjectInstructionApplicationResult::Recorded { application } => application,
+            other => panic!("expected a new application, got {other:?}"),
+        };
+        assert_eq!(application.proposal_id, proposal_id);
+        assert_eq!(application.approval_sha256, hash_hex(approval_sha256));
+        assert_eq!(application.before_sha256, hash_hex(sha256(base)));
+        assert_eq!(application.after_sha256, hash_hex(sha256(proposed)));
+        assert_eq!(
+            application.proposing_actor.user.as_deref(),
+            Some("proposer")
+        );
+        assert_eq!(
+            application.approving_actor.user.as_deref(),
+            Some("approver")
+        );
+        assert_eq!(application.applying_actor.user.as_deref(), Some("applier"));
+
+        let repeated = store
+            .writer
+            .record_project_instruction_application(input.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated,
+            RecordProjectInstructionApplicationResult::AlreadyRecorded {
+                application: application.clone()
+            }
+        );
+        let mut contradictory = input;
+        contradictory.backup_path = Some("/tmp/AGENTS.md.bak-other".into());
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(contradictory)
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, proposal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Approved);
+        assert_eq!(
+            detail.repository_identity_sha256,
+            Some(hash_hex(sha256("/test/repository")))
+        );
+        assert_eq!(detail.application, Some(application));
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .filter(|event| event.event == "applied")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn project_instruction_application_validates_created_updated_and_no_op_shapes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let (created_id, created_approval) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "AGENTS.md",
+            AutoImproveProposalOperation::Add,
+            "",
+            "# Rules\n",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: created_id,
+                    expected_approval_sha256: created_approval,
+                    before_sha256: sha256(""),
+                    after_sha256: sha256("# Rules\n"),
+                    outcome: ProjectInstructionApplyOutcome::Created,
+                    backup_path: None,
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await
+                .unwrap(),
+            RecordProjectInstructionApplicationResult::Recorded { .. }
+        ));
+
+        let unchanged = "# Same\n";
+        let malformed_no_change = "# Changed\n";
+        assert!(matches!(
+            store
+                .writer
+                .stage_project_instruction_proposal(StageProjectInstructionProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    operation: AutoImproveProposalOperation::NoChange,
+                    logical_target: PagePath::new("CLAUDE.md").unwrap(),
+                    repository_identity_sha256: sha256("/test/repository"),
+                    base_target_existed: true,
+                    target_context_layer: "no_change".into(),
+                    base_sha256: sha256(unchanged),
+                    base_content: unchanged.into(),
+                    boundary_kind: "exact_anchor".into(),
+                    boundary_value: "whole_file_snapshot".into(),
+                    proposed_content: malformed_no_change.into(),
+                    unified_diff: project_instruction_unified_diff(
+                        "CLAUDE.md",
+                        unchanged,
+                        malformed_no_change,
+                    ),
+                    estimated_token_delta: project_instruction_token_delta(
+                        unchanged,
+                        malformed_no_change,
+                    ),
+                    title: "malformed no change".into(),
+                    rationale: "must preserve bytes".into(),
+                    provenance_json: serde_json::json!([{"kind":"test"}]),
+                    proposing_actor: ActorContext::default(),
+                    proposing_author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        let (no_op_id, no_op_approval) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "CLAUDE.md",
+            AutoImproveProposalOperation::NoChange,
+            unchanged,
+            unchanged,
+        )
+        .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: no_op_id,
+                    expected_approval_sha256: no_op_approval,
+                    before_sha256: sha256(unchanged),
+                    after_sha256: sha256("# Changed\n"),
+                    outcome: ProjectInstructionApplyOutcome::Updated,
+                    backup_path: Some("/tmp/CLAUDE.md.bak-invalid-no-change".into()),
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: no_op_id,
+                    expected_approval_sha256: no_op_approval,
+                    before_sha256: sha256(unchanged),
+                    after_sha256: sha256(unchanged),
+                    outcome: ProjectInstructionApplyOutcome::NoOp,
+                    backup_path: None,
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await
+                .unwrap(),
+            RecordProjectInstructionApplicationResult::Recorded { .. }
+        ));
+
+        let (invalid_id, invalid_approval) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "docs/AGENTS.md",
+            AutoImproveProposalOperation::Update,
+            "old",
+            "new",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: invalid_id,
+                    expected_approval_sha256: invalid_approval,
+                    before_sha256: sha256("old"),
+                    after_sha256: sha256("new"),
+                    outcome: ProjectInstructionApplyOutcome::Updated,
+                    backup_path: None,
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, invalid_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(detail.application.is_none());
+        assert!(!detail.events.iter().any(|event| event.event == "applied"));
+
+        let (move_id, move_approval) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "AGENTS.md",
+            AutoImproveProposalOperation::MoveToSkill,
+            "procedure",
+            "",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: move_id,
+                    expected_approval_sha256: move_approval,
+                    before_sha256: sha256("procedure"),
+                    after_sha256: sha256(""),
+                    outcome: ProjectInstructionApplyOutcome::Updated,
+                    backup_path: Some("/tmp/AGENTS.md.bak-move".into()),
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[tokio::test]
