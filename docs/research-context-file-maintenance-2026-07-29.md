@@ -6,7 +6,7 @@
 
 **范围：** 项目级长期记忆、行为守则和 Agent Skills 的分层治理。这里不讨论普通对话记忆或把原始文档切块后直接检索的常规 RAG。
 
-> **后续状态（2026-07-29）：** 本文完成后，GitHub Issues #5–#13 已按这里的边界完成实现并合并。下文第 3.2–6 节保留的是实施前的差距分析与设计依据，不代表当前版本仍缺少这些能力；现行行为以 `README.md`、`docs/usage.md`、`docs/ARCHITECTURE.md` 和 `docs/auto-improvement-loop.md` 为准。
+> **后续状态（2026-07-29）：** 本文完成后，GitHub Issues #5–#13 已按这里的边界完成实现并合并。下文第 3–6 节保留的是实施前的能力快照、差距分析与设计依据，不代表当前版本仍缺少这些能力；其中的仓库证据固定到实施前的 `1307148e`。现行行为以 `README.md`、`docs/usage.md`、`docs/ARCHITECTURE.md` 和 `docs/auto-improvement-loop.md` 为准。
 
 ## 结论
 
@@ -75,24 +75,24 @@ OpenAI 的[AGENTS.md 官方文档](https://learn.chatgpt.com/docs/agent-configur
 
 ### 3.1 已有基础
 
-- Engram 已把 Markdown Wiki 定为真源，SQLite 只是派生索引；自动捕获、consolidation、auto-improve、搜索和衰减已经组成完整循环（[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#L16-L21)、[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#L44-L89)）。
-- Wiki 有 Git 历史，也可直接由 Obsidian/vim 编辑，外部编辑由 watcher 回填索引（[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#L123-L135)）。
-- `memory_lint` 已能识别 `_rules/` 或 `kind: rule` 页面并建议复制到 `CLAUDE.md` / `AGENTS.md`，但不会比较文件或提出具体 patch（[`lint.rs`](../crates/engram-consolidate/src/lint.rs#L188-L214)）。
-- auto-improve 已有证据、proposal、pending-writes、审计和可选人工审批机制；`_rules/` 被视为高影响目标（[`auto-improvement-loop.md`](auto-improvement-loop.md#L180-L214)、[`auto-improvement-loop.md`](auto-improvement-loop.md#L234-L262)）。
-- `install-instructions` 从 core 单一来源取得 snippet，支持 `--print`、幂等写入、备份与原子替换（[`install_instructions.rs`](../crates/engram-cli/src/commands/install_instructions.rs#L27-L81)、[`apply_shared.rs`](../crates/engram-cli/src/commands/apply_shared.rs#L1-L18)）。
-- 当前 marker 合并只修改 `<!-- engram:start -->` 到 `<!-- engram:end -->` 的第一个完整区块，保留前后用户内容（[`install_instructions.rs`](../crates/engram-cli/src/commands/install_instructions.rs#L159-L193)）。
-- managed skill 只有在包含 `<!-- engram-managed: routing-skill -->` 时才允许无 force 覆盖（[`install_skills.rs`](../crates/engram-cli/src/commands/install_skills.rs#L163-L188)）。
-- `memory_install_self_routing` 是只读工具：服务器返回 marker block、文件名、skills 和目标提示，由 agent 使用宿主文件工具落盘（[`server.rs`](../crates/engram-mcp/src/server.rs#L2311-L2379)）。这个边界对远端 Engram 服务尤其重要。
+- Engram 已把 Markdown Wiki 定为真源，SQLite 只是派生索引；自动捕获、consolidation、auto-improve、搜索和衰减已经组成完整循环（[`docs/ARCHITECTURE.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/ARCHITECTURE.md#L16-L21)、[`docs/ARCHITECTURE.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/ARCHITECTURE.md#L44-L89)）。
+- Wiki 有 Git 历史，也可直接由 Obsidian/vim 编辑，外部编辑由 watcher 回填索引（[`docs/ARCHITECTURE.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/ARCHITECTURE.md#L123-L135)）。
+- `memory_lint` 已能识别 `_rules/` 或 `kind: rule` 页面并建议复制到 `CLAUDE.md` / `AGENTS.md`，但不会比较文件或提出具体 patch（[`lint.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-consolidate/src/lint.rs#L188-L214)）。
+- auto-improve 已有证据、proposal、pending-writes、审计和可选人工审批机制；`_rules/` 被视为高影响目标（[`auto-improvement-loop.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/auto-improvement-loop.md#L180-L214)、[`auto-improvement-loop.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/auto-improvement-loop.md#L234-L262)）。
+- `install-instructions` 从 core 单一来源取得 snippet，支持 `--print`、幂等写入、备份与原子替换（[`install_instructions.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/install_instructions.rs#L27-L81)、[`apply_shared.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/apply_shared.rs#L1-L18)）。
+- 当前 marker 合并只修改 `<!-- engram:start -->` 到 `<!-- engram:end -->` 的第一个完整区块，保留前后用户内容（[`install_instructions.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/install_instructions.rs#L159-L193)）。
+- managed skill 只有在包含 `<!-- engram-managed: routing-skill -->` 时才允许无 force 覆盖（[`install_skills.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/install_skills.rs#L163-L188)）。
+- `memory_install_self_routing` 是只读工具：服务器返回 marker block、文件名、skills 和目标提示，由 agent 使用宿主文件工具落盘（[`server.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-mcp/src/server.rs#L2311-L2379)）。这个边界对远端 Engram 服务尤其重要。
 
 ### 3.2 仍缺的维护能力
 
-1. **没有 canonical source 检测。** 当前逻辑在两个文件都存在时写两份，在都不存在时默认建 `CLAUDE.md`（[`install_instructions.rs`](../crates/engram-cli/src/commands/install_instructions.rs#L84-L123)）。它不识别 `@AGENTS.md` pointer、symlink、stub、tool-specific override 或项目已经声明的单一真源。
-2. **规则只有提示，没有 proposal。** 现有文档明确说 Engram 不自行编辑 rules file；lint 工作流止于“考虑复制”（[`docs/usage.md`](usage.md#L269-L282)）。
-3. **预览不是 diff。** `--print` 展示将写入的完整 snippet，不包含旧值、逐项行为规则、来源和基线哈希（[`routing_instructions.rs`](../crates/engram-cli/tests/routing_instructions.rs#L156-L177)）。
-4. **没有并发冲突检测。** 原子写和备份能恢复，但从读取到 rename 之间没有 expected hash；另一个 agent 在此期间改同一文件时可能被覆盖（[`apply_shared.rs`](../crates/engram-cli/src/commands/apply_shared.rs#L61-L96)）。
+1. **没有 canonical source 检测。** 当前逻辑在两个文件都存在时写两份，在都不存在时默认建 `CLAUDE.md`（[`install_instructions.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/install_instructions.rs#L84-L123)）。它不识别 `@AGENTS.md` pointer、symlink、stub、tool-specific override 或项目已经声明的单一真源。
+2. **规则只有提示，没有 proposal。** 现有文档明确说 Engram 不自行编辑 rules file；lint 工作流止于“考虑复制”（[`docs/usage.md`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/docs/usage.md#L269-L282)）。
+3. **预览不是 diff。** `--print` 展示将写入的完整 snippet，不包含旧值、逐项行为规则、来源和基线哈希（[`routing_instructions.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/tests/routing_instructions.rs#L156-L177)）。
+4. **没有并发冲突检测。** 原子写和备份能恢复，但从读取到 rename 之间没有 expected hash；另一个 agent 在此期间改同一文件时可能被覆盖（[`apply_shared.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-cli/src/commands/apply_shared.rs#L61-L96)）。
 5. **畸形 marker 会被静默绕开。** 缺失 end marker 时现逻辑会追加新块；重复完整块只替换第一块。维护器需要先验证 marker 结构并 fail closed。
 6. **没有跨层冲突和膨胀审计。** 当前 lint 不比较 Wiki `_rules/`、根指令、嵌套规则、skills、hooks/permissions 之间的重复、矛盾、失效路径和职责错放。
-7. **安装资产也可能漂移。** 本仓库当前 `AGENTS.md` 的 Engram 区块占第 1–136 行，而 core 中所谓 slim snippet 位于 [`routing_snippet.rs`](../crates/engram-core/src/routing_snippet.rs#L29-L96)。这正说明需要报告“已安装版本与当前二进制资产是否一致”，而不是等待用户偶然刷新。
+7. **安装资产也可能漂移。** 本仓库当前 `AGENTS.md` 的 Engram 区块占第 1–136 行，而 core 中所谓 slim snippet 位于 [`routing_snippet.rs`](https://github.com/semantic-craft/engram/blob/1307148e75dbba7871dd82e86f791dac513a8da0/crates/engram-core/src/routing_snippet.rs#L29-L96)。这正说明需要报告“已安装版本与当前二进制资产是否一致”，而不是等待用户偶然刷新。
 
 ## 4. 建议的分层模型
 
