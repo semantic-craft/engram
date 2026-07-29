@@ -2064,6 +2064,12 @@ async fn handle_project_instruction_semantic_proposal(
         Ok(path) => path,
         Err(error) => return bad_request(&format!("invalid logical target: {error}")),
     };
+    let repository_identity_sha256 = match hex_to_sha256(&request.repository_identity_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return bad_request(&format!("invalid repository_identity_sha256: {error}"));
+        }
+    };
     if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES {
         return bad_request("project-instruction target content exceeds the 1 MiB limit");
     }
@@ -2221,6 +2227,8 @@ async fn handle_project_instruction_semantic_proposal(
             project_id,
             operation,
             logical_target,
+            repository_identity_sha256,
+            base_target_existed: request.base_target_existed,
             target_context_layer: proposal.target_context_layer.clone(),
             base_sha256,
             base_content: request.base_content,
