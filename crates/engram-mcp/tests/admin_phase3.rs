@@ -2022,6 +2022,79 @@ async fn project_instruction_edit_and_approval_are_actor_separated_persistent_an
     let repeated = router.clone().oneshot(approve_request()).await.unwrap();
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(body_json(repeated).await["idempotent"], true);
+
+    let sha256_hex = |value: &str| {
+        Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let apply_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/admin/pending-writes/{proposal_id}/apply?workspace=default&project=scratch"
+            ))
+            .header("content-type", "application/json")
+            .extension(ActorContext {
+                agent: Some("codex".into()),
+                user: Some("local-applier".into()),
+                ..ActorContext::default()
+            })
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "expected_approval_sha256": reviewed_approval_sha,
+                    "before_sha256": sha256_hex(base),
+                    "after_sha256": sha256_hex(reviewed_content),
+                    "outcome": "updated",
+                    "backup_path": "/tmp/AGENTS.md.bak-1",
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let applied = router.clone().oneshot(apply_request()).await.unwrap();
+    assert_eq!(applied.status(), StatusCode::OK);
+    let applied = body_json(applied).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "updated");
+    assert_eq!(applied["idempotent"], false);
+
+    let repeated_apply = router.clone().oneshot(apply_request()).await.unwrap();
+    assert_eq!(repeated_apply.status(), StatusCode::OK);
+    assert_eq!(body_json(repeated_apply).await["idempotent"], true);
+
+    let applied_detail = body_json(
+        router_get(
+            router.clone(),
+            &format!("/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(applied_detail["summary"]["status"], "approved");
+    assert_eq!(
+        applied_detail["application"]["proposing_actor"]["user"],
+        "proposer"
+    );
+    assert_eq!(
+        applied_detail["application"]["approving_actor"]["user"],
+        "approver"
+    );
+    assert_eq!(
+        applied_detail["application"]["applying_actor"]["user"],
+        "local-applier"
+    );
+    assert_eq!(
+        applied_detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "applied")
+            .count(),
+        1,
+        "idempotent apply reporting must not duplicate audit"
+    );
     let final_detail = store
         .reader
         .auto_improve_proposal_detail(ws, project, proposal_id.parse().unwrap())

@@ -314,9 +314,17 @@ review surface. Each edit binds to the current approval hash, recomputes derived
 review fields from the stored base, and appends a reviewer-attributed revision.
 Approval binds to the exact current revision and stores a separate deciding
 actor, but only advances the SQLite record to `approved`/apply-ready. It never
-invokes a repository or Wiki mutation, and local application remains a separate
-phase. Wiki scheduler/provider/auto-approval settings cannot enter this manual
-approval path.
+invokes a repository or Wiki mutation. `instructions apply` is the separate
+local executor: it reruns doctor discovery, resolves the stored logical target
+inside that repository, recomputes the approval hash, checks the approved
+boundary and base hash inside the atomic mutator's final read, protects the
+managed routing block, and replaces the file through a synced sibling tempfile
+with a timestamped backup. It performs no Git operation. Only the resulting
+hashes, outcome, recovery path, and local actor return to a root-gated admin
+endpoint; that endpoint owns no repository path or content and records the
+application plus one `applied` event through the single writer actor. The MCP
+tool surface is unchanged. Wiki scheduler/provider/auto-approval settings
+cannot enter either manual path.
 
 The optional `--semantic` branch adds one read-only provider review in
 `engram-consolidate::instruction_semantic`. The admin boundary authoritatively

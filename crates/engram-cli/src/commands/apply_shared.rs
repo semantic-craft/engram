@@ -38,6 +38,15 @@ pub enum ApplyOutcome {
     NoOp,
 }
 
+/// Complete report for one atomic filesystem mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// Whether the target was created, updated, or already matched.
+    pub outcome: ApplyOutcome,
+    /// Timestamped recovery copy written before an update.
+    pub backup_path: Option<PathBuf>,
+}
+
 impl ApplyOutcome {
     /// Short verb for the CLI report line.
     #[must_use]
@@ -62,6 +71,21 @@ pub fn apply_atomic<F>(path: &Path, mutator: F) -> Result<ApplyOutcome>
 where
     F: FnOnce(&str) -> Result<String>,
 {
+    Ok(apply_atomic_report(path, mutator)?.outcome)
+}
+
+/// Apply an idempotent mutation and return its recovery metadata.
+///
+/// The caller's mutator runs against the content read immediately before the
+/// backup/write sequence. Callers that need compare-and-swap safety must
+/// perform their final expected-content check inside this closure.
+///
+/// # Errors
+/// Propagates IO + mutator failures.
+pub fn apply_atomic_report<F>(path: &Path, mutator: F) -> Result<ApplyReport>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
     let existed = path.exists();
     let original = if existed {
         fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
@@ -72,7 +96,10 @@ where
     let new_content = mutator(&original)?;
 
     if existed && new_content == original {
-        return Ok(ApplyOutcome::NoOp);
+        return Ok(ApplyReport {
+            outcome: ApplyOutcome::NoOp,
+            backup_path: None,
+        });
     }
 
     if let Some(parent) = path.parent()
@@ -82,17 +109,23 @@ where
             .with_context(|| format!("ensuring parent directory {}", parent.display()))?;
     }
 
-    if existed {
+    let backup_path = if existed {
         let backup = backup_path_for(path);
         fs::copy(path, &backup)
             .with_context(|| format!("backing up {} → {}", path.display(), backup.display()))?;
-    }
+        Some(backup)
+    } else {
+        None
+    };
 
     write_atomic(path, &new_content)?;
-    Ok(if existed {
-        ApplyOutcome::Updated
-    } else {
-        ApplyOutcome::Created
+    Ok(ApplyReport {
+        outcome: if existed {
+            ApplyOutcome::Updated
+        } else {
+            ApplyOutcome::Created
+        },
+        backup_path,
     })
 }
 

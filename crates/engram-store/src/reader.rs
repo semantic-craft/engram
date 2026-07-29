@@ -29,7 +29,7 @@ use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, ProjectInstructionProposalRevision, bytes32, opt_bytes32,
-    summary_from_row_with_metadata, to_sql_err,
+    project_instruction_application_from_row, summary_from_row_with_metadata, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
@@ -3824,6 +3824,7 @@ impl ReaderPool {
                             approval_sha256,
                             review_revision: None,
                             revisions: Vec::new(),
+                            application: None,
                             events: Vec::new(),
                         })
                     },
@@ -3864,6 +3865,16 @@ impl ReaderPool {
                 detail.revisions.push(row?);
             }
             detail.review_revision = detail.revisions.last().map(|revision| revision.revision);
+            detail.application = conn
+                .query_row(
+                    "SELECT proposal_id, approval_sha256, before_sha256, after_sha256, outcome, \
+                            backup_path, proposing_actor_json, approving_actor_json, \
+                            applying_actor_json, applied_by_author_id, applied_at \
+                     FROM project_instruction_applications WHERE proposal_id = ?1",
+                    params![proposal_id.as_bytes()],
+                    project_instruction_application_from_row,
+                )
+                .optional()?;
             let mut stmt = conn.prepare(
                 "SELECT id, proposal_id, event, actor_json, author_id, detail_json, at \
                  FROM auto_improve_proposal_events \
