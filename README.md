@@ -489,8 +489,13 @@ engram instructions doctor --json
 
 The doctor is deterministic and completely read-only. It reports effective
 load order, canonical/adapter relationships, nested rules, size estimates,
-marker health, and routing-asset drift without loading an LLM provider or
-opening Engram's store. See
+marker health, routing-asset drift, and evidence-backed placement diagnostics
+without loading an LLM provider or opening Engram's store. Placement findings
+distinguish disposable generic harness text from non-inferable team, deployment,
+internal-tool, migration, business, and security knowledge, then recommend the
+root, a path rule, an Agent Skill, the Wiki, enforcement, or no change. The
+optimization target is correct placement and lower conflict, not the shortest
+possible root file. See
 [`docs/usage.md`](docs/usage.md#audit-project-instruction-chains) for the
 supported loading semantics and structured report.
 

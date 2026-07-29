@@ -19,6 +19,13 @@ below start from the fork.
   routing marker health and managed-asset drift without changing files or
   initializing Engram runtime state. Other recognized harness files are
   explicitly reported as best-effort.
+- Instruction-doctor reports now include evidence-backed context-placement
+  diagnostics for generic harness guidance, exact or normalized duplication,
+  contradictory rules, stale repository paths or commands, missing referenced
+  project Skills, context-budget pressure, and likely wrong-layer content.
+  Recommendations protect non-inferable project knowledge and identify root,
+  path-rule, Agent Skill, Wiki, enforcement, or no-change destinations; file
+  length alone never produces a removal recommendation.
 
 ## 2.0.0 - 2026-07-19
 

@@ -113,7 +113,7 @@ fn claude_only_repo_reports_canonical_source_and_writes_nothing() {
 
     let report = doctor_without_writes(project.path(), home.path());
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["read_only"], true);
     assert_eq!(report["canonical"]["path"], "CLAUDE.md");
     assert_eq!(report["canonical"]["basis"], "single_source");
@@ -719,6 +719,7 @@ fn marker_health_and_routing_drift_are_reported_without_repair() {
             .iter()
             .any(|finding| { finding["code"] == "routing_asset_drift" })
     );
+    assert!(report["placement_findings"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -967,6 +968,331 @@ fn long_claude_root_reports_context_budget_warning_without_deletion_advice() {
     assert_eq!(finding["severity"], "warning");
     assert!(finding["message"].as_str().unwrap().contains("201 lines"));
     assert!(!finding["message"].as_str().unwrap().contains("delete"));
+
+    let placement = report["placement_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "context_budget_pressure")
+        .unwrap();
+    assert_eq!(placement["action"], "review");
+    assert_eq!(placement["destination"], "no_change");
+    assert_eq!(placement["protected"], false);
+    assert!(
+        placement["rationale"]
+            .as_str()
+            .unwrap()
+            .contains("never deletion evidence by itself")
+    );
+}
+
+#[test]
+fn placement_diagnostics_remove_generic_text_and_protect_local_knowledge() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Project instructions\n\n\
+Think step by step and be helpful.\n\n\
+- Rust filesystem errors in this repository must use `anyhow::Context`.\n\
+- Production deployment uses the private `opsctl release` workflow.\n\
+- The internal `artifact-index` tool is the only supported index writer.\n\
+- Database migrations must remain backward-compatible for one release.\n\
+- Enterprise tenants must never receive consumer trial entitlements.\n\
+- Authentication checks must never be bypassed.\n",
+    )
+    .unwrap();
+
+    let report = doctor_without_writes(project.path(), home.path());
+    let findings = report["placement_findings"].as_array().unwrap();
+
+    let generic = findings
+        .iter()
+        .find(|finding| finding["category"] == "generic_harness")
+        .unwrap();
+    assert_eq!(generic["action"], "remove");
+    assert_eq!(generic["destination"], "no_change");
+    assert_eq!(generic["protected"], false);
+    assert!(
+        generic["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("step by step")
+    );
+
+    for category in [
+        "team_convention",
+        "private_deployment",
+        "internal_tool",
+        "database_migration",
+        "business_boundary",
+        "security_requirement",
+    ] {
+        let finding = findings
+            .iter()
+            .find(|finding| finding["category"] == category)
+            .unwrap_or_else(|| panic!("missing protected category {category}"));
+        assert_eq!(finding["protected"], true, "category {category}");
+        assert_ne!(finding["action"], "remove", "category {category}");
+        assert!(
+            finding["rationale"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be inferred"),
+            "category {category}"
+        );
+    }
+
+    let deployment = findings
+        .iter()
+        .find(|finding| finding["category"] == "private_deployment")
+        .unwrap();
+    assert_eq!(deployment["action"], "move");
+    assert_eq!(deployment["destination"], "agent_skill");
+
+    let security = findings
+        .iter()
+        .find(|finding| finding["category"] == "security_requirement")
+        .unwrap();
+    assert_eq!(security["action"], "reinforce");
+    assert_eq!(security["destination"], "enforcement");
+}
+
+#[test]
+fn wrong_layer_content_routes_to_path_rules_skills_and_wiki() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("crates/store")).unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Project instructions\n\n\
+When working under `crates/store/`, keep SQLite writes behind the writer actor.\n\n\
+## Release procedure\n\n\
+- Run the release build.\n\
+\n\
+- Verify the signed artifact.\n\
+\n\
+- Publish the release notes.\n\n\
+## Background\n\n\
+We chose SQLite because the repository is designed for a single local writer; rejected alternatives and benchmark evidence belong with this history.\n",
+    )
+    .unwrap();
+
+    let report = doctor_without_writes(project.path(), home.path());
+    let findings = report["placement_findings"].as_array().unwrap();
+
+    let scoped = findings
+        .iter()
+        .find(|finding| finding["category"] == "component_scope")
+        .unwrap();
+    assert_eq!(scoped["action"], "move");
+    assert_eq!(scoped["destination"], "path_rules");
+
+    let workflow = findings
+        .iter()
+        .find(|finding| finding["category"] == "workflow")
+        .unwrap();
+    assert_eq!(workflow["action"], "move");
+    assert_eq!(workflow["destination"], "agent_skill");
+
+    let history = findings
+        .iter()
+        .find(|finding| finding["category"] == "history_and_evidence")
+        .unwrap();
+    assert_eq!(history["action"], "move");
+    assert_eq!(history["destination"], "wiki");
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["code"] != "stale_path_reference")
+    );
+}
+
+#[test]
+fn claude_rule_frontmatter_distinguishes_root_and_path_destinations() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".claude/rules")).unwrap();
+    fs::write(
+        project.path().join(".claude/rules/global.md"),
+        "Database migrations must remain reversible.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".claude/rules/store.md"),
+        "---\npaths:\n  - crates/store/**\n---\nDatabase migrations must remain backward-compatible.\n",
+    )
+    .unwrap();
+
+    let report = doctor_without_writes(project.path(), home.path());
+    let findings = report["placement_findings"].as_array().unwrap();
+    let global = findings
+        .iter()
+        .find(|finding| finding["source"] == ".claude/rules/global.md")
+        .unwrap();
+    assert_eq!(global["destination"], "root_instructions");
+    let scoped = findings
+        .iter()
+        .find(|finding| finding["source"] == ".claude/rules/store.md")
+        .unwrap();
+    assert_eq!(scoped["destination"], "path_rules");
+}
+
+#[test]
+fn duplicate_conflict_stale_reference_and_missing_skill_are_diagnosed() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("scripts")).unwrap();
+    fs::create_dir_all(project.path().join("docs")).unwrap();
+    fs::write(project.path().join("scripts/current.sh"), "#!/bin/sh\n").unwrap();
+    fs::write(project.path().join("docs/current.md"), "# Current\n").unwrap();
+    fs::create_dir_all(project.path().join(".agents/skills/existing")).unwrap();
+    fs::write(
+        project.path().join(".agents/skills/existing/SKILL.md"),
+        "---\nname: existing\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Project instructions\n\n\
+- Always run cargo test before merging.\n\
+- Never run cargo test before merging.\n\
+- See `docs/removed.md` for the release policy.\n\
+- Run `./scripts/retired.sh --prod`.\n\
+- Run `./scripts/current.sh`.\n\
+- See [the current guide](docs/current.md#usage).\n\
+- Use the `missing-release` Skill.\n\
+- Use the `existing` Skill.\n\
+- Keep audit logs for thirty days.\n\
+- **Keep audit logs** for thirty days!\n\
+- Keep audit logs for thirty days.\n",
+    )
+    .unwrap();
+
+    let report = doctor_without_writes(project.path(), home.path());
+    let findings = report["placement_findings"].as_array().unwrap();
+
+    for code in [
+        "contradictory_guidance",
+        "duplicate_guidance",
+        "stale_path_reference",
+        "stale_command_reference",
+        "missing_referenced_skill",
+    ] {
+        assert!(
+            findings.iter().any(|finding| finding["code"] == code),
+            "missing placement finding {code}"
+        );
+    }
+
+    let duplicates: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding["code"] == "duplicate_guidance")
+        .collect();
+    assert_eq!(duplicates.len(), 2);
+    assert!(duplicates.iter().any(|finding| {
+        finding["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("Normalized")
+    }));
+    assert!(
+        duplicates
+            .iter()
+            .any(|finding| finding["evidence"].as_str().unwrap().starts_with("Exact"))
+    );
+    for duplicate in duplicates {
+        assert_eq!(duplicate["action"], "remove");
+        assert_eq!(duplicate["destination"], "no_change");
+        assert!(duplicate["related_sources"].as_array().unwrap().len() == 1);
+    }
+
+    assert!(findings.iter().all(|finding| {
+        let evidence = finding["evidence"].as_str().unwrap();
+        !evidence.contains("scripts/current.sh")
+            && !evidence.contains("docs/current.md")
+            && !evidence.contains("`existing` Skill")
+    }));
+}
+
+#[test]
+fn claude_imports_are_explicitly_counted_as_loaded_context() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Shared rules\n\nUse the repository formatter.\n",
+    )
+    .unwrap();
+
+    let report = doctor_without_writes(project.path(), home.path());
+    let imported = report["placement_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "imported_context_counts")
+        .unwrap();
+    assert_eq!(imported["action"], "review");
+    assert_eq!(imported["destination"], "no_change");
+    assert!(
+        imported["rationale"]
+            .as_str()
+            .unwrap()
+            .contains("not a token saving")
+    );
+}
+
+#[test]
+fn human_report_explains_placement_action_destination_and_evidence() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Rules\n\nThink step by step and be helpful.\n",
+    )
+    .unwrap();
+    let project_before = snapshot(project.path());
+    let home_before = snapshot(home.path());
+
+    let output = Command::new(bin())
+        .args(["instructions", "doctor"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("ENGRAM_DATA_DIR", home.path().join("engram-data"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Placement diagnostics"));
+    assert!(stdout.contains("generic_harness_guidance"));
+    assert!(stdout.contains("action remove; destination no_change; protected no"));
+    assert!(stdout.contains("Evidence:"));
+    assert_eq!(snapshot(project.path()), project_before);
+    assert_eq!(snapshot(home.path()), home_before);
+}
+
+#[test]
+fn semantic_placement_output_is_deterministic_and_read_only() {
+    let project = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("AGENTS.md"),
+        "# Rules\n\nThink step by step.\n\nDatabase migrations must remain reversible.\n",
+    )
+    .unwrap();
+    let project_before = snapshot(project.path());
+    let home_before = snapshot(home.path());
+
+    let first = assert_success(run_doctor(project.path(), home.path(), &[]));
+    let second = assert_success(run_doctor(project.path(), home.path(), &[]));
+
+    assert_eq!(first, second);
+    assert_eq!(snapshot(project.path()), project_before);
+    assert_eq!(snapshot(home.path()), home_before);
+    assert!(!home.path().join("engram-data").exists());
 }
 
 #[cfg(unix)]
