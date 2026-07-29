@@ -1075,6 +1075,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Return selected observations in one scope without an N+1 session walk.
+    ///
+    /// Missing or cross-scope ids are omitted. Callers use this after a
+    /// scope-filtered search when they need authoritative bodies instead of
+    /// highlighted snippets.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn observations_by_ids_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        observation_ids: Vec<ObservationId>,
+    ) -> StoreResult<Vec<Observation>> {
+        if observation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let placeholders = std::iter::repeat_n("?", observation_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                        title, body, importance, created_at \
+                 FROM observations \
+                 WHERE workspace_id = ? AND project_id = ? AND id IN ({placeholders}) \
+                 ORDER BY created_at ASC"
+            );
+            let mut values = Vec::with_capacity(observation_ids.len() + 2);
+            values.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            values.push(Value::Blob(project_id.as_bytes().to_vec()));
+            values.extend(
+                observation_ids
+                    .iter()
+                    .map(|id| Value::Blob(id.as_bytes().to_vec())),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values.iter()), row_to_observation)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return the latest completed session for a project.
     ///
     /// Used by read-only review tools that need a natural default when the user
@@ -3579,6 +3626,39 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// Whether a Wiki-page proposal for this path completed the explicit
+    /// approval path. This classifies a durable rule page's provenance; it
+    /// never grants approval to a project-instruction proposal.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn wiki_page_was_approved_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &str,
+    ) -> StoreResult<bool> {
+        let path = path.to_owned();
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM auto_improve_proposals p \
+                     JOIN pages current ON current.id = p.applied_page_id \
+                       AND current.workspace_id = p.workspace_id \
+                       AND current.project_id = p.project_id \
+                       AND current.path = p.target_path AND current.is_latest = 1 \
+                     WHERE p.workspace_id = ?1 AND p.project_id = ?2 \
+                       AND p.target_kind = 'wiki_page' AND p.target_path = ?3 \
+                       AND p.status = 'approved' LIMIT 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
         })
         .await
     }

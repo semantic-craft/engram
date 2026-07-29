@@ -31,7 +31,7 @@ pub fn run_doctor(args: InstructionsDoctorArgs) -> Result<()> {
 pub async fn run(config: &Config, args: InstructionsArgs) -> Result<()> {
     match args.command {
         InstructionsCommand::Doctor(args) => run_doctor(args),
-        InstructionsCommand::Propose(args) => propose(config, args).await,
+        InstructionsCommand::Propose(args) => propose(config, *args).await,
     }
 }
 
@@ -61,12 +61,16 @@ struct StageRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct StageResponse {
-    proposal_id: String,
+    proposal_id: Option<String>,
     status: String,
     target_kind: String,
     operation: String,
     logical_target: String,
     target_context_layer: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    manual_approval_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    semantic_assistance: Option<serde_json::Value>,
 }
 
 struct LocalProposal {
@@ -86,14 +90,35 @@ async fn propose(config: &Config, args: InstructionsProposeArgs) -> Result<()> {
     let report = DoctorReport::inspect_current_repository()?;
     let project = super::resolve_project_name(args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let local = match (args.rule.as_deref(), args.finding.as_deref()) {
-        (Some(rule), None) => proposal_from_rule(&endpoint, &report, &args, &project, rule).await?,
-        (None, Some(finding)) => proposal_from_finding(&report, &args, finding)?,
-        _ => bail!("select exactly one of --rule or --finding"),
+    let local = match (
+        args.rule.as_deref(),
+        args.finding.as_deref(),
+        args.correction.as_deref(),
+        args.review_finding.as_deref(),
+    ) {
+        (Some(rule), None, None, None) => {
+            proposal_from_rule(&endpoint, &report, &args, &project, rule).await?
+        }
+        (None, Some(finding), None, None) => proposal_from_finding(&report, &args, finding)?,
+        (None, None, Some(query), None) => {
+            proposal_from_semantic_selector(&report, &args, "repeated_project_correction", query)?
+        }
+        (None, None, None, Some(path)) => {
+            if !path.starts_with("_lint/") {
+                bail!("durable review findings must come from an explicit _lint/ page");
+            }
+            proposal_from_semantic_selector(&report, &args, "durable_review_finding", path)?
+        }
+        _ => bail!("select exactly one of --rule, --finding, --correction, or --review-finding"),
+    };
+    let route = if args.semantic {
+        "/admin/instructions/semantic-proposals"
+    } else {
+        "/admin/instructions/proposals"
     };
     let response: StageResponse = post_json(
         &endpoint,
-        "/admin/instructions/proposals",
+        route,
         &StageRequest {
             workspace: args.workspace,
             project,
@@ -113,18 +138,73 @@ async fn propose(config: &Config, args: InstructionsProposeArgs) -> Result<()> {
     .context("staging project-instruction proposal")?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
+    } else if response.status == "rejected" {
+        println!(
+            "no project-instruction proposal staged for {} ({})",
+            response.logical_target, response.target_context_layer
+        );
+        if let Some(budget) = response.semantic_assistance {
+            println!("  semantic assistance budget: {budget}");
+        }
     } else {
+        let proposal_id = response.proposal_id.as_deref().unwrap_or("none");
         println!(
             "✓ staged {} {} proposal {} for {} ({})",
             response.target_kind,
             response.operation,
-            response.proposal_id,
+            proposal_id,
             response.logical_target,
             response.target_context_layer
         );
         println!("  staged only; no project instruction is active until a later approved apply");
+        if let Some(budget) = response.semantic_assistance {
+            println!("  semantic assistance budget: {budget}");
+        }
     }
     Ok(())
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn proposal_from_semantic_selector(
+    report: &DoctorReport,
+    args: &InstructionsProposeArgs,
+    kind: &str,
+    source: &str,
+) -> Result<LocalProposal> {
+    if source.trim().is_empty() {
+        bail!("semantic evidence selector cannot be empty");
+    }
+    let target = args
+        .target
+        .as_ref()
+        .map(|path| path_string(path.as_path()))
+        .or_else(|| report.canonical.path.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "instruction doctor could not resolve a canonical target; pass --target"
+            )
+        })?;
+    let (logical_target, base_content) = read_repository_target(report, &target)?;
+    Ok(LocalProposal {
+        operation: "no_change",
+        logical_target,
+        target_context_layer: "no_change".into(),
+        boundary_kind: "exact_anchor",
+        boundary_value: "whole_file_snapshot".into(),
+        proposed_content: base_content.clone(),
+        base_content,
+        title: "Provider-assisted durable instruction review".into(),
+        rationale: "Review explicitly selected durable Engram evidence.".into(),
+        provenance: serde_json::json!([{
+            "kind": kind,
+            "source": source,
+            "excerpt": source,
+            "selection": "explicit_cli",
+        }]),
+    })
 }
 
 async fn proposal_from_rule(

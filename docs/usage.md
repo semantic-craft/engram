@@ -168,6 +168,21 @@ engram instructions propose \
 engram instructions propose \
   --workspace default --project my-project \
   --finding generic_harness_guidance --source AGENTS.md --line 12
+
+# Ask for bounded semantic duplication/conflict/placement assistance over an
+# explicitly selected durable rule.
+engram instructions propose \
+  --workspace default --project my-project \
+  --rule _rules/single-writer.md --target AGENTS.md --semantic
+
+# A correction must match user prompts in at least two distinct project
+# sessions. A durable review finding must be an authoritative lint-report page.
+engram instructions propose \
+  --workspace default --project my-project \
+  --correction "full gate before merging" --target AGENTS.md --semantic
+engram instructions propose \
+  --workspace default --project my-project \
+  --review-finding _lint/2026-07-29.md --target AGENTS.md --semantic
 ```
 
 Durable-rule evidence must name an existing `_rules/` page and is read through
@@ -175,6 +190,37 @@ the configured Engram server. Doctor evidence is recomputed from the current
 repository and must resolve to one readable inventoried instruction source;
 context-budget and other source-less audit findings are not proposal targets.
 Both paths are deterministic and require no LLM.
+
+`--semantic` is an optional bridge layered on those deterministic paths. It
+also accepts repeated project corrections and durable lint-review findings.
+The server, not the client or provider, loads and classifies the authoritative
+evidence:
+
+- an explicitly selected `_rules/` page is `explicit_user_rule`;
+- the same page is `approved_durable_rule` when it came through an approved
+  Wiki proposal;
+- `--correction` must resolve to `user-prompt` observations in at least two
+  distinct sessions in the selected project;
+- `--review-finding` must resolve to a latest `_lint/` page with
+  `kind: lint-report`;
+- deterministic doctor evidence remains tied to the current target snapshot.
+
+The provider gets quoted evidence as data and may return semantic duplication,
+semantic conflict, and placement findings. Every finding and the sole optional
+proposal must cite an exact substring from a server-loaded source. Citations to
+assistant/model text or unknown sources are rejected. New web/issue
+instructions, transient or resolved state, secret-shaped input/output, and
+destructive relocation without deterministic doctor evidence are rejected.
+Rewrites also preserve any target line carrying team, deployment, production,
+internal-tool, migration, business, or security context.
+
+The fixed budgets are one provider call, at most 8 evidence items / 12,000
+evidence characters (2,000 per item), a 16,000-character target snapshot and
+approximately 8,000 input tokens, 4,000 output tokens / 16,000 structured
+output characters, one proposal, 12,000 changed characters, and a 32,000
+character final body. The JSON response reports calls, evidence, input,
+output, proposal count, and changed characters. Validation failures stage no
+instruction proposal and are recorded in the existing rejection buffer.
 
 The proposal stores `target_kind = "project_instruction"`, its operation
 (`add`, `update`, `stale_delete`, `move_to_skill`, `move_to_path_rule`,
@@ -217,6 +263,10 @@ approval path. Conversely, provider availability, the background scheduler,
 `[auto_improve] require_approval`, and Wiki auto-approval behavior cannot
 approve or apply a `project_instruction`; only the explicit human review route
 can mark it apply-ready. Local application remains a separate phase.
+Semantic assistance is available only through the explicit CLI/admin proposal
+path. No repository-writing MCP tool is added, and scheduled learning review
+has no repository access: it can at most stage pending data through the same
+writer actor and can never approve, apply, or write project instructions.
 
 ## Install the routing snippet and Agent Skills
 

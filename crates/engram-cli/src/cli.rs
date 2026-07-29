@@ -170,7 +170,7 @@ pub enum InstructionsCommand {
     /// Explain the effective Claude Code and Codex instruction chains.
     Doctor(InstructionsDoctorArgs),
     /// Stage an evidence-backed project-instruction proposal without applying it.
-    Propose(InstructionsProposeArgs),
+    Propose(Box<InstructionsProposeArgs>),
 }
 
 /// Arguments for `instructions doctor`.
@@ -187,7 +187,7 @@ pub struct InstructionsDoctorArgs {
     clap::ArgGroup::new("evidence_source")
         .required(true)
         .multiple(false)
-        .args(["rule", "finding"])
+        .args(["rule", "finding", "correction", "review_finding"])
 ))]
 pub struct InstructionsProposeArgs {
     /// Explicit durable Wiki rule path under `_rules/`.
@@ -196,6 +196,12 @@ pub struct InstructionsProposeArgs {
     /// Doctor finding code to select from the current repository report.
     #[arg(long)]
     pub finding: Option<String>,
+    /// Repeated project correction query. Requires provider-backed semantic assistance.
+    #[arg(long, requires = "semantic")]
+    pub correction: Option<String>,
+    /// Durable `_lint/` review-finding page. Requires provider-backed semantic assistance.
+    #[arg(long, requires = "semantic")]
+    pub review_finding: Option<String>,
     /// Finding source path used to disambiguate repeated codes.
     #[arg(long, requires = "finding")]
     pub source: Option<String>,
@@ -206,6 +212,9 @@ pub struct InstructionsProposeArgs {
     /// doctor-selected canonical source; findings always target their source.
     #[arg(long)]
     pub target: Option<PathBuf>,
+    /// Use one bounded provider call for cited duplication/conflict/placement assistance.
+    #[arg(long)]
+    pub semantic: bool,
     /// Existing workspace scope.
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
@@ -1589,6 +1598,39 @@ mod tests {
         assert_eq!(args.session_id, "00000000-0000-0000-0000-000000000000");
         assert_eq!(args.max_proposals, Some(2));
         assert_eq!(args.project.as_deref(), Some("scratch"));
+    }
+
+    #[test]
+    fn instruction_semantic_evidence_selectors_require_opt_in() {
+        let cli = Cli::try_parse_from([
+            "engram",
+            "instructions",
+            "propose",
+            "--correction",
+            "full gate before merging",
+            "--semantic",
+        ])
+        .expect("semantic correction parses");
+        let Command::Instructions(args) = cli.command else {
+            panic!("expected instructions command");
+        };
+        let InstructionsCommand::Propose(args) = args.command else {
+            panic!("expected instructions propose command");
+        };
+        assert_eq!(args.correction.as_deref(), Some("full gate before merging"));
+        assert!(args.semantic);
+
+        assert!(
+            Cli::try_parse_from([
+                "engram",
+                "instructions",
+                "propose",
+                "--review-finding",
+                "_lint/2026-07-29.md",
+            ])
+            .is_err(),
+            "durable review findings require explicit semantic opt-in"
+        );
     }
 
     #[test]
