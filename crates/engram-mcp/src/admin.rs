@@ -24,6 +24,7 @@
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
 //! - `POST /admin/instructions/proposals` — stage a DB-only project-instruction proposal.
+//! - `POST /admin/instructions/semantic-proposals` — bounded provider assistance, then stage only.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -44,14 +45,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use engram_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report, run_lint, run_sweep,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
+    InstructionSemanticEvidence, InstructionSemanticInput, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report,
+    run_instruction_semantic_assistance, run_lint, run_sweep,
 };
 use engram_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
+    ObservationKind, PagePath, ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use engram_store::{
@@ -527,6 +529,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/admin/instructions/proposals",
             post(handle_project_instruction_proposal),
+        )
+        .route(
+            "/admin/instructions/semantic-proposals",
+            post(handle_project_instruction_semantic_proposal),
         )
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
@@ -2001,6 +2007,510 @@ async fn handle_project_instruction_proposal(
     )
 }
 
+struct LoadedInstructionSemanticEvidence {
+    evidence: InstructionSemanticEvidence,
+    provenance: serde_json::Value,
+}
+
+async fn handle_project_instruction_semantic_proposal(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    Json(request): Json<ProjectInstructionProposalRequest>,
+) -> impl IntoResponse {
+    let Some(llm) = state.llm.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "semantic instruction assistance requires a configured LLM provider"
+            })),
+        );
+    };
+    let logical_target = match PagePath::new(request.logical_target.clone()) {
+        Ok(path) => path,
+        Err(error) => return bad_request(&format!("invalid logical target: {error}")),
+    };
+    if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES {
+        return bad_request("project-instruction target content exceeds the 1 MiB limit");
+    }
+    if !matches!(
+        request.boundary_kind.as_str(),
+        "exact_anchor" | "owned_region"
+    ) || request.boundary_value.trim().is_empty()
+    {
+        return bad_request("an exact anchor or owned region is required");
+    }
+    let sanitizer = Sanitizer::builtin();
+    let provenance_text = match serde_json::to_string(&request.provenance) {
+        Ok(value) => value,
+        Err(error) => return bad_request(&format!("invalid provenance: {error}")),
+    };
+    for (label, value) in [
+        ("logical target", request.logical_target.as_str()),
+        ("boundary", request.boundary_value.as_str()),
+        ("base content", request.base_content.as_str()),
+        ("provenance", provenance_text.as_str()),
+    ] {
+        if sanitizer.scrub(value) != value {
+            return bad_request(&format!(
+                "{label} contains credential-shaped or secret-shaped content"
+            ));
+        }
+    }
+
+    let (workspace_id, project_id) =
+        match lookup_ws_proj_no_create(&state, &request.workspace, &request.project).await {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
+    let base_sha256: [u8; 32] = Sha256::digest(request.base_content.as_bytes()).into();
+    let loaded = match load_instruction_semantic_evidence(
+        &state,
+        workspace_id,
+        project_id,
+        logical_target.as_str(),
+        base_sha256,
+        &request.provenance,
+    )
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(error) => return error,
+    };
+    let report = match run_instruction_semantic_assistance(
+        llm.as_ref(),
+        InstructionSemanticInput {
+            logical_target: logical_target.to_string(),
+            base_content: request.base_content.clone(),
+            evidence: loaded
+                .iter()
+                .map(|loaded| loaded.evidence.clone())
+                .collect(),
+        },
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => return internal_err(error.to_string()),
+    };
+    if !report.rejected_candidates.is_empty()
+        && let Err(error) = stage_instruction_semantic_rejections(
+            &state,
+            workspace_id,
+            project_id,
+            logical_target.as_str(),
+            &report,
+        )
+        .await
+    {
+        return error;
+    }
+    if report.proposal.is_none() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "proposal_id": serde_json::Value::Null,
+                "status": "rejected",
+                "target_kind": "project_instruction",
+                "operation": "no_change",
+                "logical_target": request.logical_target,
+                "target_context_layer": "no_change",
+                "manual_approval_required": true,
+                "semantic_assistance": report.budget,
+                "rejected_candidates": report.rejected_candidates,
+            })),
+        );
+    }
+    let Some(proposal) = report.proposal.as_ref() else {
+        return internal_err("semantic proposal disappeared after validation");
+    };
+    let operation = match proposal.operation.parse::<AutoImproveProposalOperation>() {
+        Ok(operation) if operation != AutoImproveProposalOperation::Create => operation,
+        Ok(_) => return bad_request("project-instruction proposals use add, not create"),
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let mut provenance: Vec<serde_json::Value> =
+        loaded.into_iter().map(|item| item.provenance).collect();
+    provenance.push(serde_json::json!({
+        "kind": "semantic_analysis",
+        "source": format!("{}:{}", report.provider, report.model),
+        "excerpt": if report.summary.trim().is_empty() {
+            "bounded semantic instruction review"
+        } else {
+            report.summary.as_str()
+        },
+        "provider": report.provider,
+        "model": report.model,
+        "findings": report.findings,
+        "proposal_citations": proposal.citations,
+        "budget": report.budget,
+    }));
+    let provenance = serde_json::Value::Array(provenance);
+    if let Err(error) = validate_project_instruction_shape(
+        operation,
+        &proposal.target_context_layer,
+        &request.boundary_kind,
+        &request.boundary_value,
+        &provenance,
+    ) {
+        return bad_request(&error);
+    }
+    let final_provenance_text = match serde_json::to_string(&provenance) {
+        Ok(value) => value,
+        Err(error) => return bad_request(&format!("invalid provenance: {error}")),
+    };
+    for (label, value) in [
+        ("proposed content", proposal.proposed_content.as_str()),
+        ("rationale", proposal.rationale.as_str()),
+        ("provenance", final_provenance_text.as_str()),
+    ] {
+        if sanitizer.scrub(value) != value {
+            return bad_request(&format!(
+                "{label} contains credential-shaped or secret-shaped content"
+            ));
+        }
+    }
+    let unified_diff = project_instruction_unified_diff(
+        logical_target.as_str(),
+        &request.base_content,
+        &proposal.proposed_content,
+    );
+    let estimated_token_delta =
+        project_instruction_token_delta(&request.base_content, &proposal.proposed_content);
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let staged = match state
+        .writer
+        .stage_project_instruction_proposal(StageProjectInstructionProposal {
+            workspace_id,
+            project_id,
+            operation,
+            logical_target,
+            target_context_layer: proposal.target_context_layer.clone(),
+            base_sha256,
+            base_content: request.base_content,
+            boundary_kind: request.boundary_kind,
+            boundary_value: request.boundary_value,
+            proposed_content: proposal.proposed_content.clone(),
+            unified_diff,
+            estimated_token_delta,
+            title: "Provider-assisted durable instruction proposal".into(),
+            rationale: proposal.rationale.clone(),
+            provenance_json: provenance,
+            proposing_actor: actor,
+            proposing_author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await
+    {
+        Ok(staged) => staged,
+        Err(StoreError::InvalidState(message)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": message })),
+            );
+        }
+        Err(error) => return internal_err(error.to_string()),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "proposal_id": staged.proposal_id.to_string(),
+            "status": "pending",
+            "target_kind": "project_instruction",
+            "operation": operation.as_str(),
+            "logical_target": request.logical_target,
+            "target_context_layer": proposal.target_context_layer,
+            "manual_approval_required": true,
+            "semantic_assistance": report.budget,
+        })),
+    )
+}
+
+async fn load_instruction_semantic_evidence(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    logical_target: &str,
+    base_sha256: [u8; 32],
+    provenance: &serde_json::Value,
+) -> Result<Vec<LoadedInstructionSemanticEvidence>, (StatusCode, Json<serde_json::Value>)> {
+    let entries = provenance
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| bad_request("semantic assistance requires explicit durable evidence"))?;
+    if entries.len() != 1 {
+        return Err(bad_request(
+            "semantic assistance requires exactly one explicit evidence selector",
+        ));
+    }
+    let mut loaded = Vec::new();
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| bad_request("each provenance entry must be an object"))?;
+        if object.get("selection").and_then(serde_json::Value::as_str) != Some("explicit_cli") {
+            return Err(bad_request("semantic evidence must be explicitly selected"));
+        }
+        let kind = object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "durable_rule" => {
+                let source_path = PagePath::new(source.to_owned())
+                    .map_err(|error| bad_request(&format!("invalid durable-rule path: {error}")))?;
+                if !source_path.as_str().starts_with("_rules/") {
+                    return Err(bad_request("durable-rule evidence must come from _rules/"));
+                }
+                let source_sha256 = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| hex_to_sha256(value).ok())
+                    .ok_or_else(|| bad_request("durable-rule evidence source hash is invalid"))?;
+                let excerpt = object
+                    .get("excerpt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let page = state
+                    .reader
+                    .page_body_by_ids(workspace_id, project_id, source_path.as_str())
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?
+                    .ok_or_else(|| bad_request("durable-rule evidence page does not exist"))?;
+                let actual_sha256: [u8; 32] = Sha256::digest(page.body.as_bytes()).into();
+                if actual_sha256 != source_sha256 || !page.body.contains(excerpt) {
+                    return Err(bad_request(
+                        "durable-rule evidence hash or excerpt does not match the authoritative Wiki page",
+                    ));
+                }
+                let approved = state
+                    .reader
+                    .wiki_page_was_approved_proposal(workspace_id, project_id, source_path.as_str())
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?;
+                let accepted_kind = if approved {
+                    "approved_durable_rule"
+                } else {
+                    "explicit_user_rule"
+                };
+                loaded.push(LoadedInstructionSemanticEvidence {
+                    evidence: InstructionSemanticEvidence {
+                        kind: accepted_kind.into(),
+                        source: source_path.to_string(),
+                        content: excerpt.into(),
+                    },
+                    provenance: serde_json::json!({
+                        "kind": accepted_kind,
+                        "source": source_path,
+                        "source_sha256": sha256_to_hex(&actual_sha256),
+                        "excerpt": excerpt,
+                        "selection": "explicit_cli",
+                    }),
+                });
+            }
+            "doctor_finding" => {
+                let source_sha256 = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| hex_to_sha256(value).ok())
+                    .ok_or_else(|| bad_request("doctor-finding evidence source hash is invalid"))?;
+                let excerpt = object
+                    .get("excerpt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if source != logical_target || source_sha256 != base_sha256 || excerpt.is_empty() {
+                    return Err(bad_request(
+                        "doctor-finding evidence must match the selected target snapshot",
+                    ));
+                }
+                loaded.push(LoadedInstructionSemanticEvidence {
+                    evidence: InstructionSemanticEvidence {
+                        kind: "doctor_finding".into(),
+                        source: source.into(),
+                        content: excerpt.into(),
+                    },
+                    provenance: entry.clone(),
+                });
+            }
+            "repeated_project_correction" => {
+                let query = source.trim();
+                if query.is_empty() {
+                    return Err(bad_request("repeated-correction query cannot be empty"));
+                }
+                let hits = state
+                    .reader
+                    .search_observations_for_project(workspace_id, project_id, query.to_owned(), 16)
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?;
+                let ids = hits
+                    .into_iter()
+                    .filter(|hit| {
+                        matches!(
+                            hit.kind.parse::<ObservationKind>(),
+                            Ok(ObservationKind::UserPrompt)
+                        )
+                    })
+                    .map(|hit| hit.id)
+                    .collect();
+                let observations = state
+                    .reader
+                    .observations_by_ids_for_project(workspace_id, project_id, ids)
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?;
+                let session_count = observations
+                    .iter()
+                    .map(|observation| observation.session_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                if session_count < 2 {
+                    return Err(bad_request(
+                        "repeated project correction requires matching user prompts from at least two sessions",
+                    ));
+                }
+                let mut selected = Vec::new();
+                let mut remaining = Vec::new();
+                let mut selected_sessions = std::collections::HashSet::new();
+                for observation in observations {
+                    if selected_sessions.insert(observation.session_id) && selected.len() < 8 {
+                        selected.push(observation);
+                    } else {
+                        remaining.push(observation);
+                    }
+                }
+                selected.extend(remaining.into_iter().take(8 - selected.len()));
+                for observation in selected {
+                    let source = format!("observation:{}", observation.id);
+                    loaded.push(LoadedInstructionSemanticEvidence {
+                        evidence: InstructionSemanticEvidence {
+                            kind: "repeated_project_correction".into(),
+                            source: source.clone(),
+                            content: observation.body.clone(),
+                        },
+                        provenance: serde_json::json!({
+                            "kind": "repeated_project_correction",
+                            "source": source,
+                            "excerpt": observation.body,
+                            "session_id": observation.session_id,
+                            "selection": "explicit_cli",
+                        }),
+                    });
+                }
+            }
+            "durable_review_finding" => {
+                let source_path = PagePath::new(source.to_owned()).map_err(|error| {
+                    bad_request(&format!("invalid review-finding path: {error}"))
+                })?;
+                if !source_path.as_str().starts_with("_lint/") {
+                    return Err(bad_request("durable review findings must come from _lint/"));
+                }
+                let page = state
+                    .reader
+                    .page_body_by_ids(workspace_id, project_id, source_path.as_str())
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?
+                    .ok_or_else(|| bad_request("durable review-finding page does not exist"))?;
+                let frontmatter: serde_json::Value = serde_json::from_str(&page.frontmatter_json)
+                    .map_err(|error| {
+                    bad_request(&format!("invalid review frontmatter: {error}"))
+                })?;
+                if frontmatter.get("kind").and_then(serde_json::Value::as_str)
+                    != Some("lint-report")
+                {
+                    return Err(bad_request(
+                        "durable review evidence must be an authoritative lint-report page",
+                    ));
+                }
+                let source_hash: [u8; 32] = Sha256::digest(page.body.as_bytes()).into();
+                loaded.push(LoadedInstructionSemanticEvidence {
+                    evidence: InstructionSemanticEvidence {
+                        kind: "durable_review_finding".into(),
+                        source: source_path.to_string(),
+                        content: page.body.clone(),
+                    },
+                    provenance: serde_json::json!({
+                        "kind": "durable_review_finding",
+                        "source": source_path,
+                        "source_sha256": sha256_to_hex(&source_hash),
+                        "excerpt": page.body,
+                        "selection": "explicit_cli",
+                    }),
+                });
+            }
+            "assistant_restatement"
+            | "web_instruction"
+            | "issue_instruction"
+            | "one_off_failure"
+            | "resolved_transient_state"
+            | "transient_failure" => {
+                return Err(bad_request(&format!(
+                    "evidence kind {kind} cannot support a durable rule"
+                )));
+            }
+            other => {
+                return Err(bad_request(&format!(
+                    "unsupported semantic evidence kind: {other}"
+                )));
+            }
+        }
+    }
+    if loaded.len() > 8 {
+        loaded.truncate(8);
+    }
+    Ok(loaded)
+}
+
+async fn stage_instruction_semantic_rejections(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    logical_target: &str,
+    report: &engram_consolidate::InstructionSemanticReport,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let rejected = report
+        .rejected_candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "reason": candidate.reason,
+                "evidence": candidate.evidence,
+                "target_path": logical_target,
+                "kind": "project_instruction",
+                "operation": "semantic_assistance",
+            })
+        })
+        .collect::<Vec<_>>();
+    state
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id,
+            project_id,
+            session_id: None,
+            provider: (report.provider != "none").then(|| report.provider.clone()),
+            model: (report.model != "none").then(|| report.model.clone()),
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::json!([]),
+            rejected_candidates_json: serde_json::Value::Array(rejected),
+            config_json: serde_json::json!({
+                "source": "instructions_semantic_propose",
+                "budget": report.budget,
+                "manual_approval_only": true,
+            }),
+            proposal_actor: engram_core::ActorContext {
+                agent: Some("instruction_semantic".into()),
+                ..engram_core::ActorContext::default()
+            },
+            proposals: Vec::new(),
+        })
+        .await
+        .map_err(|error| internal_err(error.to_string()))?;
+    Ok(())
+}
+
 fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -2100,6 +2610,84 @@ fn validate_project_instruction_shape(
                     != Some("explicit_cli")
                 {
                     return Err("durable-rule evidence must be explicitly selected".into());
+                }
+            }
+            "explicit_user_rule" | "approved_durable_rule" => {
+                let source_path = PagePath::new(source.to_owned())
+                    .map_err(|error| format!("invalid durable-rule source path: {error}"))?;
+                let hash = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !source_path.as_str().starts_with("_rules/")
+                    || !is_sha256_hex(hash)
+                    || object.get("selection").and_then(serde_json::Value::as_str)
+                        != Some("explicit_cli")
+                {
+                    return Err(
+                        "accepted durable-rule evidence requires an explicit _rules/ source and hash"
+                            .into(),
+                    );
+                }
+            }
+            "repeated_project_correction" => {
+                if !source.starts_with("observation:")
+                    || object.get("session_id").is_none()
+                    || object.get("selection").and_then(serde_json::Value::as_str)
+                        != Some("explicit_cli")
+                {
+                    return Err(
+                        "repeated corrections require authoritative observation and session provenance"
+                            .into(),
+                    );
+                }
+            }
+            "durable_review_finding" => {
+                let source_path = PagePath::new(source.to_owned())
+                    .map_err(|error| format!("invalid durable-review source path: {error}"))?;
+                let hash = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !source_path.as_str().starts_with("_lint/")
+                    || !is_sha256_hex(hash)
+                    || object.get("selection").and_then(serde_json::Value::as_str)
+                        != Some("explicit_cli")
+                {
+                    return Err(
+                        "durable review evidence requires an explicit authoritative _lint/ page and hash"
+                            .into(),
+                    );
+                }
+            }
+            "semantic_analysis" => {
+                let budget = object
+                    .get("budget")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        "semantic analysis requires an enforced budget report".to_string()
+                    })?;
+                if budget
+                    .get("provider_calls")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(1)
+                    || budget
+                        .get("proposal_count")
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(1)
+                    || object
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || object
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(
+                        "semantic analysis requires one provider call, one proposal, provider, and model"
+                            .into(),
+                    );
                 }
             }
             "doctor_finding" => {

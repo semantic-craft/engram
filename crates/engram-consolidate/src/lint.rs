@@ -185,8 +185,8 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                 detail: None,
             });
         }
-        // M20: rule-shaped pages get a "consider adding to
-        // CLAUDE.md" suggestion. Two signals are checked:
+        // Rule-shaped pages get an explicit proposal-only promotion path.
+        // Two signals are checked:
         //   1. Frontmatter `kind: rule` — set by the consolidator
         //      when it classifies an observation as a rule.
         //   2. Page path starts with `_rules/` — same routing
@@ -200,14 +200,18 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
         let path_str = c.path.as_str();
         let path_is_rule = path_str.starts_with("_rules/");
         if kind_is_rule || path_is_rule {
+            let staging_hint = if path_is_rule {
+                format!("`engram instructions propose --rule {path_str}`")
+            } else {
+                "`engram instructions propose --review-finding _lint/<date>.md --semantic`".into()
+            };
             out.push(LintFinding {
                 kind: "rule_suggestion".into(),
                 severity: "info".into(),
                 message: format!(
                     "Page {path_str} looks like a durable project rule. \
-                     Consider copying it into your project's CLAUDE.md / \
-                     AGENTS.md so the agent sees it on every turn, not \
-                     just when it remembers to call memory_query."
+                     Review and stage it with {staging_hint}; this creates a DB-only pending \
+                     project-instruction proposal and does not write the repository."
                 ),
                 pages: vec![path_str.to_string()],
                 detail: None,
@@ -393,8 +397,7 @@ mod tests {
         assert_eq!(dupes[0].pages.len(), 2);
     }
 
-    /// M20: a page tagged `kind: rule` in its frontmatter triggers
-    /// a rule_suggestion finding pointing the user at CLAUDE.md.
+    /// A page tagged `kind: rule` can promote its durable lint finding.
     #[test]
     fn rule_pass_flags_rule_kind_frontmatter() {
         let candidate = DecayCandidate {
@@ -414,7 +417,11 @@ mod tests {
             .filter(|f| f.kind == "rule_suggestion")
             .collect();
         assert_eq!(rules.len(), 1, "expected one rule_suggestion finding");
-        assert!(rules[0].message.contains("CLAUDE.md"));
+        assert!(
+            rules[0]
+                .message
+                .contains("engram instructions propose --review-finding")
+        );
     }
 
     /// M20: a page under `_rules/` also triggers the suggestion
@@ -433,9 +440,14 @@ mod tests {
             frontmatter_json: "{}".into(),
         };
         let findings = rule_based_findings(&[candidate]);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.kind == "rule_suggestion")
+            .expect("expected a rule_suggestion finding for _rules/ page");
         assert!(
-            findings.iter().any(|f| f.kind == "rule_suggestion"),
-            "expected a rule_suggestion finding for _rules/ page",
+            finding
+                .message
+                .contains("engram instructions propose --rule _rules/no-impl-without-test.md")
         );
     }
 

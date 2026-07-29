@@ -78,5 +78,5 @@ pub use openai_oauth::{
     OPENAI_OAUTH_TOKEN_URL, OpenAiOAuthProvider, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
+pub use provider::{LlmProvider, complete_structured, complete_structured_once};
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};

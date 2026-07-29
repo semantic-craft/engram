@@ -290,6 +290,19 @@ impl LlmProvider for HealthRecordingLlmProvider {
         self.health.record_result(&result);
         result
     }
+
+    async fn complete_structured_raw_once(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        let result = self
+            .inner
+            .complete_structured_raw_once(request, schema)
+            .await;
+        self.health.record_result(&result);
+        result
+    }
 }
 
 struct HealthRecordingEmbedder {

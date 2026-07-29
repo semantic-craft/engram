@@ -13,6 +13,7 @@ pub mod auto_improve_telemetry;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
+pub mod instruction_semantic;
 pub mod lint;
 pub mod projection;
 pub mod sweep;
@@ -51,6 +52,12 @@ pub use consolidator::{
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
     run_curator_report,
+};
+pub use instruction_semantic::{
+    InstructionSemanticBudget, InstructionSemanticCitation, InstructionSemanticEvidence,
+    InstructionSemanticFinding, InstructionSemanticInput, InstructionSemanticProposal,
+    InstructionSemanticRejectedCandidate, InstructionSemanticReport,
+    run_instruction_semantic_assistance,
 };
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};

@@ -16,7 +16,7 @@
 //! actually changes about end-to-end behaviour.
 
 use engram_llm::types::ChatRequest;
-use engram_llm::{LlmProvider, OpenAiCompatProvider};
+use engram_llm::{LlmProvider, OpenAiCompatProvider, ProviderHealth};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,6 +166,39 @@ async fn strict_non_object_falls_back_to_tolerant_parser() {
         counter.load(Ordering::SeqCst),
         2,
         "fallback path must issue exactly two upstream calls (strict, then tolerant)"
+    );
+}
+
+/// Budget-sensitive callers can request the strict structured-output path
+/// without the tolerant retry. A parse-shape failure must then surface after
+/// exactly one upstream call.
+#[tokio::test]
+async fn strict_single_call_path_does_not_fallback_on_parse_shape_error() {
+    let server = MockServer::start().await;
+    let responder = CountingResponder::json(
+        200,
+        body_with_content("Sure! Here is the JSON you asked for: {\"ok\":true}"),
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(responder.clone())
+        .mount(&server)
+        .await;
+
+    let provider = ProviderHealth::default().wrap_llm_provider(
+        Arc::new(strict_provider(server.uri())),
+        "openai-compat",
+        "mistral-nemo",
+        None,
+    );
+    provider
+        .complete_structured_raw_once(tiny_request(), tiny_schema())
+        .await
+        .expect_err("single-call strict parsing must not fall back");
+    assert_eq!(
+        responder.count(),
+        1,
+        "single-call structured completion must not retry through the tolerant path"
     );
 }
 
