@@ -161,7 +161,7 @@ async fn proposal_from_rule(
     let (logical_target, base_content) = read_repository_target(report, &target)?;
     let rule_content = rule_instruction_content(&page.body)?;
     let (operation, proposed_content, target_context_layer) =
-        if normalized_contains(&base_content, &rule_content) {
+        if contains_complete_instruction_blocks(&base_content, &rule_content) {
             ("no_change", base_content.clone(), "no_change".to_owned())
         } else {
             (
@@ -428,9 +428,36 @@ fn remove_lines(content: &str, start: usize, end: usize) -> Result<String> {
     Ok(output)
 }
 
-fn normalized_contains(haystack: &str, needle: &str) -> bool {
-    let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalize(haystack).contains(&normalize(needle))
+fn contains_complete_instruction_blocks(target: &str, instruction: &str) -> bool {
+    let target_blocks = normalized_instruction_blocks(target);
+    let instruction_blocks = normalized_instruction_blocks(instruction);
+    !instruction_blocks.is_empty()
+        && target_blocks
+            .windows(instruction_blocks.len())
+            .any(|blocks| blocks == instruction_blocks)
+}
+
+fn normalized_instruction_blocks(value: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    for line in value.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        for word in line.split_whitespace() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
 }
 
 fn target_layer_for_path(path: &str) -> &'static str {
@@ -461,4 +488,25 @@ fn first_h1(body: &str) -> Option<String> {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_complete_instruction_blocks;
+
+    #[test]
+    fn complete_instruction_blocks_ignore_line_wrapping() {
+        assert!(contains_complete_instruction_blocks(
+            "# Rules\n\nKeep SQLite writes behind\nthe single writer actor.\n",
+            "Keep SQLite writes behind the single writer actor."
+        ));
+    }
+
+    #[test]
+    fn instruction_substring_inside_larger_statement_is_not_complete() {
+        assert!(!contains_complete_instruction_blocks(
+            "# Rules\n\nNever Keep SQLite writes behind the single writer actor.\n",
+            "Keep SQLite writes behind the single writer actor."
+        ));
+    }
 }

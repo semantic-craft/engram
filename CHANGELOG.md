@@ -34,7 +34,10 @@ below start from the fork.
   and timestamps in the existing pending-writes review surface. They can be
   listed, shown, diffed, or rejected, but cannot be approved or applied yet;
   staging and rejection never change repository files, Wiki pages, or Git
-  state. Existing Wiki proposals retain their sidecar and Wiki mutation path.
+  state. Durable-rule no-change detection requires a complete normalized
+  instruction block, so contradictory or larger statements are not mistaken
+  for the selected rule. Existing Wiki proposals retain their sidecar and Wiki
+  mutation path.
 
 ## 2.0.0 - 2026-07-19
 
