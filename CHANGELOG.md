@@ -108,6 +108,12 @@ below start from the fork.
 
 ### Fixed
 
+- Updated `plist` to 1.10.0 and `quick-xml` to 0.41.0, removing the
+  `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` XML denial-of-service
+  advisories from the CLI release dependency graph.
+- The release script now moves this changelog's canonical `## Unreleased`
+  section into the new version entry and includes it in the annotated tag,
+  instead of silently expecting bracketed headings that the file does not use.
 - GitHub Release installation notes now describe the shipped macOS Apple
   Silicon archive accurately instead of advertising an x86_64 artifact that
   the release workflow does not build.
