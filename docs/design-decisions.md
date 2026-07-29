@@ -212,6 +212,17 @@ remains separate from Wiki auto-approval. This preserves the narrow tool
 surface and prevents scheduler or model output from acquiring repository-write
 authority.
 
+Local project-instruction apply is an optimistic, fail-closed executor rather
+than a Git reconciliation engine. Human approval binds one base snapshot and
+ownership boundary; apply may write only when the canonical target, relevant
+Git state, instruction graph, managed-marker structure, encoding, and approval
+binding still agree. It never repairs with force, merge, rebase, or staging.
+Routing and approved-rules are separate ownership domains, safe adapters resolve
+to one canonical file, and failures are durable typed audit outcomes rather than
+permission to retry against new bytes. Repository content and write authority
+remain local; the server stores only application or diagnostic metadata through
+the single writer actor.
+
 ## 11. Identity & project scoping (3-tuple from day one)
 
 Lesson from basic-memory's v0.20 trauma: `(workspace, project, page_path)`. Even if v1 ships single-workspace, the schema and every API/tool param encodes the full 3-tuple. No retrofits.

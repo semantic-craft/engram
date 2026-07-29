@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use engram_core::{MARKER_END, MARKER_START, SNIPPET_BODY};
 use serde::Serialize;
 use toml_edit::DocumentMut;
@@ -17,6 +17,58 @@ use toml_edit::DocumentMut;
 use crate::instruction_placement::{
     PlacementChain, PlacementChainEntry, PlacementFinding, PlacementSource,
 };
+
+pub(crate) const APPROVED_RULES_START: &str = "<!-- engram:approved-rules:start -->";
+pub(crate) const APPROVED_RULES_END: &str = "<!-- engram:approved-rules:end -->";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedInstructionRegions {
+    pub(crate) routing: Option<std::ops::Range<usize>>,
+    pub(crate) approved_rules: Option<std::ops::Range<usize>>,
+}
+
+/// Parse every structural Engram-owned marker as a single, disjoint region.
+/// Marker-like examples inside fenced or inline code are intentionally ignored.
+pub(crate) fn managed_instruction_regions(content: &str) -> Result<ManagedInstructionRegions> {
+    let routing = managed_region(content, MARKER_START, MARKER_END, "routing")?;
+    let approved_rules = managed_region(
+        content,
+        APPROVED_RULES_START,
+        APPROVED_RULES_END,
+        "approved-rules",
+    )?;
+    if let (Some(routing), Some(approved)) = (&routing, &approved_rules)
+        && routing.start < approved.end
+        && approved.start < routing.end
+    {
+        bail!(
+            "managed markers are malformed: routing and approved-rules regions overlap; repair each region into one disjoint start/end pair before retrying"
+        );
+    }
+    Ok(ManagedInstructionRegions {
+        routing,
+        approved_rules,
+    })
+}
+
+fn managed_region(
+    content: &str,
+    start_marker: &str,
+    end_marker: &str,
+    label: &str,
+) -> Result<Option<std::ops::Range<usize>>> {
+    let starts = structural_marker_positions(content, start_marker);
+    let ends = structural_marker_positions(content, end_marker);
+    if starts.is_empty() && ends.is_empty() {
+        return Ok(None);
+    }
+    if starts.len() != 1 || ends.len() != 1 || starts[0] >= ends[0] {
+        bail!(
+            "managed markers are malformed: {label} requires exactly one ordered start/end pair; repair duplicate, missing, crossed, or nested markers before retrying"
+        );
+    }
+    Ok(Some(starts[0]..ends[0] + end_marker.len()))
+}
 
 const DEFAULT_CODEX_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 const NEAR_DUPLICATE_THRESHOLD: f64 = 0.8;

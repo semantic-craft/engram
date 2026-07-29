@@ -135,22 +135,25 @@ fn install_instructions_updates_only_markered_block_and_backs_up_original() {
     assert!(updated.contains("Use the installed engram Agent Skills"));
     assert!(!updated.contains("old engram block"));
 
-    let backups: Vec<_> = fs::read_dir(project.path())
+    let backup_dirs: Vec<_> = fs::read_dir(project.path())
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("CLAUDE.md.bak-"))
+                .is_some_and(|name| name.starts_with(".engram-apply-backup."))
         })
         .collect();
     assert_eq!(
-        backups.len(),
+        backup_dirs.len(),
         1,
         "install-instructions must back up updates"
     );
-    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), original);
+    assert_eq!(
+        fs::read_to_string(backup_dirs[0].join("CLAUDE.md")).unwrap(),
+        original
+    );
 }
 
 #[test]
