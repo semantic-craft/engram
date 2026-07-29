@@ -591,7 +591,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "engram-cli"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "engram-consolidate"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "engram-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "jiff",
  "regex",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "engram-eval"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "engram-hooks"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "engram-llm"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "engram-mcp"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "engram-store"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "engram-web"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "engram-wiki"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
