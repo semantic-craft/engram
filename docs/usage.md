@@ -106,6 +106,38 @@ symlink, or explicit configuration establishes one source. Malformed,
 duplicate, crossed, nested, or incomplete routing markers are reported only;
 the doctor never repairs them.
 
+Schema version 2 adds `placement_findings`. Every placement finding includes a
+content category, source line range when applicable, recommended `action`,
+`destination`, protection status, concise evidence, rationale, and related
+locations. The destination vocabulary is intentionally small:
+
+| Destination | Meaning |
+|---|---|
+| `root_instructions` | Keep a non-obvious universal project invariant in always-loaded instructions. |
+| `path_rules` | Scope a component-specific constraint to its repository subtree. |
+| `agent_skill` | Load a multi-step or private procedure only for the relevant task. |
+| `wiki` | Retain rationale, evidence, history, and rejected alternatives as durable knowledge. |
+| `enforcement` | Back mandatory controls with permissions, hooks, sandboxing, authentication, or an equivalent mechanism. |
+| `no_change` | No relocation target is recommended; the paired action says whether to keep, review, or remove the diagnosed text. |
+
+The deterministic analysis reports generic how-to-think phrases, exact and
+normalized duplication, opposite-polarity directives, missing relative
+repository paths or command files, missing referenced project Skills, and
+likely wrong-layer content. It explicitly protects team coding conventions,
+private deployment knowledge, internal tool boundaries, database migration
+rules, business boundaries, and security requirements as content a model
+cannot safely infer. Mandatory security prose is preserved as a requirement
+but directed to enforcement; detailed procedures are directed to Skills; and
+history or evidence is directed to the Wiki.
+
+These are review findings, not edits or proposals. A generic or duplicate
+finding can recommend removal only when its evidence is independent of file
+length. A line or byte threshold produces `action = "review"` and never a
+deletion recommendation by itself. Claude imports remain included in loaded
+bytes, and Codex pressure uses the configured combined project-document limit.
+The optimization target is correct placement and fewer conflicts, not the
+shortest possible root file.
+
 To make the source-of-truth choice explicit, add this to the repository-root
 `.engram.toml`:
 

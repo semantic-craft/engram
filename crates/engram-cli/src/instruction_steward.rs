@@ -14,6 +14,10 @@ use engram_core::{MARKER_END, MARKER_START, SNIPPET_BODY};
 use serde::Serialize;
 use toml_edit::DocumentMut;
 
+use crate::instruction_placement::{
+    PlacementChain, PlacementChainEntry, PlacementFinding, PlacementSource,
+};
+
 const DEFAULT_CODEX_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 const NEAR_DUPLICATE_THRESHOLD: f64 = 0.8;
 const CLAUDE_IMPORT_MAX_DEPTH: usize = 5;
@@ -29,6 +33,7 @@ pub struct DoctorReport {
     pub canonical: CanonicalSource,
     pub sources: Vec<SourceReport>,
     pub chains: Vec<ChainReport>,
+    pub placement_findings: Vec<PlacementFinding>,
     pub findings: Vec<Finding>,
 }
 
@@ -148,6 +153,49 @@ impl DoctorReport {
         ];
         chains.extend(build_best_effort_chains(&mut inventory));
 
+        let placement_sources = inventory
+            .sources
+            .values()
+            .filter_map(|source| {
+                source.content.as_ref().map(|content| PlacementSource {
+                    path: source.report.path.clone(),
+                    absolute_path: source.absolute_path.clone(),
+                    content: content.clone(),
+                    line_count: source.report.line_count,
+                    safe_symlink_target: source
+                        .report
+                        .symlink
+                        .as_ref()
+                        .filter(|symlink| symlink.safe)
+                        .map(|symlink| symlink.target.clone()),
+                })
+            })
+            .collect();
+        let placement_chains = chains
+            .iter()
+            .map(|chain| PlacementChain {
+                harness: chain.harness.clone(),
+                total_loaded_bytes: chain.total_loaded_bytes,
+                project_document_max_bytes: chain.project_document_max_bytes,
+                entries: chain
+                    .entries
+                    .iter()
+                    .map(|entry| PlacementChainEntry {
+                        source: entry.source.clone(),
+                        load_mode: entry.load_mode.clone(),
+                        effective: entry.effective,
+                        loaded_bytes: entry.loaded_bytes,
+                        truncated: entry.truncated,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let placement_findings = crate::instruction_placement::analyze(
+            &repository_root,
+            placement_sources,
+            placement_chains,
+        );
+
         let mut sources: Vec<_> = inventory
             .sources
             .into_values()
@@ -163,7 +211,7 @@ impl DoctorReport {
         });
 
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             read_only: true,
             repository_root,
             working_directory,
@@ -171,6 +219,7 @@ impl DoctorReport {
             canonical: canonical.report,
             sources,
             chains,
+            placement_findings,
             findings: inventory.findings,
         })
     }
@@ -241,6 +290,32 @@ impl DoctorReport {
                     println!("    paths: {}", entry.path_patterns.join(", "));
                 }
             }
+        }
+
+        println!("\nPlacement diagnostics");
+        if self.placement_findings.is_empty() {
+            println!("  none");
+        }
+        for finding in &self.placement_findings {
+            let location = finding.line_start.map_or_else(
+                || finding.source.clone(),
+                |start| match finding.line_end {
+                    Some(end) if end != start => format!("{}:{start}-{end}", finding.source),
+                    _ => format!("{}:{start}", finding.source),
+                },
+            );
+            println!(
+                "  {} {} [{}] — {}",
+                finding.severity, finding.code, finding.category, location
+            );
+            println!(
+                "    action {}; destination {}; protected {}",
+                finding.action,
+                finding.destination,
+                if finding.protected { "yes" } else { "no" }
+            );
+            println!("    Evidence: {}", finding.evidence);
+            println!("    Reason: {}", finding.rationale);
         }
 
         println!("\nFindings");

@@ -19,6 +19,7 @@ mod cli;
 mod commands;
 mod config;
 mod http_client;
+mod instruction_placement;
 mod instruction_steward;
 mod logging;
 mod process_guard;
