@@ -326,7 +326,7 @@ impl ApiClient {
         let payload = text
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
-            .last()
+            .next_back()
             .map(|s| s.to_string())
             .unwrap_or(text);
         serde_json::from_str(&payload).map_err(|e| e.to_string())
@@ -531,7 +531,7 @@ mod tests {
             .expect("page exists");
         let detail = c.read_page(&target.path).await.expect("read ok");
         assert!(!detail.body.is_empty());
-        assert!(detail.title.len() > 0);
+        assert!(!detail.title.is_empty());
     }
 
     #[tokio::test]

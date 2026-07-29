@@ -10,6 +10,25 @@ below start from the fork.
 
 ## Unreleased
 
+## Desktop 0.1.1 - 2026-07-29
+
+### Changed
+
+- Refreshed the desktop npm and Rust lockfiles to current compatible releases,
+  including Tauri plugin/runtime patch updates, while retaining the explicit
+  `cookie` security override. The frontend audit remains vulnerability-free;
+  the Linux-only Tauri v2 GTK3/`glib 0.18.5` upstream advisory remains tracked
+  separately until gtk-rs publishes a compatible fix.
+
+### Fixed
+
+- Desktop release builds now distinguish unsigned local bundles from public
+  artifacts. The macOS release gate requires an available Developer ID identity
+  and Keychain-hosted notary profile, verifies path sanitization and signatures,
+  notarizes and staples the DMG, mounts it for Gatekeeper acceptance, and emits
+  a SHA-256 sidecar. Two current-toolchain Clippy findings were also corrected
+  without changing behavior.
+
 ## 2.1.0 - 2026-07-29
 
 ### Added
