@@ -381,16 +381,19 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
 | `engram curator` | Rule-based, report-only maintenance review. |
 | `engram curator --stage` | Stage exactly one curator report page for pending-writes approval. |
-| `engram pending-writes list` | Show staged wiki changes. |
-| `engram pending-writes diff <id>` | Show markdown diff. |
-| `engram pending-writes approve <id>` | Apply through the normal wiki mutation path. |
-| `engram pending-writes reject <id>` | Discard proposal with audit trail. |
+| `engram instructions propose --rule ...` / `--finding ...` | Stage one evidence-backed, DB-only `project_instruction` proposal; never edit repository or Wiki content. |
+| `engram pending-writes list` | Show staged Wiki and project-instruction changes. |
+| `engram pending-writes diff <id>` | Show the stored target-appropriate diff. |
+| `engram pending-writes approve <id>` | Apply a `wiki_page` proposal through the normal Wiki mutation path; `project_instruction` approval is intentionally unavailable in the proposal-only phase. |
+| `engram pending-writes reject <id>` | Record reviewer, reason, and terminal state without mutating the target. |
 
-Pending proposals should be visible as markdown under `_pending/auto-improve/`
-so humans can review them in the wiki/Obsidian workflow. SQLite can still hold
-proposal state, approval status, evidence metadata, and audit rows, but the
-review artifact itself should be inspectable and versioned like the rest of the
-wiki.
+Pending Wiki proposals remain visible as markdown under
+`_pending/auto-improve/` so humans can review them in the wiki/Obsidian
+workflow. Project-instruction proposals intentionally have no Wiki sidecar:
+SQLite holds their target kind, operation, logical target/layer, base hash,
+approved boundary, proposed content, diff, token delta, provenance, actor, and
+audit events. This prevents proposal staging from turning repository policy
+into durable Wiki content or accidentally entering the Wiki mutation path.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the
@@ -475,6 +478,20 @@ Tests:
    indexed as approved durable knowledge.
 7. Approval/audit metadata preserves `auto_improve` proposal attribution and the
    approving actor separately.
+
+### Project-instruction proposal bridge
+
+Status: proposal-only staging, list/show/diff, and rejection are implemented.
+
+The bridge extends pending-proposal rows compatibly with
+`target_kind = "project_instruction"`. It accepts only an explicitly selected
+durable `_rules/` page or deterministic doctor finding, rejects weak or
+secret-shaped evidence before storage, and records derived review data and full
+provenance through the single writer actor. Existing `wiki_page` rows retain
+their defaults, sidecars, and approval behavior. Project-instruction staging and
+rejection are DB-only, persist across restart, and never alter repository files,
+Wiki pages, or Git state. Human editing/approval and hash-checked local apply
+are intentionally outside this phase.
 
 ### Phase 3: Background Scheduler
 

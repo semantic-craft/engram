@@ -130,13 +130,14 @@ cannot safely infer. Mandatory security prose is preserved as a requirement
 but directed to enforcement; detailed procedures are directed to Skills; and
 history or evidence is directed to the Wiki.
 
-These are review findings, not edits or proposals. A generic or duplicate
-finding can recommend removal only when its evidence is independent of file
-length. A line or byte threshold produces `action = "review"` and never a
-deletion recommendation by itself. Claude imports remain included in loaded
-bytes, and Codex pressure uses the configured combined project-document limit.
-The optimization target is correct placement and fewer conflicts, not the
-shortest possible root file.
+These are review findings, not edits. A generic or duplicate finding can
+recommend removal only when its evidence is independent of file length. A line
+or byte threshold produces `action = "review"` and never a deletion
+recommendation by itself. Claude imports remain included in loaded bytes, and
+Codex pressure uses the configured combined project-document limit. The
+optimization target is correct placement and fewer conflicts, not the shortest
+possible root file. An operator may explicitly select one finding for the
+proposal-only workflow below; Engram never stages every finding automatically.
 
 To make the source-of-truth choice explicit, add this to the repository-root
 `.engram.toml`:
@@ -150,6 +151,57 @@ The path must be repository-relative, must remain inside the repository, and
 must name a readable file. This declaration affects doctor classification
 only; it does not change Claude Code or Codex loading behavior and does not
 change `install-instructions` output.
+
+## Stage project instruction proposals
+
+`engram instructions propose` turns exactly one explicit evidence source into a
+pending `project_instruction` record:
+
+```bash
+# Promote one durable Wiki rule into an explicit repository target.
+engram instructions propose \
+  --workspace default --project my-project \
+  --rule _rules/single-writer.md --target AGENTS.md
+
+# Select one deterministic doctor finding. Add --source/--line when a code is
+# repeated; the finding always targets the diagnosed readable source.
+engram instructions propose \
+  --workspace default --project my-project \
+  --finding generic_harness_guidance --source AGENTS.md --line 12
+```
+
+Durable-rule evidence must name an existing `_rules/` page and is read through
+the configured Engram server. Doctor evidence is recomputed from the current
+repository and must resolve to one readable inventoried instruction source;
+context-budget and other source-less audit findings are not proposal targets.
+Both paths are deterministic and require no LLM.
+
+The proposal stores `target_kind = "project_instruction"`, its operation
+(`add`, `update`, `stale_delete`, `move_to_skill`, `move_to_path_rule`,
+`move_to_wiki`, `move_to_enforcement`, or `no_change`), logical target, context
+layer, base SHA-256, exact anchor or owned region, proposed content, unified
+diff, estimated token delta, rationale, complete provenance, proposing actor,
+and timestamps. The server recomputes the hash, diff, and token delta instead of
+trusting client-supplied derived fields. Missing evidence, assistant-only
+restatements, web or issue instructions, one-off or resolved transient state,
+and secret-shaped base/proposed/evidence content are rejected before staging.
+
+Review uses the existing surface:
+
+```bash
+engram pending-writes list --workspace default --project my-project
+engram pending-writes show <proposal-id> --workspace default --project my-project
+engram pending-writes diff <proposal-id> --workspace default --project my-project
+engram pending-writes reject <proposal-id> --reason "not a project invariant" \
+  --workspace default --project my-project
+```
+
+The record is DB-only and persists across server restarts. It creates no Wiki
+sidecar and does not change the repository, Wiki target, index, or Git state.
+It is not an active project rule, and `pending-writes approve` intentionally
+refuses this target kind until the separate human editing/approval and local
+apply phases exist. Existing `wiki_page` proposals continue to use their
+current sidecar and Wiki approval path.
 
 ## Install the routing snippet and Agent Skills
 

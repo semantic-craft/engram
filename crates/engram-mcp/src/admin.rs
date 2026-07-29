@@ -23,6 +23,7 @@
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
+//! - `POST /admin/instructions/proposals` — stage a DB-only project-instruction proposal.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -50,19 +51,21 @@ use engram_consolidate::{
 };
 use engram_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    PagePath, ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use engram_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
-    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
+    DecayParams, EmbeddingWrite, NewAutoImproveProposal, PendingProposalTargetKind, ReaderPool,
+    RejectAutoImproveProposal, ScopeResolutionError, StageAutoImproveRun,
+    StageProjectInstructionProposal, StoreError, WriterHandle, create_explicit_scope,
     f32_vec_to_bytes, lookup_existing_scope,
 };
 use engram_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
@@ -355,6 +358,22 @@ struct PendingRejectRequest {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProjectInstructionProposalRequest {
+    workspace: String,
+    project: String,
+    operation: String,
+    logical_target: String,
+    target_context_layer: String,
+    boundary_kind: String,
+    boundary_value: String,
+    base_content: String,
+    proposed_content: String,
+    title: String,
+    rationale: String,
+    provenance: serde_json::Value,
+}
+
 fn default_auto_improve_min_observations() -> usize {
     engram_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS
 }
@@ -481,6 +500,10 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_auto_improve_report),
         )
         .route("/admin/curator", post(handle_curator))
+        .route(
+            "/admin/instructions/proposals",
+            post(handle_project_instruction_proposal),
+        )
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -1822,6 +1845,438 @@ async fn handle_pending_writes_list(
     }
 }
 
+const MAX_PROJECT_INSTRUCTION_CONTENT_BYTES: usize = 1024 * 1024;
+
+async fn handle_project_instruction_proposal(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    Json(request): Json<ProjectInstructionProposalRequest>,
+) -> impl IntoResponse {
+    let operation = match request.operation.parse::<AutoImproveProposalOperation>() {
+        Ok(operation) if operation != AutoImproveProposalOperation::Create => operation,
+        Ok(_) => return bad_request("project-instruction proposals use add, not create"),
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let logical_target = match PagePath::new(request.logical_target.clone()) {
+        Ok(path) => path,
+        Err(error) => return bad_request(&format!("invalid logical target: {error}")),
+    };
+    if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
+        || request.proposed_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
+    {
+        return bad_request("project-instruction target content exceeds the 1 MiB limit");
+    }
+    if request.title.trim().is_empty() || request.rationale.trim().is_empty() {
+        return bad_request("project-instruction proposal requires title and rationale");
+    }
+    if let Err(error) = validate_project_instruction_shape(
+        operation,
+        &request.target_context_layer,
+        &request.boundary_kind,
+        &request.boundary_value,
+        &request.provenance,
+    ) {
+        return bad_request(&error);
+    }
+    let sanitizer = Sanitizer::builtin();
+    let provenance_text = match serde_json::to_string(&request.provenance) {
+        Ok(value) => value,
+        Err(error) => return bad_request(&format!("invalid provenance: {error}")),
+    };
+    for (label, value) in [
+        ("logical target", request.logical_target.as_str()),
+        ("boundary", request.boundary_value.as_str()),
+        ("title", request.title.as_str()),
+        ("base content", request.base_content.as_str()),
+        ("proposed content", request.proposed_content.as_str()),
+        ("rationale", request.rationale.as_str()),
+        ("provenance", provenance_text.as_str()),
+    ] {
+        if sanitizer.scrub(value) != value {
+            return bad_request(&format!(
+                "{label} contains credential-shaped or secret-shaped content"
+            ));
+        }
+    }
+
+    let (workspace_id, project_id) =
+        match lookup_ws_proj_no_create(&state, &request.workspace, &request.project).await {
+            Ok(scope) => scope,
+            Err(error) => return error,
+        };
+    let base_sha256: [u8; 32] = Sha256::digest(request.base_content.as_bytes()).into();
+    if let Err(error) = verify_project_instruction_provenance(
+        &state,
+        workspace_id,
+        project_id,
+        logical_target.as_str(),
+        base_sha256,
+        &request.provenance,
+    )
+    .await
+    {
+        return error;
+    }
+    let unified_diff = project_instruction_unified_diff(
+        logical_target.as_str(),
+        &request.base_content,
+        &request.proposed_content,
+    );
+    let estimated_token_delta =
+        estimated_tokens(&request.proposed_content) - estimated_tokens(&request.base_content);
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let staged = match state
+        .writer
+        .stage_project_instruction_proposal(StageProjectInstructionProposal {
+            workspace_id,
+            project_id,
+            operation,
+            logical_target,
+            target_context_layer: request.target_context_layer.clone(),
+            base_sha256,
+            boundary_kind: request.boundary_kind,
+            boundary_value: request.boundary_value,
+            proposed_content: request.proposed_content,
+            unified_diff,
+            estimated_token_delta,
+            title: request.title,
+            rationale: request.rationale,
+            provenance_json: request.provenance,
+            proposing_actor: actor,
+            proposing_author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await
+    {
+        Ok(staged) => staged,
+        Err(StoreError::InvalidState(message)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": message })),
+            );
+        }
+        Err(error) => return internal_err(error.to_string()),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "proposal_id": staged.proposal_id.to_string(),
+            "status": "pending",
+            "target_kind": "project_instruction",
+            "operation": operation.as_str(),
+            "logical_target": request.logical_target,
+            "target_context_layer": request.target_context_layer,
+        })),
+    )
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+fn validate_project_instruction_shape(
+    operation: AutoImproveProposalOperation,
+    target_context_layer: &str,
+    boundary_kind: &str,
+    boundary_value: &str,
+    provenance: &serde_json::Value,
+) -> Result<(), String> {
+    if !matches!(boundary_kind, "exact_anchor" | "owned_region") || boundary_value.trim().is_empty()
+    {
+        return Err("an exact anchor or owned region is required".into());
+    }
+    let expected_layer = match operation {
+        AutoImproveProposalOperation::MoveToSkill => Some("agent_skill"),
+        AutoImproveProposalOperation::MoveToPathRule => Some("path_rules"),
+        AutoImproveProposalOperation::MoveToWiki => Some("wiki"),
+        AutoImproveProposalOperation::MoveToEnforcement => Some("enforcement"),
+        AutoImproveProposalOperation::NoChange => Some("no_change"),
+        AutoImproveProposalOperation::Add
+        | AutoImproveProposalOperation::Update
+        | AutoImproveProposalOperation::StaleDelete => None,
+        AutoImproveProposalOperation::Create => {
+            return Err("project-instruction proposals use add, not create".into());
+        }
+    };
+    if let Some(expected) = expected_layer
+        && target_context_layer != expected
+    {
+        return Err(format!(
+            "operation {} requires target context layer {expected}",
+            operation.as_str()
+        ));
+    }
+    if matches!(
+        operation,
+        AutoImproveProposalOperation::Add
+            | AutoImproveProposalOperation::Update
+            | AutoImproveProposalOperation::StaleDelete
+    ) && !matches!(target_context_layer, "root_instructions" | "path_rules")
+    {
+        return Err(format!(
+            "operation {} requires a root or path-scoped instruction layer",
+            operation.as_str()
+        ));
+    }
+    if !matches!(
+        target_context_layer,
+        "root_instructions" | "path_rules" | "agent_skill" | "wiki" | "enforcement" | "no_change"
+    ) {
+        return Err("unsupported target context layer".into());
+    }
+
+    let entries = provenance
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "project-instruction proposal requires evidence provenance".to_string())?;
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| "each provenance entry must be an object".to_string())?;
+        let kind = object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "each provenance entry requires a kind".to_string())?;
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .filter(|source| !source.trim().is_empty())
+            .ok_or_else(|| "each provenance entry requires a source".to_string())?;
+        let excerpt = object
+            .get("excerpt")
+            .and_then(serde_json::Value::as_str)
+            .filter(|excerpt| !excerpt.trim().is_empty())
+            .ok_or_else(|| "each provenance entry requires an evidence excerpt".to_string())?;
+        let _ = excerpt;
+        match kind {
+            "durable_rule" => {
+                let source_path = PagePath::new(source.to_owned())
+                    .map_err(|error| format!("invalid durable-rule source path: {error}"))?;
+                if !source_path.as_str().starts_with("_rules/") {
+                    return Err("durable-rule evidence must come from _rules/".into());
+                }
+                let hash = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err("durable-rule evidence requires source_sha256".into());
+                }
+                if object.get("selection").and_then(serde_json::Value::as_str)
+                    != Some("explicit_cli")
+                {
+                    return Err("durable-rule evidence must be explicitly selected".into());
+                }
+            }
+            "doctor_finding" => {
+                let source_hash = object
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !is_sha256_hex(source_hash)
+                    || object.get("selection").and_then(serde_json::Value::as_str)
+                        != Some("explicit_cli")
+                    || object
+                        .get("finding_code")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || object
+                        .get("doctor_schema_version")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none()
+                    || object
+                        .get("rationale")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || object
+                        .get("category")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || object
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || object
+                        .get("destination")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(
+                        "doctor-finding evidence requires an explicit selection, source hash, code, schema version, classification, action, destination, and rationale".into(),
+                    );
+                }
+            }
+            "assistant_restatement"
+            | "web_instruction"
+            | "issue_instruction"
+            | "one_off_failure"
+            | "resolved_transient_state"
+            | "transient_failure" => {
+                return Err(format!(
+                    "evidence kind {kind} cannot support a durable rule"
+                ));
+            }
+            other => return Err(format!("unsupported evidence kind: {other}")),
+        }
+    }
+    Ok(())
+}
+
+async fn verify_project_instruction_provenance(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    logical_target: &str,
+    base_sha256: [u8; 32],
+    provenance: &serde_json::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(entries) = provenance.as_array() else {
+        return Err(bad_request(
+            "project-instruction proposal requires evidence provenance",
+        ));
+    };
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            return Err(bad_request("each provenance entry must be an object"));
+        };
+        let kind = object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let source = object
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let source_sha256 = object
+            .get("source_sha256")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| hex_to_sha256(value).ok())
+            .ok_or_else(|| bad_request("evidence source hash is invalid"))?;
+        let excerpt = object
+            .get("excerpt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "durable_rule" => {
+                let page = state
+                    .reader
+                    .page_body_by_ids(workspace_id, project_id, source)
+                    .await
+                    .map_err(|error| internal_err(error.to_string()))?
+                    .ok_or_else(|| bad_request("durable-rule evidence page does not exist"))?;
+                let actual_sha256: [u8; 32] = Sha256::digest(page.body.as_bytes()).into();
+                if actual_sha256 != source_sha256 || !page.body.contains(excerpt) {
+                    return Err(bad_request(
+                        "durable-rule evidence hash or excerpt does not match the authoritative Wiki page",
+                    ));
+                }
+            }
+            "doctor_finding" => {
+                if source != logical_target || source_sha256 != base_sha256 {
+                    return Err(bad_request(
+                        "doctor-finding evidence must match the selected target snapshot",
+                    ));
+                }
+            }
+            _ => {
+                return Err(bad_request("unsupported project-instruction evidence kind"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn estimated_tokens(content: &str) -> i64 {
+    i64::try_from(content.len().div_ceil(4)).unwrap_or(i64::MAX)
+}
+
+fn project_instruction_unified_diff(path: &str, before: &str, after: &str) -> String {
+    if before == after {
+        return String::new();
+    }
+
+    const CONTEXT_LINES: usize = 3;
+    let before_lines: Vec<_> = before.split_inclusive('\n').collect();
+    let after_lines: Vec<_> = after.split_inclusive('\n').collect();
+    let mut common_prefix = 0;
+    while common_prefix < before_lines.len()
+        && common_prefix < after_lines.len()
+        && before_lines[common_prefix] == after_lines[common_prefix]
+    {
+        common_prefix += 1;
+    }
+    let mut common_suffix = 0;
+    while common_suffix < before_lines.len().saturating_sub(common_prefix)
+        && common_suffix < after_lines.len().saturating_sub(common_prefix)
+        && before_lines[before_lines.len() - common_suffix - 1]
+            == after_lines[after_lines.len() - common_suffix - 1]
+    {
+        common_suffix += 1;
+    }
+
+    let old_change_end = before_lines.len() - common_suffix;
+    let new_change_end = after_lines.len() - common_suffix;
+    let context_start = common_prefix.saturating_sub(CONTEXT_LINES);
+    let old_context_end = (old_change_end + CONTEXT_LINES).min(before_lines.len());
+    let new_context_end = (new_change_end + CONTEXT_LINES).min(after_lines.len());
+    let before_count = old_context_end - context_start;
+    let after_count = new_context_end - context_start;
+    let before_start = if before_count == 0 {
+        0
+    } else {
+        context_start + 1
+    };
+    let after_start = if after_count == 0 {
+        0
+    } else {
+        context_start + 1
+    };
+    let mut output = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{before_start},{before_count} +{after_start},{after_count} @@\n"
+    );
+    append_diff_lines(
+        &mut output,
+        ' ',
+        &before_lines[context_start..common_prefix],
+    );
+    append_diff_lines(
+        &mut output,
+        '-',
+        &before_lines[common_prefix..old_change_end],
+    );
+    append_diff_lines(
+        &mut output,
+        '+',
+        &after_lines[common_prefix..new_change_end],
+    );
+    append_diff_lines(
+        &mut output,
+        ' ',
+        &before_lines[old_change_end..old_context_end],
+    );
+    output
+}
+
+fn append_diff_lines(output: &mut String, prefix: char, lines: &[&str]) {
+    for line in lines {
+        output.push(prefix);
+        output.push_str(line);
+        if !line.ends_with('\n') {
+            output.push('\n');
+            output.push_str("\\ No newline at end of file\n");
+        }
+    }
+}
+
 async fn pending_detail(
     state: &AdminState,
     raw_id: &str,
@@ -1876,6 +2331,13 @@ async fn handle_pending_write_diff(
 ) -> impl IntoResponse {
     match pending_detail(&state, &id, &query).await {
         Ok((ws, proj, detail)) => {
+            if detail.summary.target_kind == PendingProposalTargetKind::ProjectInstruction {
+                let diff = detail.unified_diff.unwrap_or_default();
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "proposal_id": id, "diff": diff })),
+                );
+            }
             let before = state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
@@ -1922,6 +2384,31 @@ async fn handle_pending_write_approve(
         Ok(ids) => ids,
         Err(e) => return e,
     };
+    match state
+        .reader
+        .auto_improve_proposal_detail(ws, proj, proposal_id)
+        .await
+    {
+        Ok(Some(detail))
+            if detail.summary.target_kind == PendingProposalTargetKind::ProjectInstruction =>
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "approval_not_implemented",
+                    "error": "project-instruction approval is intentionally deferred"
+                })),
+            );
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "proposal not found in scope" })),
+            );
+        }
+        Err(error) => return internal_err(error.to_string()),
+    }
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(engram_core::ActorContext::anonymous);
@@ -1974,13 +2461,18 @@ async fn handle_pending_write_reject(
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let reason = if body.reason.trim().is_empty() {
+        "rejected by reviewer".to_owned()
+    } else {
+        body.reason
+    };
     match state
         .writer
         .reject_auto_improve_proposal(RejectAutoImproveProposal {
             workspace_id: ws,
             project_id: proj,
             proposal_id,
-            reason: body.reason,
+            reason,
             actor,
             author_id: author_ext.map(|axum::Extension(author_id)| author_id),
         })
@@ -4546,6 +5038,54 @@ mod tests {
     use engram_core::{AgentKind, NewObservation, NewSession, ObservationKind};
     use engram_llm::{ChatRequest, ChatResponse, LlmResult};
     use engram_store::Store;
+
+    #[test]
+    fn project_instruction_diff_is_exact_for_no_change_and_missing_final_newline() {
+        assert_eq!(
+            project_instruction_unified_diff("AGENTS.md", "same\n", "same\n"),
+            ""
+        );
+        assert_eq!(
+            project_instruction_unified_diff("AGENTS.md", "old", "new"),
+            "--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
+    fn project_instruction_operation_vocabulary_is_distinct() {
+        let provenance = serde_json::json!([{
+            "kind": "durable_rule",
+            "source": "_rules/rule.md",
+            "source_sha256": "c882767f7238d6c41b1fc3f61bdaa88fcf9f541ed4f8cce6f16005b2f9f5d42a",
+            "excerpt": "Keep the invariant.",
+            "selection": "explicit_cli"
+        }]);
+        for (operation, layer) in [
+            (AutoImproveProposalOperation::Add, "root_instructions"),
+            (AutoImproveProposalOperation::Update, "root_instructions"),
+            (
+                AutoImproveProposalOperation::StaleDelete,
+                "root_instructions",
+            ),
+            (AutoImproveProposalOperation::MoveToSkill, "agent_skill"),
+            (AutoImproveProposalOperation::MoveToPathRule, "path_rules"),
+            (AutoImproveProposalOperation::MoveToWiki, "wiki"),
+            (
+                AutoImproveProposalOperation::MoveToEnforcement,
+                "enforcement",
+            ),
+            (AutoImproveProposalOperation::NoChange, "no_change"),
+        ] {
+            validate_project_instruction_shape(
+                operation,
+                layer,
+                "exact_anchor",
+                "EOF",
+                &provenance,
+            )
+            .unwrap_or_else(|error| panic!("{} must be supported: {error}", operation.as_str()));
+        }
+    }
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -6257,6 +6797,30 @@ mod tests {
                 "POST",
                 "/admin/curator",
                 serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
+                "/admin/instructions/proposals",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "operation": "add",
+                    "logical_target": "AGENTS.md",
+                    "target_context_layer": "root_instructions",
+                    "boundary_kind": "exact_anchor",
+                    "boundary_value": "EOF",
+                    "base_content": "",
+                    "proposed_content": "rule",
+                    "title": "rule",
+                    "rationale": "explicit durable rule",
+                    "provenance": [{
+                        "kind": "durable_rule",
+                        "source": "_rules/rule.md",
+                        "source_sha256": "c882767f7238d6c41b1fc3f61bdaa88fcf9f541ed4f8cce6f16005b2f9f5d42a",
+                        "excerpt": "rule",
+                        "selection": "explicit_cli"
+                    }]
+                }),
             ),
             (
                 "POST",

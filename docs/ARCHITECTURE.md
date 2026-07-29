@@ -298,6 +298,18 @@ deterministic content categories, evidence, recommended actions and destination
 layers without opening the Wiki, proposal store, index, or audit state. The
 classification layer is diagnostic only and has no repository-write path.
 
+`instructions propose` is the stateful, proposal-only bridge from one explicit
+`_rules/` page or selected doctor finding. The local CLI reads the repository
+snapshot, but the admin boundary validates evidence and secret shape, resolves
+the existing workspace/project without creating a scope, and computes the base
+hash, unified diff, and token delta. The single writer actor stores a
+`project_instruction` row and audit event in the expanded pending-proposal
+tables. No repository content is sent through `Wiki::write_page`, no pending
+sidecar is created, and the Wiki approval function rejects this target kind.
+List/show/diff/reject share the existing authenticated, scoped review surface;
+editing, approval, and local application are deliberately separate later
+phases.
+
 ## Cross-cutting invariants
 
 Carved in M0/M1; every milestone has to respect them. Each comes from

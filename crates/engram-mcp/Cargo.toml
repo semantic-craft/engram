@@ -31,6 +31,7 @@ axum.workspace = true
 # timestamps + delta against now). The rest of the crate doesn't
 # need a clock dep.
 jiff.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 engram-core.workspace = true
