@@ -161,6 +161,20 @@ mod tests {
                 && lower.contains("repository"),
             "maintenance skill must separate server proposal storage from local repository apply"
         );
+        assert!(
+            lower.contains(".engram.toml")
+                && lower.contains("effective workspace")
+                && lower.contains("effective project")
+                && lower.contains("--workspace")
+                && lower.contains("--project")
+                && lower.contains("closest")
+                && lower.contains("actual working directory")
+                && lower.contains("not applicable")
+                && lower.contains("worktree common directory")
+                && lower.contains("baked into the installed lifecycle hook")
+                && lower.contains("fail-safe default"),
+            "maintenance skill must preserve marker-resolved workspace/project scope"
+        );
         for forbidden in [
             "automatically apply",
             "force apply",

@@ -321,6 +321,13 @@ Agents should load the managed `engram-project-instruction-maintenance` Skill
 for this workflow. It keeps the always-loaded routing block small while
 requiring this order: read-only doctor, one cited proposal, show/diff review,
 explicit human approval, and only then an explicitly requested local apply.
+Before any server-scoped step, it resolves the same scope as lifecycle capture:
+the closest `.engram.toml` ancestor of the actual working directory wins,
+explicit workspace/project values outrank strategy, `repo-root` alone follows
+the Git common directory, and the fail-safe default is the actual working
+directory basename. A marker found only in a linked worktree's main checkout is
+not applicable. The Skill passes the effective `--workspace` and `--project`
+explicitly because instruction CLI commands do not inherit MCP auto-scope.
 The agent must stop on CAS, dirty-target, marker, import, symlink, repository,
 or canonical-layout conflicts and must not stage, commit, push, merge, or open
 a pull request as a follow-on maintenance action.

@@ -41,7 +41,32 @@ stage too.
 The server stores proposal and audit state only; proposing, reviewing, and
 approving do not change the repository.
 
-Use explicit `--workspace` and `--project` only when the user names a different scope. Otherwise let the CLI resolve the current repository and project.
+## Resolve scope before server state
+
+Before every server-scoped command, resolve the same scope used by lifecycle
+hooks. Starting at the actual working directory, walk upward and use the
+closest `.engram.toml`. A marker inside a linked worktree's main checkout is
+not applicable unless it is also on that upward path; worktrees need their own
+marker or a shared ancestor marker.
+
+Use this precedence:
+
+1. The closest marker's explicit `workspace`, otherwise `default`.
+2. The closest marker's explicit `project` when present.
+3. Otherwise, the marker's `project_strategy`; if absent, use the strategy
+   baked into the installed lifecycle hook or client.
+4. For `repo-root`, use the main Git repository name derived through the
+   worktree common directory. For `basename` or an unknown strategy, use the
+   actual working-directory basename, matching the hooks' fail-safe default.
+
+These results are the effective workspace and effective project.
+
+If the baked strategy cannot be confirmed, inspect the installed hook/client
+configuration or stop before creating or changing proposal state. Pass the
+resolved values explicitly as
+`--workspace <effective-workspace> --project <effective-project>` to propose,
+show, diff, approve, reject, and apply. Do not assume these CLI commands inherit
+MCP auto-scope.
 
 ## Safety boundaries
 
