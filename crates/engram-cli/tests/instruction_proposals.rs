@@ -20,6 +20,7 @@ fn bin() -> &'static str {
 }
 
 static RESERVED_ADDRS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static SERVER_SLOT: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn reserve_listener() -> (TcpListener, String) {
     let reserved = RESERVED_ADDRS.get_or_init(|| Mutex::new(BTreeSet::new()));
@@ -41,6 +42,7 @@ fn reserve_addr() -> String {
 struct Server {
     child: Child,
     url: String,
+    _exclusive: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Server {
@@ -54,6 +56,10 @@ impl Server {
         addr: &str,
         provider_url: Option<&str>,
     ) -> Self {
+        let exclusive = SERVER_SLOT
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut command = Command::new(bin());
         command
             .args([
@@ -86,6 +92,7 @@ impl Server {
                 return Self {
                     child,
                     url: format!("http://{addr}"),
+                    _exclusive: exclusive,
                 };
             }
             thread::sleep(Duration::from_millis(50));
@@ -188,6 +195,24 @@ fn run(project: &Path, data_dir: &Path, server_url: &str, args: &[&str]) -> Outp
         .unwrap()
 }
 
+fn run_with_env(
+    project: &Path,
+    data_dir: &Path,
+    server_url: &str,
+    args: &[&str],
+    key: &str,
+    value: &str,
+) -> Output {
+    Command::new(bin())
+        .args(["--data-dir", data_dir.to_str().unwrap()])
+        .args(args)
+        .current_dir(project)
+        .env("ENGRAM_SERVER_URL", server_url)
+        .env(key, value)
+        .output()
+        .unwrap()
+}
+
 fn json_success(output: Output) -> Value {
     assert!(
         output.status.success(),
@@ -224,6 +249,147 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn commit_all(repository: &Path, message: &str) {
+    let added = Command::new("git")
+        .args(["add", "--all"])
+        .current_dir(repository)
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let committed = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Engram Test",
+            "-c",
+            "user.email=engram-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ])
+        .current_dir(repository)
+        .status()
+        .unwrap();
+    assert!(committed.success());
+}
+
+fn stage_and_approve_rule(
+    repository: &Path,
+    data_dir: &Path,
+    server_url: &str,
+    project: &str,
+    rule_path: &str,
+    rule_body: &str,
+    target: &str,
+) -> String {
+    let wrote = run(
+        repository,
+        data_dir,
+        server_url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            rule_path,
+            "--kind",
+            "rule",
+            "--body",
+            rule_body,
+        ],
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+    let proposal = json_success(run(
+        repository,
+        data_dir,
+        server_url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            rule_path,
+            "--target",
+            target,
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap().to_owned();
+    let approved = run(
+        repository,
+        data_dir,
+        server_url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    proposal_id
+}
+
+fn assert_apply_failure_audit(
+    repository: &Path,
+    data_dir: &Path,
+    server_url: &str,
+    project: &str,
+    proposal_id: &str,
+    expected: (&str, &str, &str),
+) {
+    let (status, event, code) = expected;
+    let detail = json_success(run(
+        repository,
+        data_dir,
+        server_url,
+        &[
+            "pending-writes",
+            "show",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["summary"]["status"], status);
+    assert!(detail["application"].is_null());
+    let matching: Vec<_> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["event"] == event && entry["detail_json"]["code"] == code)
+        .collect();
+    assert_eq!(matching.len(), 1, "expected one {event}/{code} audit event");
+    assert!(
+        !detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["event"] == "applied"),
+        "failed local apply must never record a false applied event"
+    );
 }
 
 #[test]
@@ -852,8 +1018,14 @@ fn approved_instruction_applies_locally_once_with_cas_backup_and_audit() {
     );
     let target = repository.path().join("AGENTS.md");
     fs::write(&target, &original).unwrap();
+    commit_all(repository.path(), "initial instructions");
+    fs::write(
+        repository.path().join("NOTES.md"),
+        "unrelated staged bytes\n",
+    )
+    .unwrap();
     Command::new("git")
-        .args(["add", "AGENTS.md"])
+        .args(["add", "NOTES.md"])
         .current_dir(repository.path())
         .status()
         .unwrap();
@@ -1023,6 +1195,77 @@ fn approved_instruction_applies_locally_once_with_cas_backup_and_audit() {
 }
 
 #[test]
+fn approved_add_creates_a_missing_target_without_touching_the_git_index() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("README.md"), "# Seed\n").unwrap();
+    commit_all(repository.path(), "initial repository");
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-create-missing";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/create.md",
+        "# Create\n\nCreate the approved instruction target.",
+        "AGENTS.md",
+    );
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["base_target_existed"], false);
+    let expected = detail["proposed_content"].as_str().unwrap();
+
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "created");
+    assert!(applied["backup_path"].is_null());
+    assert_eq!(
+        fs::read_to_string(repository.path().join("AGENTS.md")).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+}
+
+#[test]
 fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -1034,6 +1277,7 @@ fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
     let target = repository.path().join("AGENTS.md");
     let original = "# Rules\n";
     fs::write(&target, original).unwrap();
+    commit_all(repository.path(), "initial instructions");
 
     let project = "instruction-local-apply-cas";
     let addr = reserve_addr();
@@ -1161,6 +1405,18 @@ fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
         ],
     ));
     assert!(detail["application"].is_null());
+    assert_eq!(detail["summary"]["status"], "conflict");
+    assert_eq!(
+        detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["event"] == "conflict" && event["detail_json"]["code"] == "target_changed"
+            })
+            .count(),
+        1
+    );
     assert!(
         !detail["events"]
             .as_array()
@@ -1168,6 +1424,799 @@ fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
             .iter()
             .any(|event| event["event"] == "applied")
     );
+}
+
+#[test]
+fn instruction_apply_rejects_a_dirty_target_even_when_its_bytes_match_the_approved_base() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let target = repository.path().join("AGENTS.md");
+    fs::write(&target, "# Rules\n").unwrap();
+    commit_all(repository.path(), "initial instructions");
+    fs::write(&target, "# Rules\n\nLocally staged owner bytes.\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "AGENTS.md"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let project = "instruction-dirty-target";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/dirty-target.md",
+        "# Dirty target\n\nNever overwrite a dirty instruction target.",
+        "AGENTS.md",
+    );
+    let before = snapshot(repository.path());
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let applied = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied.status.success());
+    assert!(
+        String::from_utf8_lossy(&applied.stderr).contains("dirty instruction target"),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(snapshot(repository.path()), before);
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        &proposal_id,
+        ("conflict", "conflict", "dirty_instruction_target"),
+    );
+}
+
+#[test]
+fn instruction_apply_rejects_an_ambiguous_git_operation_state_without_mutation() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    commit_all(repository.path(), "initial instructions");
+
+    let project = "instruction-merge-state";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/merge-state.md",
+        "# Merge state\n\nRequire a clean Git operation state before applying.",
+        "AGENTS.md",
+    );
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    fs::write(repository.path().join(".git/MERGE_HEAD"), head.stdout).unwrap();
+    let before = snapshot(repository.path());
+
+    let applied = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied.status.success());
+    assert!(
+        String::from_utf8_lossy(&applied.stderr).contains("ambiguous Git operation state"),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(snapshot(repository.path()), before);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        &proposal_id,
+        ("conflict", "conflict", "ambiguous_git_state"),
+    );
+}
+
+#[test]
+fn instruction_apply_rejects_every_malformed_managed_marker_shape() {
+    const APPROVED_START: &str = "<!-- engram:approved-rules:start -->";
+    const APPROVED_END: &str = "<!-- engram:approved-rules:end -->";
+    let cases = [
+        (
+            "routing_missing_end",
+            format!("# Rules\n\n{MARKER_START}\nbroken\n"),
+        ),
+        (
+            "routing_duplicate",
+            format!(
+                "# Rules\n\n{MARKER_START}\none\n{MARKER_END}\n{MARKER_START}\ntwo\n{MARKER_END}\n"
+            ),
+        ),
+        (
+            "routing_nested",
+            format!(
+                "# Rules\n\n{MARKER_START}\n{MARKER_START}\nnested\n{MARKER_END}\n{MARKER_END}\n"
+            ),
+        ),
+        (
+            "routing_crossed",
+            format!("# Rules\n\n{MARKER_END}\ncrossed\n{MARKER_START}\n"),
+        ),
+        (
+            "approved_missing_end",
+            format!("# Rules\n\n{APPROVED_START}\nbroken\n"),
+        ),
+        (
+            "approved_duplicate",
+            format!(
+                "# Rules\n\n{APPROVED_START}\none\n{APPROVED_END}\n{APPROVED_START}\ntwo\n{APPROVED_END}\n"
+            ),
+        ),
+        (
+            "approved_nested",
+            format!(
+                "# Rules\n\n{APPROVED_START}\n{APPROVED_START}\nnested\n{APPROVED_END}\n{APPROVED_END}\n"
+            ),
+        ),
+        (
+            "approved_crossed",
+            format!("# Rules\n\n{APPROVED_END}\ncrossed\n{APPROVED_START}\n"),
+        ),
+        (
+            "crossed_domains",
+            format!(
+                "# Rules\n\n{MARKER_START}\n{APPROVED_START}\ncrossed\n{MARKER_END}\n{APPROVED_END}\n"
+            ),
+        ),
+        (
+            "nested_domains",
+            format!(
+                "# Rules\n\n{APPROVED_START}\n{MARKER_START}\nnested\n{MARKER_END}\n{APPROVED_END}\n"
+            ),
+        ),
+    ];
+
+    for (case, original) in cases {
+        let repository = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        let target = repository.path().join("AGENTS.md");
+        fs::write(&target, &original).unwrap();
+        commit_all(repository.path(), "initial malformed instructions");
+        let project = format!("instruction-marker-{case}");
+        let addr = reserve_addr();
+        let server = Server::start(data.path(), &project, &addr);
+        let proposal_id = stage_and_approve_rule(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &project,
+            "_rules/marker-safety.md",
+            "# Marker safety\n\nReject malformed managed marker structure.",
+            "AGENTS.md",
+        );
+        let before = snapshot(repository.path());
+
+        let applied = run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "instructions",
+                "apply",
+                &proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                &project,
+                "--json",
+            ],
+        );
+        assert!(
+            !applied.status.success(),
+            "case {case} unexpectedly applied"
+        );
+        assert!(
+            String::from_utf8_lossy(&applied.stderr).contains("managed markers are malformed"),
+            "case {case}: {}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(snapshot(repository.path()), before, "case {case}");
+        assert_apply_failure_audit(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &project,
+            &proposal_id,
+            ("failed", "failed", "malformed_markers"),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn instruction_apply_resolves_safe_symlink_and_preserves_bytes_mode_newlines_and_index() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    const APPROVED_START: &str = "<!-- engram:approved-rules:start -->";
+    const APPROVED_END: &str = "<!-- engram:approved-rules:end -->";
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::create_dir_all(repository.path().join("docs")).unwrap();
+    let canonical = repository.path().join("docs/AGENTS-main.md");
+    let original = format!(
+        "# Rules\r\n\r\nHuman prefix.\r\n\r\n{MARKER_START}\r\nrouting bytes\r\n{MARKER_END}\r\n\r\n{APPROVED_START}\r\napproved bytes\r\n{APPROVED_END}\r\n\r\nHuman tail.\r\n"
+    );
+    fs::write(&canonical, &original).unwrap();
+    fs::set_permissions(&canonical, fs::Permissions::from_mode(0o640)).unwrap();
+    symlink("docs/AGENTS-main.md", repository.path().join("AGENTS.md")).unwrap();
+    commit_all(repository.path(), "initial symlinked instructions");
+    fs::write(
+        repository.path().join("NOTES.md"),
+        "unrelated staged bytes\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "NOTES.md"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-safe-symlink";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/safe-symlink.md",
+        "# Safe symlink\n\nPreserve owner bytes through the canonical adapter.",
+        "AGENTS.md",
+    );
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert!(
+        fs::symlink_metadata(repository.path().join("AGENTS.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let expected = format!("{original}\r\nPreserve owner bytes through the canonical adapter.\r\n");
+    let actual = fs::read_to_string(&canonical).unwrap();
+    assert_eq!(actual, expected);
+    assert!(!actual.replace("\r\n", "").contains('\n'));
+    assert_eq!(
+        fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn instruction_apply_rejects_a_cleanly_retargeted_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("one.md"), "# Rules\n").unwrap();
+    fs::write(repository.path().join("two.md"), "# Rules\n").unwrap();
+    symlink("one.md", repository.path().join("AGENTS.md")).unwrap();
+    commit_all(repository.path(), "initial safe symlink");
+
+    let project = "instruction-retargeted-symlink";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/retarget.md",
+        "# Retarget\n\nNever follow a post-approval symlink retarget.",
+        "AGENTS.md",
+    );
+    fs::remove_file(repository.path().join("AGENTS.md")).unwrap();
+    symlink("two.md", repository.path().join("AGENTS.md")).unwrap();
+    commit_all(repository.path(), "retarget symlink after approval");
+    let before = snapshot(repository.path());
+    let applied = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied.status.success());
+    assert_eq!(snapshot(repository.path()), before);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        &proposal_id,
+        ("conflict", "conflict", "different_repository"),
+    );
+}
+
+#[test]
+fn instruction_apply_follows_safe_import_without_writing_the_adapter() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let adapter = "# Claude adapter\n\n@AGENTS.md\n";
+    fs::write(repository.path().join("CLAUDE.md"), adapter).unwrap();
+    fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    commit_all(repository.path(), "initial imported instructions");
+
+    let project = "instruction-safe-import";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/safe-import.md",
+        "# Safe import\n\nWrite only the canonical imported source.",
+        "AGENTS.md",
+    );
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(
+        fs::read_to_string(repository.path().join("CLAUDE.md")).unwrap(),
+        adapter
+    );
+    assert_eq!(
+        fs::read_to_string(repository.path().join("AGENTS.md")).unwrap(),
+        "# Rules\n\nWrite only the canonical imported source.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn instruction_apply_blocks_unsafe_symlink_encoding_and_import_graphs() {
+    use std::os::unix::fs::symlink;
+
+    let cases = [
+        ("unsupported_encoding", "unsupported_encoding", "conflict"),
+        ("unsafe_symlink", "unsafe_symlink", "conflict"),
+        ("unresolved_import", "unresolved_import", "failed"),
+        ("import_cycle", "import_cycle", "failed"),
+        ("escaped_import", "escaped_import", "failed"),
+    ];
+    for (case, expected_code, expected_status) in cases {
+        let repository = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        let target = repository.path().join("AGENTS.md");
+        fs::write(&target, "# Rules\n").unwrap();
+        commit_all(repository.path(), "initial instructions");
+        let project = format!("instruction-hazard-{case}");
+        let addr = reserve_addr();
+        let server = Server::start(data.path(), &project, &addr);
+        let proposal_id = stage_and_approve_rule(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &project,
+            "_rules/hazard.md",
+            "# Hazard\n\nRun every safety preflight before mutation.",
+            "AGENTS.md",
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("outside.md");
+        fs::write(&outside_target, "# Rules\n").unwrap();
+        match case {
+            "unsupported_encoding" => fs::write(&target, [0xff, 0xfe, b'X']).unwrap(),
+            "unsafe_symlink" => {
+                fs::remove_file(&target).unwrap();
+                symlink(&outside_target, &target).unwrap();
+            }
+            "unresolved_import" => {
+                fs::write(repository.path().join("CLAUDE.md"), "@missing.md\n").unwrap();
+            }
+            "import_cycle" => {
+                fs::write(repository.path().join("CLAUDE.md"), "@rules.md\n").unwrap();
+                fs::write(repository.path().join("rules.md"), "@CLAUDE.md\n").unwrap();
+            }
+            "escaped_import" => {
+                fs::write(repository.path().join("CLAUDE.md"), "@../outside.md\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(repository.path());
+        let outside_before = fs::read(&outside_target).unwrap();
+        let applied = run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "instructions",
+                "apply",
+                &proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                &project,
+                "--json",
+            ],
+        );
+        assert!(
+            !applied.status.success(),
+            "case {case} unexpectedly applied"
+        );
+        assert_eq!(snapshot(repository.path()), before, "case {case}");
+        assert_eq!(
+            fs::read(&outside_target).unwrap(),
+            outside_before,
+            "case {case}"
+        );
+        assert_apply_failure_audit(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &project,
+            &proposal_id,
+            (expected_status, expected_status, expected_code),
+        );
+    }
+}
+
+#[test]
+fn instruction_apply_rejects_an_ambiguous_line_anchor() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let repeated = "Think step by step and be helpful.\n";
+    fs::write(
+        repository.path().join("AGENTS.md"),
+        format!("# Rules\n\n{repeated}\n{repeated}"),
+    )
+    .unwrap();
+    commit_all(repository.path(), "initial repeated anchor");
+    let project = "instruction-ambiguous-anchor";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--finding",
+            "generic_harness_guidance",
+            "--source",
+            "AGENTS.md",
+            "--line",
+            "3",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+    let before = snapshot(repository.path());
+    let applied = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied.status.success());
+    assert_eq!(snapshot(repository.path()), before);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        proposal_id,
+        ("failed", "failed", "ambiguous_anchor"),
+    );
+}
+
+#[test]
+fn instruction_proposal_cannot_target_managed_skill_paths() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::create_dir_all(repository.path().join(".agents/skills/example")).unwrap();
+    let target = repository.path().join(".agents/skills/example/SKILL.md");
+    fs::write(&target, "<!-- engram-managed: routing-skill -->\n# Skill\n").unwrap();
+    fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    commit_all(repository.path(), "initial managed skill");
+    let project = "instruction-managed-skill";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                project,
+                "--path",
+                "_rules/skill.md",
+                "--kind",
+                "rule",
+                "--body",
+                "# Skill\n\nNever mutate managed skills through instruction apply.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let before = snapshot(repository.path());
+    let proposed = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/skill.md",
+            "--target",
+            ".agents/skills/example/SKILL.md",
+            "--json",
+        ],
+    );
+    assert!(!proposed.status.success());
+    assert!(String::from_utf8_lossy(&proposed.stderr).contains("managed Agent Skill"));
+    assert_eq!(snapshot(repository.path()), before);
+
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), "outside owner bytes\n").unwrap();
+    let outside_before = fs::read(outside.path()).unwrap();
+    let escaped = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/skill.md",
+            "--target",
+            "../outside.md",
+            "--json",
+        ],
+    );
+    assert!(!escaped.status.success());
+    assert!(String::from_utf8_lossy(&escaped.stderr).contains("invalid repository-relative"));
+    assert_eq!(fs::read(outside.path()).unwrap(), outside_before);
+}
+
+#[test]
+fn routing_refresh_cli_preserves_approved_rules_and_rejects_malformed_markers() {
+    const APPROVED_START: &str = "<!-- engram:approved-rules:start -->";
+    const APPROVED_END: &str = "<!-- engram:approved-rules:end -->";
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let approved = format!("{APPROVED_START}\napproved owner bytes\n{APPROVED_END}");
+    let target = repository.path().join("AGENTS.md");
+    fs::write(
+        &target,
+        format!(
+            "# Rules\n\n{approved}\n\n{MARKER_START}\nstale routing\n{MARKER_END}\n\nHuman tail.\n"
+        ),
+    )
+    .unwrap();
+    commit_all(repository.path(), "initial routing instructions");
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+    let refreshed = run(
+        repository.path(),
+        data.path(),
+        "http://127.0.0.1:9",
+        &[
+            "install-instructions",
+            "--target",
+            "AGENTS.md",
+            "--no-skills",
+        ],
+    );
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let current = fs::read_to_string(&target).unwrap();
+    assert!(current.contains(&approved));
+    assert!(current.contains("Human tail."));
+    assert!(!current.contains("stale routing"));
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+
+    let malformed = format!(
+        "# Rules\n\n{approved}\n\n{MARKER_START}\none\n{MARKER_END}\n{MARKER_START}\ntwo\n{MARKER_END}\n"
+    );
+    fs::write(&target, &malformed).unwrap();
+    let before = snapshot(repository.path());
+    let rejected = run(
+        repository.path(),
+        data.path(),
+        "http://127.0.0.1:9",
+        &[
+            "install-instructions",
+            "--target",
+            "AGENTS.md",
+            "--no-skills",
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("managed markers are malformed"));
+    assert_eq!(snapshot(repository.path()), before);
 }
 
 #[test]
@@ -1296,7 +2345,7 @@ fn instruction_apply_rejects_a_different_repository_with_the_same_base() {
 }
 
 #[test]
-fn instruction_apply_recovers_a_written_but_unrecorded_update() {
+fn instruction_apply_rejects_forged_backup_without_a_bound_receipt() {
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     Command::new("git")
@@ -1307,6 +2356,7 @@ fn instruction_apply_recovers_a_written_but_unrecorded_update() {
     let original = "";
     let target = repository.path().join("AGENTS.md");
     fs::write(&target, original).unwrap();
+    commit_all(repository.path(), "initial empty instructions");
 
     let project = "instruction-apply-recovery";
     let addr = reserve_addr();
@@ -1394,7 +2444,7 @@ fn instruction_apply_recovers_a_written_but_unrecorded_update() {
     fs::write(&target, proposed).unwrap();
     let repository_before_retry = snapshot(repository.path());
 
-    let recovered = json_success(run(
+    let recovered = run(
         repository.path(),
         data.path(),
         &server.url,
@@ -1408,22 +2458,26 @@ fn instruction_apply_recovers_a_written_but_unrecorded_update() {
             project,
             "--json",
         ],
-    ));
-    assert_eq!(recovered["status"], "applied");
-    assert_eq!(recovered["outcome"], "updated");
-    assert_eq!(recovered["idempotent"], false);
-    assert_eq!(
-        recovered["backup_path"],
-        fs::canonicalize(&backup)
-            .unwrap()
-            .to_string_lossy()
-            .as_ref()
+    );
+    assert!(!recovered.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovered.stderr).contains("local apply receipt"),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
     );
     assert_eq!(snapshot(repository.path()), repository_before_retry);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        proposal_id,
+        ("conflict", "conflict", "target_changed"),
+    );
 }
 
 #[test]
-fn instruction_apply_recovers_a_written_but_unrecorded_create() {
+fn instruction_apply_rejects_matching_created_bytes_without_a_bound_receipt() {
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     Command::new("git")
@@ -1515,7 +2569,7 @@ fn instruction_apply_recovers_a_written_but_unrecorded_create() {
     fs::write(&target, detail["proposed_content"].as_str().unwrap()).unwrap();
     let repository_before_retry = snapshot(repository.path());
 
-    let recovered = json_success(run(
+    let recovered = run(
         repository.path(),
         data.path(),
         &server.url,
@@ -1529,11 +2583,159 @@ fn instruction_apply_recovers_a_written_but_unrecorded_create() {
             project,
             "--json",
         ],
-    ));
-    assert_eq!(recovered["status"], "applied");
-    assert_eq!(recovered["outcome"], "created");
-    assert!(recovered["backup_path"].is_null());
+    );
+    assert!(!recovered.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovered.stderr).contains("local apply receipt"),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
     assert_eq!(snapshot(repository.path()), repository_before_retry);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        proposal_id,
+        ("conflict", "conflict", "target_changed"),
+    );
+}
+
+#[test]
+fn instruction_apply_rejects_a_preexisting_receipt_before_mutation() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let target = repository.path().join("AGENTS.md");
+    fs::write(&target, "# Rules\n").unwrap();
+    commit_all(repository.path(), "initial instructions");
+
+    let project = "instruction-preexisting-receipt";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/receipt.md",
+        "# Receipt\n\nReserve audit state before mutation.",
+        "AGENTS.md",
+    );
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    let approval = detail["approval_sha256"].as_str().unwrap();
+    let receipt_dir = repository.path().join(".git/engram-local-apply");
+    fs::create_dir_all(&receipt_dir).unwrap();
+    fs::write(receipt_dir.join("hmac-key"), [9_u8; 32]).unwrap();
+    let receipt = receipt_dir.join(format!(
+        "{}-{approval}.json",
+        sha256_hex(proposal_id.as_bytes())
+    ));
+    fs::write(&receipt, "preexisting").unwrap();
+    let before = snapshot(repository.path());
+    let applied = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied.status.success());
+    assert_eq!(snapshot(repository.path()), before);
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        &proposal_id,
+        ("failed", "failed", "local_receipt_failed"),
+    );
+}
+
+#[test]
+fn instruction_apply_rolls_back_when_receipt_finalization_fails() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let target = repository.path().join("AGENTS.md");
+    let base = "# Rules\n";
+    fs::write(&target, base).unwrap();
+    commit_all(repository.path(), "initial instructions");
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-receipt-rollback";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/rollback.md",
+        "# Rollback\n\nRestore the base if receipt finalization fails.",
+        "AGENTS.md",
+    );
+    let applied = run_with_env(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+        "ENGRAM_TEST_FAIL_RECEIPT_FINALIZE",
+        "1",
+    );
+    assert!(!applied.status.success());
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_apply_failure_audit(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        &proposal_id,
+        ("failed", "failed", "local_receipt_failed"),
+    );
 }
 
 #[test]
@@ -1634,6 +2836,7 @@ fn instruction_apply_records_an_approved_no_change_without_writing() {
         "# Rules\n\nUse rustfmt as this repository's coding convention.\n",
     )
     .unwrap();
+    commit_all(repository.path(), "initial instructions");
 
     let project = "instruction-no-change";
     let addr = reserve_addr();

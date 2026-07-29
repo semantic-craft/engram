@@ -32,11 +32,13 @@ pub use auto_improve::{
     AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
     AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, EditProjectInstructionProposal,
     EditProjectInstructionProposalResult, FailAutoImproveProposal, NewAutoImproveProposal,
-    PendingProposalTargetKind, ProjectInstructionApplication, ProjectInstructionApplyOutcome,
-    ProjectInstructionProposalRevision, RecordProjectInstructionApplication,
-    RecordProjectInstructionApplicationResult, RejectAutoImproveProposal, StageAutoImproveRun,
-    StageProjectInstructionProposal, StagedAutoImproveRun, StagedProjectInstructionProposal,
-    artifact_path_for, project_instruction_approval_sha256, project_instruction_token_delta,
+    PendingProposalTargetKind, ProjectInstructionApplication, ProjectInstructionApplyFailureKind,
+    ProjectInstructionApplyOutcome, ProjectInstructionProposalRevision,
+    RecordProjectInstructionApplication, RecordProjectInstructionApplicationResult,
+    RecordProjectInstructionApplyFailure, RecordProjectInstructionApplyFailureResult,
+    RejectAutoImproveProposal, StageAutoImproveRun, StageProjectInstructionProposal,
+    StagedAutoImproveRun, StagedProjectInstructionProposal, artifact_path_for,
+    project_instruction_approval_sha256, project_instruction_token_delta,
     project_instruction_unified_diff,
 };
 pub use decay::{DecayParams, retention_score};
