@@ -21,6 +21,7 @@ use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
     ApproveProjectInstructionProposal, ApproveProjectInstructionProposalResult,
     EditProjectInstructionProposal, EditProjectInstructionProposalResult, FailAutoImproveProposal,
+    RecordProjectInstructionApplication, RecordProjectInstructionApplicationResult,
     RejectAutoImproveProposal, StageAutoImproveRun, StageProjectInstructionProposal,
     StagedAutoImproveRun, StagedProjectInstructionProposal,
 };
@@ -220,6 +221,10 @@ pub(crate) enum WriteCmd {
     ApproveProjectInstructionProposal {
         input: ApproveProjectInstructionProposal,
         reply: oneshot::Sender<StoreResult<ApproveProjectInstructionProposalResult>>,
+    },
+    RecordProjectInstructionApplication {
+        input: RecordProjectInstructionApplication,
+        reply: oneshot::Sender<StoreResult<RecordProjectInstructionApplicationResult>>,
     },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
@@ -918,6 +923,17 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically record one completed local project-instruction application.
+    pub async fn record_project_instruction_application(
+        &self,
+        input: RecordProjectInstructionApplication,
+    ) -> StoreResult<RecordProjectInstructionApplicationResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProjectInstructionApplication { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reject a pending auto-improvement proposal and append an event.
     pub async fn reject_auto_improve_proposal(
         &self,
@@ -1282,6 +1298,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result =
                     crate::auto_improve::approve_project_instruction_proposal(&mut conn, &input);
                 send_or_warn(reply, result, "approve_project_instruction_proposal");
+            }
+            WriteCmd::RecordProjectInstructionApplication { input, reply } => {
+                let result =
+                    crate::auto_improve::record_project_instruction_application(&mut conn, &input);
+                send_or_warn(reply, result, "record_project_instruction_application");
             }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);
