@@ -406,11 +406,16 @@ Provider-backed instruction assistance is explicit-only: the scheduler never
 invokes it. Even if scheduling is extended later, its maximum authority is to
 stage pending proposal data through the writer actor; it must never approve,
 apply, write repository content, or gain a repository-writing MCP surface.
-Application is a distinct local-host command. The server records a successful
-application but never receives repository content or authority to write a
-repository; MCP gains no new tool. Proposal-id uniqueness makes reporting and
-retries idempotent, while the stored backup path and before/after hashes make
-the local replacement recoverable and auditable.
+Application is a distinct local-host command. Its recording endpoint receives
+only the successful outcome metadata, never repository content or authority to
+write a repository; MCP gains no new tool. Proposal-id uniqueness makes
+reporting and retries idempotent, while the stored backup path and before/after
+hashes make the local replacement recoverable and auditable. The proposal also retains a
+SHA-256 identity for its staging checkout, which apply must reproduce before a
+filesystem write. The first path supports add/update/stale-delete/no-change and
+rejects move operations until a destination write can be included. When a
+write completed but reporting did not, an exact approved-base backup permits a
+retry to finish the immutable audit instead of rewriting the target.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the
@@ -513,9 +518,11 @@ and refresh the diff, token delta, and approval hash. Explicit approval records
 a separate actor and makes only that revision apply-ready; scheduler and Wiki
 auto-approval configuration cannot invoke it. The explicit local apply command
 re-resolves the target, verifies the approved hash/boundary, preserves the
-routing block, writes atomically with a recovery backup, and records the
+routing block, verifies the staging checkout identity, writes atomically with a
+recovery backup, and records the
 proposer, approver, applier, hashes, and outcome. The server/MCP never writes the
-repository.
+repository. Move operations remain review-only in this first single-target
+executor.
 
 ### Phase 3: Background Scheduler
 

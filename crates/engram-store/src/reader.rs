@@ -3743,7 +3743,8 @@ impl ReaderPool {
                             p.target_context_layer, r.proposal_actor_json, p.base_sha256, \
                             p.boundary_kind, p.boundary_value, p.unified_diff, \
                             p.estimated_token_delta, p.provenance_json, p.base_content, \
-                            p.approval_sha256 \
+                            p.approval_sha256, p.repository_identity_sha256, \
+                            p.base_target_existed \
                      FROM auto_improve_proposals p \
                      JOIN auto_improve_runs r ON r.id = p.run_id \
                      WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
@@ -3783,6 +3784,10 @@ impl ReaderPool {
                         let approval_sha256 = opt_bytes32(row.get(42)?)
                             .map_err(to_sql_err)?
                             .map(hex_bytes);
+                        let repository_identity_sha256 = opt_bytes32(row.get(43)?)
+                            .map_err(to_sql_err)?
+                            .map(hex_bytes);
+                        let base_target_existed = row.get(44)?;
                         Ok(AutoImproveProposalDetail {
                             summary,
                             rationale: row.get(12)?,
@@ -3814,6 +3819,8 @@ impl ReaderPool {
                             materialized_base_body_sha256: opt_bytes32(row.get(29)?)
                                 .map_err(to_sql_err)?,
                             base_sha256,
+                            repository_identity_sha256,
+                            base_target_existed,
                             boundary_kind: row.get(36)?,
                             boundary_value: row.get(37)?,
                             unified_diff: row.get(38)?,

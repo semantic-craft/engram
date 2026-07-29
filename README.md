@@ -533,12 +533,16 @@ every revision with its own actor. Approval records a separate deciding actor
 and moves only the DB record to `approved`/apply-ready. Staging, editing,
 approval, and rejection leave repository files, Wiki pages, and Git state
 untouched. `instructions apply` is an explicit local-host step: it accepts only
-that approved revision, re-resolves the repository target, verifies the approval
-binding, base SHA-256, boundary, and unchanged Engram routing block, then uses an
-atomic replacement with a timestamped recovery backup. It neither stages nor
-commits Git changes, and the server/MCP receives no repository write authority.
-Repeated application returns the existing structured application record without
-rewriting the file or duplicating a backup or audit event.
+that approved revision, verifies the hashed identity of the checkout that staged
+it, re-resolves the repository target, verifies the approval binding, base
+SHA-256, boundary, and unchanged Engram routing block, then uses an atomic
+replacement with a timestamped recovery backup. It neither stages nor commits
+Git changes, and the server/MCP receives no repository write authority. Move
+proposals remain review-only because this first apply path writes one target;
+add, update, stale-delete, and no-change are supported. Repeated application
+returns the existing structured application record without rewriting the file
+or duplicating a backup or audit event, while an interrupted post-write audit can
+be recovered on retry from an exact approved-base backup.
 Wiki scheduler, provider, and auto-approval configuration never auto-approves a
 `project_instruction` proposal. The server rejects missing or non-durable
 evidence and secret-shaped content before storage or edit. See

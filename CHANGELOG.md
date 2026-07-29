@@ -58,11 +58,16 @@ below start from the fork.
   tool or repository-writing surface is added.
 - `engram instructions apply <proposal-id>` is the first local-only mutation
   path for an approved project-instruction proposal. The CLI re-resolves the
-  canonical repository target, recomputes the approval binding, checks the
-  approved boundary and base SHA-256 on the final read, preserves Engram's
-  routing block, and writes through a sibling tempfile plus atomic rename.
+  canonical repository target, verifies the staging checkout's hashed identity,
+  recomputes the approval binding, checks the approved boundary and base
+  SHA-256 on the final read, preserves Engram's routing block, and writes
+  through a sibling tempfile plus atomic rename. Single-target apply accepts
+  add/update/stale-delete/no-change but rejects move proposals until their
+  destination mutation exists.
   Changed files receive a timestamped recovery backup; no-change and repeated
-  applies are idempotent. The single writer actor records proposing,
+  applies are idempotent, and a retry can finish a missing audit record when
+  the target already matches and an exact base backup proves the prior update.
+  The single writer actor records proposing,
   approving, and applying actors, approval/before/after hashes, outcome, and
   backup path without granting the server or MCP any repository write access.
 

@@ -1158,3 +1158,557 @@ fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
             .any(|event| event["event"] == "applied")
     );
 }
+
+#[test]
+fn instruction_apply_rejects_a_different_repository_with_the_same_base() {
+    let originating_repository = tempfile::tempdir().unwrap();
+    let other_repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for repository in [&originating_repository, &other_repository] {
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    }
+
+    let project = "instruction-repository-identity";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    assert!(
+        run(
+            originating_repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                project,
+                "--path",
+                "_rules/repository-identity.md",
+                "--kind",
+                "rule",
+                "--body",
+                "# Repository identity\n\nApply only in the checkout that staged the proposal.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let proposal = json_success(run(
+        originating_repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/repository-identity.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    assert!(
+        run(
+            originating_repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let originating_before = snapshot(originating_repository.path());
+    let other_before = snapshot(other_repository.path());
+    let applied_elsewhere = run(
+        other_repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!applied_elsewhere.status.success());
+    assert!(
+        String::from_utf8_lossy(&applied_elsewhere.stderr).contains("different repository"),
+        "{}",
+        String::from_utf8_lossy(&applied_elsewhere.stderr)
+    );
+    assert_eq!(snapshot(originating_repository.path()), originating_before);
+    assert_eq!(snapshot(other_repository.path()), other_before);
+
+    let detail = json_success(run(
+        originating_repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert!(detail["application"].is_null());
+    assert_eq!(
+        detail["repository_identity_sha256"].as_str().unwrap().len(),
+        64
+    );
+}
+
+#[test]
+fn instruction_apply_recovers_a_written_but_unrecorded_update() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let original = "";
+    let target = repository.path().join("AGENTS.md");
+    fs::write(&target, original).unwrap();
+
+    let project = "instruction-apply-recovery";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                project,
+                "--path",
+                "_rules/recovery.md",
+                "--kind",
+                "rule",
+                "--body",
+                "# Recovery\n\nRecord an already-written approved update on retry.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/recovery.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["base_target_existed"], true);
+    let proposed = detail["proposed_content"].as_str().unwrap();
+    let mut backup_name = target.as_os_str().to_owned();
+    backup_name.push(".bak-1700000000");
+    let backup = PathBuf::from(backup_name);
+    fs::write(&backup, original).unwrap();
+    fs::write(&target, proposed).unwrap();
+    let repository_before_retry = snapshot(repository.path());
+
+    let recovered = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(recovered["status"], "applied");
+    assert_eq!(recovered["outcome"], "updated");
+    assert_eq!(recovered["idempotent"], false);
+    assert_eq!(
+        recovered["backup_path"],
+        fs::canonicalize(&backup)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(snapshot(repository.path()), repository_before_retry);
+}
+
+#[test]
+fn instruction_apply_recovers_a_written_but_unrecorded_create() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let target = repository.path().join("AGENTS.md");
+    assert!(!target.exists());
+
+    let project = "instruction-create-recovery";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                project,
+                "--path",
+                "_rules/create-recovery.md",
+                "--kind",
+                "rule",
+                "--body",
+                "# Create recovery\n\nRecord an already-created approved target on retry.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/create-recovery.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["base_target_existed"], false);
+    fs::write(&target, detail["proposed_content"].as_str().unwrap()).unwrap();
+    let repository_before_retry = snapshot(repository.path());
+
+    let recovered = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(recovered["status"], "applied");
+    assert_eq!(recovered["outcome"], "created");
+    assert!(recovered["backup_path"].is_null());
+    assert_eq!(snapshot(repository.path()), repository_before_retry);
+}
+
+#[test]
+fn instruction_apply_rejects_move_operations_without_a_destination_write() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(
+        repository.path().join("AGENTS.md"),
+        "# Rules\n\n## Release procedure\n\n1. Build the release.\n2. Verify the signed artifact.\n3. Publish the release notes.\n",
+    )
+    .unwrap();
+
+    let project = "instruction-move-rejected";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--finding",
+            "workflow_in_always_loaded_context",
+            "--source",
+            "AGENTS.md",
+            "--line",
+            "5",
+            "--json",
+        ],
+    ));
+    assert_eq!(proposal["operation"], "move_to_skill");
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+    let before = snapshot(repository.path());
+
+    let apply = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&apply.stderr).contains("single-target local apply"),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(snapshot(repository.path()), before);
+}
+
+#[test]
+fn instruction_apply_records_an_approved_no_change_without_writing() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(
+        repository.path().join("AGENTS.md"),
+        "# Rules\n\nUse rustfmt as this repository's coding convention.\n",
+    )
+    .unwrap();
+
+    let project = "instruction-no-change";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--finding",
+            "protected_project_context",
+            "--source",
+            "AGENTS.md",
+            "--line",
+            "3",
+            "--json",
+        ],
+    ));
+    assert_eq!(proposal["operation"], "no_change");
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    let rejected_edit = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "edit",
+            proposal_id,
+            "--content",
+            "# Changed despite no-change\n",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!rejected_edit.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected_edit.stderr)
+            .contains("must preserve the exact base content"),
+        "{}",
+        String::from_utf8_lossy(&rejected_edit.stderr)
+    );
+    assert!(
+        run(
+            repository.path(),
+            data.path(),
+            &server.url,
+            &[
+                "pending-writes",
+                "approve",
+                proposal_id,
+                "--workspace",
+                "default",
+                "--project",
+                project,
+            ],
+        )
+        .status
+        .success()
+    );
+    let before = snapshot(repository.path());
+
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["outcome"], "no_op");
+    assert!(applied["backup_path"].is_null());
+    assert_eq!(snapshot(repository.path()), before);
+}

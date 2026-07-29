@@ -262,9 +262,10 @@ approvals are idempotent and do not duplicate audit events.
 
 `instructions apply` must run from the repository that owns the target. It
 accepts only an approved `project_instruction` revision, reruns the instruction
-doctor to resolve the repository root and logical target, recomputes the
-approval binding, and verifies the stored base SHA-256 and approved ownership
-boundary on the atomic writer's final read. The normal
+doctor to resolve the repository root and logical target, requires the canonical
+repository-root identity hash captured at staging, recomputes the approval
+binding, and verifies the stored base SHA-256 and approved ownership boundary
+on the atomic writer's final read. The normal
 `<!-- engram:start -->` / `<!-- engram:end -->` routing block must remain
 byte-identical. A changed existing file is copied to a sibling
 `<target>.bak-<timestamp>` before tempfile sync and atomic rename; the command
@@ -273,13 +274,22 @@ actors. To recover, copy the reported backup over the target after inspecting
 both files. No-op and repeated applies create no backup, and the command never
 runs Git stage, commit, or push.
 
+This first executor supports `add`, `update`, `stale_delete`, and `no_change`.
+It rejects `move_to_skill`, `move_to_path_rule`, `move_to_wiki`, and
+`move_to_enforcement` because deleting the source without writing the approved
+destination would lose instructions. If the local replacement completed but
+the audit request was interrupted, rerunning the command can complete the
+record only when the target already equals the approved content and an exact
+timestamped backup matches the approved base (or the approved base was an
+absent file). It otherwise fails closed.
+
 Existing `wiki_page` proposals continue to use their current sidecar and Wiki
 approval path. Conversely, provider availability, the background scheduler,
 `[auto_improve] require_approval`, and Wiki auto-approval behavior cannot
 approve or apply a `project_instruction`; only the explicit human review route
 can mark it apply-ready. Application remains an explicit local CLI action; the
-admin server only records its hashes, outcome, actor, and recovery path and
-never receives target content or a repository path to mutate.
+application endpoint only records its hashes, outcome, actor, and recovery path
+and never receives target content or a repository path to mutate.
 Semantic assistance is available only through the explicit CLI/admin proposal
 path. No repository-writing MCP tool is added, and scheduled learning review
 has no repository access: it can at most stage pending data through the same

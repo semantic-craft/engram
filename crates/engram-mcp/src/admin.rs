@@ -394,6 +394,8 @@ struct ProjectInstructionProposalRequest {
     project: String,
     operation: String,
     logical_target: String,
+    repository_identity_sha256: String,
+    base_target_existed: bool,
     target_context_layer: String,
     boundary_kind: String,
     boundary_value: String,
@@ -1913,6 +1915,12 @@ async fn handle_project_instruction_proposal(
         Ok(path) => path,
         Err(error) => return bad_request(&format!("invalid logical target: {error}")),
     };
+    let repository_identity_sha256 = match hex_to_sha256(&request.repository_identity_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return bad_request(&format!("invalid repository_identity_sha256: {error}"));
+        }
+    };
     if request.base_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
         || request.proposed_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES
     {
@@ -1929,6 +1937,13 @@ async fn handle_project_instruction_proposal(
         &request.provenance,
     ) {
         return bad_request(&error);
+    }
+    if operation == AutoImproveProposalOperation::NoChange
+        && request.base_content != request.proposed_content
+    {
+        return bad_request(
+            "no-change project-instruction proposals must preserve the exact base content",
+        );
     }
     let sanitizer = Sanitizer::builtin();
     let provenance_text = match serde_json::to_string(&request.provenance) {
@@ -1986,6 +2001,8 @@ async fn handle_project_instruction_proposal(
             project_id,
             operation,
             logical_target,
+            repository_identity_sha256,
+            base_target_existed: request.base_target_existed,
             target_context_layer: request.target_context_layer.clone(),
             base_sha256,
             base_content: request.base_content,
@@ -3142,6 +3159,24 @@ async fn handle_pending_write_apply(
             Json(serde_json::json!({
                 "status": "unsupported_target_kind",
                 "error": "Wiki proposals cannot use the local instruction apply path"
+            })),
+        );
+    }
+    if !matches!(
+        detail.summary.operation,
+        AutoImproveProposalOperation::Add
+            | AutoImproveProposalOperation::Update
+            | AutoImproveProposalOperation::StaleDelete
+            | AutoImproveProposalOperation::NoChange
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "unsupported_operation",
+                "error": format!(
+                    "{} is not supported by the single-target local apply path",
+                    detail.summary.operation.as_str()
+                )
             })),
         );
     }
@@ -7640,6 +7675,8 @@ mod tests {
                     "project": "scratch",
                     "operation": "add",
                     "logical_target": "AGENTS.md",
+                    "repository_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "base_target_existed": false,
                     "target_context_layer": "root_instructions",
                     "boundary_kind": "exact_anchor",
                     "boundary_value": "EOF",
