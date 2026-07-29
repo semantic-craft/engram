@@ -38,9 +38,29 @@ npm install
 npm run tauri dev    # needs the Engram daemon running locally
 ```
 
-Build a release bundle with `npm run build:release`. It wraps
-`tauri build` with `--remap-path-prefix` so the binary carries no
-absolute build paths (Rust embeds them in panic/tracing metadata,
-which would leak the builder's home directory and username), then
-fails the build if any such path survives. Don't ship bundles from a
-bare `npm run tauri build`.
+Build a sanitized local bundle with `npm run build:release`. It wraps
+`tauri build` with `--remap-path-prefix` so the binary carries no absolute
+build paths (Rust embeds them in panic/tracing metadata, which would leak the
+builder's home directory and username), then fails the build if any such path
+survives. When `APPLE_SIGNING_IDENTITY` is set, it also verifies the resulting
+Developer ID signature; without that variable, the output is explicitly
+local-testing only. Don't ship bundles from a bare `npm run tauri build`.
+
+Public macOS releases use an independent `desktop-vX.Y.Z` tag so the CLI's
+`releases/latest` downloads keep pointing at the native engine archives. Run
+the complete local release gate with:
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: …" \
+ENGRAM_DESKTOP_NOTARY_PROFILE="<notarytool-keychain-profile>" \
+npm run release:macos
+```
+
+That command builds, signs, notarizes, staples, mounts, and Gatekeeper-checks
+the Apple Silicon DMG, then writes a matching `.sha256` file. The credential
+profile stays in Keychain and is never stored in this repository.
+
+The current public build is
+[`desktop-v0.1.1`](https://github.com/semantic-craft/engram/releases/tag/desktop-v0.1.1).
+It is a workbench for a separately installed, locally running Engram engine;
+install the CLI release and start the daemon before opening the desktop app.
