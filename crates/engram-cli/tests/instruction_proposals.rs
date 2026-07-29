@@ -1195,6 +1195,77 @@ fn approved_instruction_applies_locally_once_with_cas_backup_and_audit() {
 }
 
 #[test]
+fn approved_add_creates_a_missing_target_without_touching_the_git_index() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("README.md"), "# Seed\n").unwrap();
+    commit_all(repository.path(), "initial repository");
+    let index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-create-missing";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let proposal_id = stage_and_approve_rule(
+        repository.path(),
+        data.path(),
+        &server.url,
+        project,
+        "_rules/create.md",
+        "# Create\n\nCreate the approved instruction target.",
+        "AGENTS.md",
+    );
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["base_target_existed"], false);
+    let expected = detail["proposed_content"].as_str().unwrap();
+
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "created");
+    assert!(applied["backup_path"].is_null());
+    assert_eq!(
+        fs::read_to_string(repository.path().join("AGENTS.md")).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        index_before
+    );
+}
+
+#[test]
 fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -2515,7 +2586,7 @@ fn instruction_apply_rejects_matching_created_bytes_without_a_bound_receipt() {
     );
     assert!(!recovered.status.success());
     assert!(
-        String::from_utf8_lossy(&recovered.stderr).contains("target existence changed"),
+        String::from_utf8_lossy(&recovered.stderr).contains("local apply receipt"),
         "{}",
         String::from_utf8_lossy(&recovered.stderr)
     );
