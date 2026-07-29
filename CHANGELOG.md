@@ -108,6 +108,9 @@ below start from the fork.
 
 ### Fixed
 
+- GitHub Release installation notes now describe the shipped macOS Apple
+  Silicon archive accurately instead of advertising an x86_64 artifact that
+  the release workflow does not build.
 - The desktop SvelteKit toolchain now resolves `cookie` 0.7.2 through npm's
   supported override mechanism, removing the vulnerable transitive 0.6.0
   release without requiring an unrelated framework major-version upgrade.
