@@ -12,6 +12,17 @@ below start from the fork.
 
 ### Added
 
+- The managed routing package now includes
+  `engram-project-instruction-maintenance`, a progressively disclosed Agent
+  Skill for the existing doctor → propose → review → explicit human approval →
+  local-apply workflow. The slim always-loaded block gains only a maintenance
+  trigger; the Skill keeps proposal storage on the server, repository apply on
+  the local host, and Git stage/commit/push/merge outside the workflow. The MCP
+  surface remains the same 16 tools. Compiled-CLI black-box coverage now spans
+  generic cleanup with protected project knowledge, provenance, CAS, backup,
+  audit, Git-index preservation, idempotency, an LLM-disabled durable-rule
+  path, managed-Skill installation, and remote MCP denial of repository write
+  authority.
 - `engram instructions doctor` provides a deterministic, read-only audit of
   Claude Code and Codex project instruction loading. Human-readable and JSON
   reports identify canonical, adapter, tool-specific, path-scoped, and

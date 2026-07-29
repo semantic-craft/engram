@@ -201,7 +201,13 @@ code adds a concrete alias.
 Managed engram Agent Skills are prompt packaging for this tool-routing
 guidance only. They are installed as ordinary `SKILL.md` files so agents can
 progressively load detailed instructions, but engram does not store durable
-memory in them and does not include a runtime skill router.
+memory in them and does not include a runtime skill router. The managed
+`engram-project-instruction-maintenance` Skill extends that same packaging to
+the existing CLI/admin instruction workflow without extending the MCP list:
+the always-loaded block carries only a short trigger, and the Skill requires
+doctor → propose → review → explicit human approval → local apply. Proposal
+state remains server-side, repository authority remains local, and Git stage,
+commit, push, and merge are outside the workflow.
 
 Project-instruction semantic assistance deliberately remains an authenticated
 CLI/admin bridge rather than a seventeenth MCP tool. Its provider is advisory:

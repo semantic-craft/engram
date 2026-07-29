@@ -77,7 +77,11 @@ impl Server {
                 project,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .env_remove("ENGRAM_LLM_PROVIDER")
+            .env_remove("ENGRAM_LLM_MODEL")
+            .env_remove("ENGRAM_LLM_BASE_URL")
+            .env_remove("ENGRAM_LLM_COMPAT_STRICT");
         if let Some(provider_url) = provider_url {
             command
                 .env("ENGRAM_LLM_PROVIDER", "openai-compat")
@@ -776,6 +780,486 @@ fn selected_doctor_finding_stages_stale_deletion_and_survives_server_restart() {
     );
     assert_eq!(shown["provenance"][0]["kind"], "doctor_finding");
     assert_eq!(snapshot(repository.path()), repository_before);
+}
+
+#[test]
+fn doctor_to_local_apply_preserves_protected_context_and_git_index() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let original = "# Project instructions\n\n\
+Think step by step and be helpful.\n\n\
+- Rust filesystem errors in this repository must use `anyhow::Context`.\n\
+- Production deployment uses the private `opsctl release` workflow.\n\
+- The internal `artifact-index` tool is the only supported index writer.\n\
+- Database migrations must remain backward-compatible for one release.\n\
+- Enterprise tenants must never receive consumer trial entitlements.\n\
+- Authentication checks must never be bypassed.\n";
+    let target = repository.path().join("AGENTS.md");
+    fs::write(&target, original).unwrap();
+    commit_all(repository.path(), "initial project instructions");
+    fs::write(
+        repository.path().join("NOTES.md"),
+        "unrelated staged bytes\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .args(["add", "NOTES.md"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let git_index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-maintenance-workflow";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let doctor = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &["instructions", "doctor", "--json"],
+    ));
+    assert_eq!(doctor["canonical"]["path"], "AGENTS.md");
+    let findings = doctor["placement_findings"].as_array().unwrap();
+    let generic = findings
+        .iter()
+        .find(|finding| finding["category"] == "generic_harness")
+        .unwrap();
+    assert_eq!(generic["action"], "remove");
+    assert_eq!(generic["protected"], false);
+    for category in [
+        "team_convention",
+        "private_deployment",
+        "internal_tool",
+        "database_migration",
+        "business_boundary",
+        "security_requirement",
+    ] {
+        let protected = findings
+            .iter()
+            .find(|finding| finding["category"] == category)
+            .unwrap_or_else(|| panic!("missing protected category {category}"));
+        assert_eq!(protected["protected"], true, "{category}");
+        assert_ne!(protected["action"], "remove", "{category}");
+    }
+
+    let repository_before_proposal = snapshot(repository.path());
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--finding",
+            "generic_harness_guidance",
+            "--source",
+            "AGENTS.md",
+            "--line",
+            "3",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap().to_owned();
+    assert_eq!(proposal["status"], "pending");
+    assert_eq!(proposal["operation"], "stale_delete");
+    assert_eq!(snapshot(repository.path()), repository_before_proposal);
+
+    let shown = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(shown["summary"]["status"], "pending");
+    assert_eq!(shown["summary"]["target_kind"], "project_instruction");
+    assert_eq!(shown["provenance"][0]["kind"], "doctor_finding");
+    assert_eq!(
+        shown["base_sha256"],
+        sha256_hex(original.as_bytes()),
+        "the proposal must be CAS-bound to the reviewed target"
+    );
+    let proposed = shown["proposed_content"].as_str().unwrap().to_owned();
+    assert!(!proposed.contains("Think step by step"));
+    for protected in [
+        "anyhow::Context",
+        "opsctl release",
+        "artifact-index",
+        "backward-compatible",
+        "consumer trial entitlements",
+        "Authentication checks",
+    ] {
+        assert!(
+            proposed.contains(protected),
+            "protected repository knowledge was lost: {protected}"
+        );
+    }
+    let diff = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "diff",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    let unified = diff["diff"].as_str().unwrap();
+    assert!(unified.contains("-Think step by step and be helpful."));
+    assert_eq!(snapshot(repository.path()), repository_before_proposal);
+
+    let approved = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(approved["apply_ready"], true);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "updated");
+    assert_eq!(applied["idempotent"], false);
+    assert_eq!(applied["before_sha256"], sha256_hex(original.as_bytes()));
+    assert_eq!(applied["after_sha256"], sha256_hex(proposed.as_bytes()));
+    let backup = PathBuf::from(applied["backup_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    assert_eq!(fs::read_to_string(&target).unwrap(), proposed);
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        git_index_before,
+        "local apply must not stage either its target or unrelated work"
+    );
+
+    let after_first_apply = snapshot(repository.path());
+    let repeated = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(repeated["status"], "applied");
+    assert_eq!(repeated["idempotent"], true);
+    assert_eq!(snapshot(repository.path()), after_first_apply);
+
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    let application = &detail["application"];
+    assert!(application["proposing_actor"].is_object());
+    assert!(application["approving_actor"].is_object());
+    assert!(application["applying_actor"].is_object());
+    assert_eq!(
+        detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "applied")
+            .count(),
+        1,
+        "idempotent retries must not duplicate the terminal audit event"
+    );
+    let status = Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status = String::from_utf8(status.stdout).unwrap();
+    let actual_status: BTreeSet<_> = status.lines().map(str::to_owned).collect();
+    let repository_root = fs::canonicalize(repository.path()).unwrap();
+    let backup_root = fs::canonicalize(backup.parent().unwrap())
+        .unwrap()
+        .strip_prefix(repository_root)
+        .unwrap()
+        .to_owned();
+    let expected_status = BTreeSet::from([
+        " M AGENTS.md".to_owned(),
+        "A  NOTES.md".to_owned(),
+        format!("?? {}/", backup_root.display()),
+    ]);
+    assert_eq!(
+        actual_status, expected_status,
+        "local apply must create no unrelated Git-visible changes"
+    );
+    assert_eq!(
+        fs::read(repository.path().join("NOTES.md")).unwrap(),
+        b"unrelated staged bytes\n",
+        "local apply must preserve unrelated file bytes"
+    );
+}
+
+#[test]
+fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("README.md"), "# Seed\n").unwrap();
+    commit_all(repository.path(), "initial repository");
+
+    let installed = run(
+        repository.path(),
+        data.path(),
+        "http://127.0.0.1:1",
+        &["install-instructions", "--target", "AGENTS.md"],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let instruction = fs::read_to_string(repository.path().join("AGENTS.md")).unwrap();
+    assert!(instruction.contains("project-instruction maintenance"));
+    assert!(!instruction.contains("instructions propose"));
+    let skill_path = repository
+        .path()
+        .join(".agents/skills/engram-project-instruction-maintenance/SKILL.md");
+    let skill = fs::read_to_string(&skill_path).unwrap();
+    for command in [
+        "engram instructions doctor",
+        "engram instructions propose",
+        "engram pending-writes diff",
+        "engram pending-writes approve",
+        "engram instructions apply",
+    ] {
+        assert!(
+            skill.contains(command),
+            "missing workflow command {command}"
+        );
+    }
+    assert!(skill.contains("explicit human"));
+    assert!(skill.contains("local host"));
+    assert!(!repository.path().join(".claude/skills").exists());
+    commit_all(repository.path(), "install managed maintenance workflow");
+    let git_index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-llm-disabled";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let wrote = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            "_rules/manual-review.md",
+            "--kind",
+            "rule",
+            "--body",
+            "# Manual review\n\nRequire explicit human approval before local instruction apply.",
+        ],
+    );
+    assert!(wrote.status.success());
+
+    let target = repository.path().join("AGENTS.md");
+    let base = fs::read_to_string(&target).unwrap();
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/manual-review.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap().to_owned();
+    assert_eq!(proposal["status"], "pending");
+    assert!(proposal["semantic_assistance"].is_null());
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+
+    let shown = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(shown["provenance"][0]["kind"], "durable_rule");
+    assert_eq!(shown["provenance"][0]["source"], "_rules/manual-review.md");
+    assert_eq!(shown["provenance"][0]["selection"], "explicit_cli");
+    assert!(
+        shown["proposed_content"]
+            .as_str()
+            .unwrap()
+            .contains("Require explicit human approval")
+    );
+
+    let unapproved_apply = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!unapproved_apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&unapproved_apply.stderr).contains("only approved"),
+        "{}",
+        String::from_utf8_lossy(&unapproved_apply.stderr)
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+
+    let approved = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "updated");
+    let backup = PathBuf::from(applied["backup_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(backup).unwrap(), base);
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        git_index_before
+    );
+    let first_apply = snapshot(repository.path());
+    let repeated = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(repeated["idempotent"], true);
+    assert_eq!(snapshot(repository.path()), first_apply);
 }
 
 #[test]

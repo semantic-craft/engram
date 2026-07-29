@@ -317,6 +317,14 @@ path. No repository-writing MCP tool is added, and scheduled learning review
 has no repository access: it can at most stage pending data through the same
 writer actor and can never approve, apply, or write project instructions.
 
+Agents should load the managed `engram-project-instruction-maintenance` Skill
+for this workflow. It keeps the always-loaded routing block small while
+requiring this order: read-only doctor, one cited proposal, show/diff review,
+explicit human approval, and only then an explicitly requested local apply.
+The agent must stop on CAS, dirty-target, marker, import, symlink, repository,
+or canonical-layout conflicts and must not stage, commit, push, merge, or open
+a pull request as a follow-on maintenance action.
+
 ## Install the routing snippet and Agent Skills
 
 From an agent, say:
@@ -386,6 +394,19 @@ This is prompt packaging only. engram does not run a runtime skill router,
 does not store durable memory in `SKILL.md`, and does not turn the
 auto-improvement loop into a skill-authoring system. Durable knowledge still
 lives in the wiki.
+
+The installed package contains six managed Skills:
+
+- `engram-retrieval`
+- `engram-handoff`
+- `engram-durable-pages`
+- `engram-learning-maintenance`
+- `engram-project-instruction-maintenance`
+- `engram-routing-install`
+
+The project-instruction Skill documents a CLI workflow, not a new MCP
+capability. A remote server stores and audits proposals; only a local CLI in
+the intended repository can apply an approved revision.
 
 ## Bootstrap an existing project
 
