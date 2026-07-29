@@ -52,6 +52,9 @@ hdiutil detach "$mount_dir" >/dev/null
 rmdir "$mount_dir"
 mount_dir=""
 
-shasum -a 256 "$dmg" >"$checksum"
+(
+  cd "$(dirname "$dmg")"
+  shasum -a 256 "$(basename "$dmg")"
+) >"$checksum"
 echo "release: ${dmg}"
 echo "checksum: ${checksum}"
