@@ -1066,7 +1066,14 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
         .current_dir(repository.path())
         .status()
         .unwrap();
+    let workspace = "maintenance-team";
+    let project = "instruction-llm-disabled";
     fs::write(repository.path().join("README.md"), "# Seed\n").unwrap();
+    fs::write(
+        repository.path().join(".engram.toml"),
+        format!("workspace = \"{workspace}\"\nproject = \"{project}\"\n"),
+    )
+    .unwrap();
     commit_all(repository.path(), "initial repository");
 
     let installed = run(
@@ -1101,11 +1108,17 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
     }
     assert!(skill.contains("explicit human"));
     assert!(skill.contains("local host"));
+    assert!(skill.contains(".engram.toml"));
+    assert!(skill.contains("closest"));
+    assert!(skill.contains("main checkout is\nnot applicable"));
+    assert!(skill.contains("worktree common directory"));
+    assert!(skill.contains("actual working-directory basename"));
+    assert!(skill.contains("--workspace <effective-workspace>"));
+    assert!(skill.contains("--project <effective-project>"));
     assert!(!repository.path().join(".claude/skills").exists());
     commit_all(repository.path(), "install managed maintenance workflow");
     let git_index_before = fs::read(repository.path().join(".git/index")).unwrap();
 
-    let project = "instruction-llm-disabled";
     let addr = reserve_addr();
     let server = Server::start(data.path(), project, &addr);
     let wrote = run(
@@ -1115,7 +1128,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
         &[
             "write-page",
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--path",
@@ -1138,7 +1151,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "instructions",
             "propose",
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--rule",
@@ -1162,7 +1175,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "show",
             &proposal_id,
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--json",
@@ -1187,7 +1200,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "apply",
             &proposal_id,
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--json",
@@ -1210,7 +1223,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "approve",
             &proposal_id,
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--json",
@@ -1228,7 +1241,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "apply",
             &proposal_id,
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--json",
@@ -1252,7 +1265,7 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
             "apply",
             &proposal_id,
             "--workspace",
-            "default",
+            workspace,
             "--project",
             project,
             "--json",
