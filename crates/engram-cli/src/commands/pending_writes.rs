@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
-    PendingWriteIdArgs, PendingWriteRejectArgs, PendingWritesArgs, PendingWritesCommand,
-    PendingWritesListArgs,
+    PendingWriteEditArgs, PendingWriteIdArgs, PendingWriteRejectArgs, PendingWritesArgs,
+    PendingWritesCommand, PendingWritesListArgs,
 };
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json_with_query};
@@ -36,6 +36,9 @@ struct ProposalDetail {
     unified_diff: Option<String>,
     estimated_token_delta: Option<i64>,
     provenance: serde_json::Value,
+    approval_sha256: Option<String>,
+    review_revision: Option<i64>,
+    revisions: Vec<serde_json::Value>,
     events: Vec<serde_json::Value>,
 }
 
@@ -50,6 +53,7 @@ pub async fn run(config: &Config, args: PendingWritesArgs) -> Result<()> {
         PendingWritesCommand::List(args) => list(&ep, args).await,
         PendingWritesCommand::Show(args) => show(&ep, args).await,
         PendingWritesCommand::Diff(args) => diff(&ep, args).await,
+        PendingWritesCommand::Edit(args) => edit(&ep, args).await,
         PendingWritesCommand::Approve(args) => approve(&ep, args).await,
         PendingWritesCommand::Reject(args) => reject(&ep, args).await,
     }
@@ -131,8 +135,60 @@ async fn diff(ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
     Ok(())
 }
 
+async fn edit(ep: &ServerEndpoint, args: PendingWriteEditArgs) -> Result<()> {
+    let project = super::resolve_project_name(args.project.as_deref())?;
+    let detail: ProposalDetail = get_json(
+        ep,
+        &format!("/admin/pending-writes/{}", args.id),
+        &[
+            ("workspace", args.workspace.as_str()),
+            ("project", project.as_str()),
+        ],
+    )
+    .await?;
+    let approval_sha256 = detail
+        .approval_sha256
+        .ok_or_else(|| anyhow::anyhow!("proposal does not support editable instruction review"))?;
+    let resp: serde_json::Value = post_json_with_query(
+        ep,
+        &format!("/admin/pending-writes/{}/edit", args.id),
+        &[
+            ("workspace", args.workspace.as_str()),
+            ("project", project.as_str()),
+        ],
+        &serde_json::json!({
+            "proposed_content": args.content,
+            "expected_approval_sha256": approval_sha256,
+        }),
+    )
+    .await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        println!("✓ edited {}", args.id);
+    }
+    Ok(())
+}
+
 async fn approve(ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
     let project = super::resolve_project_name(args.project.as_deref())?;
+    let detail: ProposalDetail = get_json(
+        ep,
+        &format!("/admin/pending-writes/{}", args.id),
+        &[
+            ("workspace", args.workspace.as_str()),
+            ("project", project.as_str()),
+        ],
+    )
+    .await?;
+    let body = if detail.summary.target_kind == "project_instruction" {
+        let approval_sha256 = detail.approval_sha256.ok_or_else(|| {
+            anyhow::anyhow!("project-instruction proposal has no approval binding")
+        })?;
+        serde_json::json!({ "expected_approval_sha256": approval_sha256 })
+    } else {
+        serde_json::json!({})
+    };
     let resp: serde_json::Value = post_json_with_query(
         ep,
         &format!("/admin/pending-writes/{}/approve", args.id),
@@ -140,11 +196,13 @@ async fn approve(ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
             ("workspace", args.workspace.as_str()),
             ("project", project.as_str()),
         ],
-        &serde_json::json!({}),
+        &body,
     )
     .await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else if detail.summary.target_kind == "project_instruction" {
+        println!("✓ approved {} (apply-ready; target unchanged)", args.id);
     } else {
         println!("✓ approved {}", args.id);
     }

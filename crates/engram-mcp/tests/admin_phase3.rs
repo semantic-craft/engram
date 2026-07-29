@@ -1133,6 +1133,7 @@ async fn project_instruction_stage_list_show_diff_reject_is_db_only_and_persiste
         .await
         .unwrap();
     seed_durable_rule(&state, ws, project).await;
+    let wiki_approval_path = state.wiki.clone();
     let router = admin_router(state);
 
     let stage = router
@@ -1242,6 +1243,30 @@ async fn project_instruction_stage_list_show_diff_reject_is_db_only_and_persiste
             .exists()
     );
 
+    // `auto_improve_require_approval` is false in this fixture, matching the
+    // ordinary Wiki auto-approval policy. Its apply path still cannot authorize
+    // or mutate a project-instruction proposal.
+    let wiki_approval = wiki_approval_path
+        .approve_auto_improve_proposal(
+            ws,
+            project,
+            proposal_id.parse().unwrap(),
+            ActorContext {
+                agent: Some("scheduler".into()),
+                ..ActorContext::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        wiki_approval
+            .to_string()
+            .contains("DB-only human review approval path")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+
     let reject = router
         .clone()
         .oneshot(
@@ -1287,6 +1312,33 @@ async fn project_instruction_stage_list_show_diff_reject_is_db_only_and_persiste
         "reviewer"
     );
     assert_eq!(rejected.decided_by_actor_json.unwrap()["user"], "reviewer");
+
+    let repeated_reject = router_post(
+        router,
+        &format!("/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"),
+        json!({"reason": "retry must not replace the first decision"}),
+    )
+    .await;
+    assert_eq!(repeated_reject.status(), StatusCode::OK);
+    assert_eq!(body_json(repeated_reject).await["idempotent"], true);
+    let rejected = store
+        .reader
+        .auto_improve_proposal_detail(ws, project, proposal_id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rejected.decision_reason.as_deref(),
+        Some("keep this in the Wiki")
+    );
+    assert_eq!(
+        rejected
+            .events
+            .iter()
+            .filter(|event| event.event == "rejected")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1394,7 +1446,7 @@ async fn project_instruction_stage_rejects_weak_or_secret_shaped_evidence_before
 }
 
 #[tokio::test]
-async fn project_instruction_scope_is_fail_closed_and_approval_is_not_implemented() {
+async fn project_instruction_scope_is_fail_closed_and_manual_approval_requires_binding() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
     let default_ws = store
@@ -1448,9 +1500,257 @@ async fn project_instruction_scope_is_fail_closed_and_approval_is_not_implemente
         json!({}),
     )
     .await;
-    assert_eq!(approve.status(), StatusCode::CONFLICT);
+    assert_eq!(approve.status(), StatusCode::BAD_REQUEST);
     let approve = body_json(approve).await;
-    assert_eq!(approve["status"], "approval_not_implemented");
+    assert_eq!(approve["error"], "expected_approval_sha256 is required");
+}
+
+#[tokio::test]
+async fn project_instruction_edit_and_approval_are_actor_separated_persistent_and_db_only() {
+    let tmp = TempDir::new().unwrap();
+    let repository = tmp.path().join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let target = repository.join("AGENTS.md");
+    let base = "# Rules\n";
+    fs::write(&target, base).unwrap();
+
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_durable_rule(&state, ws, project).await;
+    let router = admin_router(state);
+    let proposed = "# Rules\n\nKeep SQLite writes behind the single writer actor.\n";
+    let stage = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/instructions/proposals")
+                .header("content-type", "application/json")
+                .extension(ActorContext {
+                    agent: Some("codex".into()),
+                    user: Some("proposer".into()),
+                    ..ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&project_instruction_request(base, proposed)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stage.status(), StatusCode::OK);
+    let proposal_id = body_json(stage).await["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let initial = body_json(
+        router_get(
+            router.clone(),
+            &format!("/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"),
+        )
+        .await,
+    )
+    .await;
+    let initial_approval_sha = initial["approval_sha256"].as_str().unwrap().to_owned();
+    assert_eq!(initial["review_revision"], 0);
+    assert_eq!(initial["revisions"].as_array().unwrap().len(), 1);
+
+    let secret_fixture = ["OPENAI_API_KEY=", "sk-", "testsecret12345678901234567890"].concat();
+    let secret_edit = router_post(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}/edit?workspace=default&project=scratch"),
+        json!({
+            "proposed_content": secret_fixture,
+            "expected_approval_sha256": initial_approval_sha,
+        }),
+    )
+    .await;
+    assert_eq!(secret_edit.status(), StatusCode::BAD_REQUEST);
+
+    let reviewed_content = "# Rules\n\nKeep every SQLite write behind the single writer actor.\n";
+    let edit = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/edit?workspace=default&project=scratch"
+                ))
+                .header("content-type", "application/json")
+                .extension(ActorContext {
+                    agent: Some("claude-code".into()),
+                    user: Some("wording-reviewer".into()),
+                    ..ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "proposed_content": reviewed_content,
+                        "expected_approval_sha256": initial_approval_sha,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit.status(), StatusCode::OK);
+    let edit = body_json(edit).await;
+    assert_eq!(edit["review_revision"], 1);
+    assert_eq!(edit["idempotent"], false);
+    let reviewed_approval_sha = edit["approval_sha256"].as_str().unwrap().to_owned();
+    assert_ne!(reviewed_approval_sha, initial_approval_sha);
+
+    let unchanged_edit = router_post(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}/edit?workspace=default&project=scratch"),
+        json!({
+            "proposed_content": reviewed_content,
+            "expected_approval_sha256": reviewed_approval_sha,
+        }),
+    )
+    .await;
+    assert_eq!(unchanged_edit.status(), StatusCode::OK);
+    let unchanged_edit = body_json(unchanged_edit).await;
+    assert_eq!(unchanged_edit["idempotent"], true);
+    assert_eq!(unchanged_edit["review_revision"], 1);
+
+    let stale_edit = router_post(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}/edit?workspace=default&project=scratch"),
+        json!({
+            "proposed_content": "stale wording",
+            "expected_approval_sha256": initial_approval_sha,
+        }),
+    )
+    .await;
+    assert_eq!(stale_edit.status(), StatusCode::CONFLICT);
+
+    let reviewed = body_json(
+        router_get(
+            router.clone(),
+            &format!("/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(reviewed["summary"]["proposing_actor"]["user"], "proposer");
+    assert_eq!(reviewed["review_revision"], 1);
+    assert_eq!(reviewed["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(reviewed["revisions"][0]["proposed_content"], proposed);
+    assert_eq!(
+        reviewed["revisions"][1]["proposed_content"],
+        reviewed_content
+    );
+    assert_eq!(
+        reviewed["revisions"][1]["actor"]["user"],
+        "wording-reviewer"
+    );
+    assert_eq!(
+        reviewed["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "edited")
+            .count(),
+        1,
+        "rejected and idempotent edits must not duplicate audit"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "AGENTS.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let approve_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+            ))
+            .header("content-type", "application/json")
+            .extension(ActorContext {
+                agent: Some("codex".into()),
+                user: Some("approver".into()),
+                ..ActorContext::default()
+            })
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "expected_approval_sha256": reviewed_approval_sha,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let approve = router.clone().oneshot(approve_request()).await.unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+    let approve = body_json(approve).await;
+    assert_eq!(approve["status"], "approved");
+    assert_eq!(approve["apply_ready"], true);
+    assert_eq!(approve["idempotent"], false);
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "AGENTS.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let repeated = router.clone().oneshot(approve_request()).await.unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(body_json(repeated).await["idempotent"], true);
+    let final_detail = store
+        .reader
+        .auto_improve_proposal_detail(ws, project, proposal_id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_detail.summary.status,
+        AutoImproveProposalStatus::Approved
+    );
+    assert!(final_detail.applied_page_id.is_none());
+    assert!(final_detail.checkpoint.is_none());
+    assert_eq!(
+        final_detail.summary.proposed_by_actor_json["user"],
+        "proposer"
+    );
+    assert_eq!(
+        final_detail.decided_by_actor_json.unwrap()["user"],
+        "approver"
+    );
+    assert_eq!(
+        final_detail
+            .events
+            .iter()
+            .filter(|event| event.event == "approved")
+            .count(),
+        1,
+        "idempotent approval must not duplicate audit"
+    );
+
+    let reject = router_post(
+        router,
+        &format!("/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"),
+        json!({"reason": "too late"}),
+    )
+    .await;
+    assert_eq!(reject.status(), StatusCode::CONFLICT);
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
 }
 
 #[tokio::test]

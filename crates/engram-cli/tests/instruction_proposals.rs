@@ -1,4 +1,4 @@
-//! Black-box acceptance tests for proposal-only instruction stewardship.
+//! Black-box acceptance tests for instruction proposal and human-review stewardship.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -364,4 +364,230 @@ fn selected_doctor_finding_stages_stale_deletion_and_survives_server_restart() {
     );
     assert_eq!(shown["provenance"][0]["kind"], "doctor_finding");
     assert_eq!(snapshot(repository.path()), repository_before);
+}
+
+#[test]
+fn reviewer_edits_and_approves_instruction_without_applying_target_changes() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    let project = "instruction-review";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+
+    let wrote = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            "_rules/single-writer.md",
+            "--kind",
+            "rule",
+            "--body",
+            "# Single writer\n\nKeep SQLite writes behind the single writer actor.",
+        ],
+    );
+    assert!(wrote.status.success());
+
+    let repository_before = snapshot(repository.path());
+    let wiki_before = snapshot(&data.path().join("wiki"));
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/single-writer.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap().to_owned();
+    let original = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    let original_content = original["proposed_content"].as_str().unwrap().to_owned();
+    let original_approval_sha = original["approval_sha256"].as_str().unwrap().to_owned();
+    let reviewed_content = "# Rules\n\nKeep every SQLite write behind the single writer actor.\n";
+
+    let edited = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "edit",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--content",
+            reviewed_content,
+            "--json",
+        ],
+    ));
+    assert_eq!(edited["status"], "pending");
+    assert_eq!(edited["review_revision"], 1);
+    assert_ne!(edited["approval_sha256"], original_approval_sha);
+    assert_eq!(snapshot(repository.path()), repository_before);
+    assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
+
+    drop(server);
+    let restarted = Server::start(data.path(), project, &addr);
+    let reviewed = json_success(run(
+        repository.path(),
+        data.path(),
+        &restarted.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(reviewed["proposed_content"], reviewed_content);
+    assert!(
+        reviewed["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+Keep every SQLite write")
+    );
+    let estimate = |body: &str| i64::try_from(body.len().div_ceil(4)).unwrap();
+    assert_eq!(
+        reviewed["estimated_token_delta"],
+        estimate(reviewed_content) - estimate("# Rules\n")
+    );
+    assert_eq!(reviewed["review_revision"], 1);
+    assert_eq!(reviewed["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        reviewed["revisions"][0]["proposed_content"],
+        original_content
+    );
+    assert_eq!(
+        reviewed["revisions"][1]["proposed_content"],
+        reviewed_content
+    );
+    let reviewed_diff = run(
+        repository.path(),
+        data.path(),
+        &restarted.url,
+        &[
+            "pending-writes",
+            "diff",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+        ],
+    );
+    assert!(
+        reviewed_diff.status.success(),
+        "diff failed: {}",
+        String::from_utf8_lossy(&reviewed_diff.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&reviewed_diff.stdout)
+            .contains("+Keep every SQLite write behind the single writer actor.")
+    );
+
+    let approved = json_success(run(
+        repository.path(),
+        data.path(),
+        &restarted.url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(approved["apply_ready"], true);
+    assert_eq!(snapshot(repository.path()), repository_before);
+    assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
+
+    let repeated = json_success(run(
+        repository.path(),
+        data.path(),
+        &restarted.url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(repeated["status"], "approved");
+    assert_eq!(repeated["idempotent"], true);
+    let final_detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &restarted.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    let approved_events = final_detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "approved")
+        .count();
+    assert_eq!(
+        approved_events, 1,
+        "idempotent retry must not duplicate audit"
+    );
+    assert_eq!(snapshot(repository.path()), repository_before);
+    assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
 }

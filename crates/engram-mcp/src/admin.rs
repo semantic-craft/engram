@@ -55,11 +55,14 @@ use engram_core::{
 };
 use engram_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use engram_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, PendingProposalTargetKind, ReaderPool,
-    RejectAutoImproveProposal, ScopeResolutionError, StageAutoImproveRun,
-    StageProjectInstructionProposal, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope,
+    ApproveAutoImproveProposalResult, ApproveProjectInstructionProposal,
+    ApproveProjectInstructionProposalResult, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, DecayParams, EditProjectInstructionProposal,
+    EditProjectInstructionProposalResult, EmbeddingWrite, NewAutoImproveProposal,
+    PendingProposalTargetKind, ReaderPool, RejectAutoImproveProposal, ScopeResolutionError,
+    StageAutoImproveRun, StageProjectInstructionProposal, StoreError, WriterHandle,
+    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
+    project_instruction_token_delta, project_instruction_unified_diff,
 };
 use engram_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use flate2::Compression;
@@ -359,6 +362,18 @@ struct PendingRejectRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PendingEditRequest {
+    proposed_content: String,
+    expected_approval_sha256: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PendingApproveRequest {
+    #[serde(default)]
+    expected_approval_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectInstructionProposalRequest {
     workspace: String,
     project: String,
@@ -466,6 +481,15 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+fn sha256_to_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 /// Build the admin axum [`Router`]. Mounts:
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
@@ -512,6 +536,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/admin/pending-writes/{id}/diff",
             get(handle_pending_write_diff),
+        )
+        .route(
+            "/admin/pending-writes/{id}/edit",
+            post(handle_pending_write_edit),
         )
         .route(
             "/admin/pending-writes/{id}/approve",
@@ -1924,7 +1952,7 @@ async fn handle_project_instruction_proposal(
         &request.proposed_content,
     );
     let estimated_token_delta =
-        estimated_tokens(&request.proposed_content) - estimated_tokens(&request.base_content);
+        project_instruction_token_delta(&request.base_content, &request.proposed_content);
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(engram_core::ActorContext::anonymous);
@@ -1937,6 +1965,7 @@ async fn handle_project_instruction_proposal(
             logical_target,
             target_context_layer: request.target_context_layer.clone(),
             base_sha256,
+            base_content: request.base_content,
             boundary_kind: request.boundary_kind,
             boundary_value: request.boundary_value,
             proposed_content: request.proposed_content,
@@ -2195,88 +2224,6 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn estimated_tokens(content: &str) -> i64 {
-    i64::try_from(content.len().div_ceil(4)).unwrap_or(i64::MAX)
-}
-
-fn project_instruction_unified_diff(path: &str, before: &str, after: &str) -> String {
-    if before == after {
-        return String::new();
-    }
-
-    const CONTEXT_LINES: usize = 3;
-    let before_lines: Vec<_> = before.split_inclusive('\n').collect();
-    let after_lines: Vec<_> = after.split_inclusive('\n').collect();
-    let mut common_prefix = 0;
-    while common_prefix < before_lines.len()
-        && common_prefix < after_lines.len()
-        && before_lines[common_prefix] == after_lines[common_prefix]
-    {
-        common_prefix += 1;
-    }
-    let mut common_suffix = 0;
-    while common_suffix < before_lines.len().saturating_sub(common_prefix)
-        && common_suffix < after_lines.len().saturating_sub(common_prefix)
-        && before_lines[before_lines.len() - common_suffix - 1]
-            == after_lines[after_lines.len() - common_suffix - 1]
-    {
-        common_suffix += 1;
-    }
-
-    let old_change_end = before_lines.len() - common_suffix;
-    let new_change_end = after_lines.len() - common_suffix;
-    let context_start = common_prefix.saturating_sub(CONTEXT_LINES);
-    let old_context_end = (old_change_end + CONTEXT_LINES).min(before_lines.len());
-    let new_context_end = (new_change_end + CONTEXT_LINES).min(after_lines.len());
-    let before_count = old_context_end - context_start;
-    let after_count = new_context_end - context_start;
-    let before_start = if before_count == 0 {
-        0
-    } else {
-        context_start + 1
-    };
-    let after_start = if after_count == 0 {
-        0
-    } else {
-        context_start + 1
-    };
-    let mut output = format!(
-        "--- a/{path}\n+++ b/{path}\n@@ -{before_start},{before_count} +{after_start},{after_count} @@\n"
-    );
-    append_diff_lines(
-        &mut output,
-        ' ',
-        &before_lines[context_start..common_prefix],
-    );
-    append_diff_lines(
-        &mut output,
-        '-',
-        &before_lines[common_prefix..old_change_end],
-    );
-    append_diff_lines(
-        &mut output,
-        '+',
-        &after_lines[common_prefix..new_change_end],
-    );
-    append_diff_lines(
-        &mut output,
-        ' ',
-        &before_lines[old_change_end..old_context_end],
-    );
-    output
-}
-
-fn append_diff_lines(output: &mut String, prefix: char, lines: &[&str]) {
-    for line in lines {
-        output.push(prefix);
-        output.push_str(line);
-        if !line.ends_with('\n') {
-            output.push('\n');
-            output.push_str("\\ No newline at end of file\n");
-        }
-    }
-}
-
 async fn pending_detail(
     state: &AdminState,
     raw_id: &str,
@@ -2361,15 +2308,109 @@ async fn handle_pending_write_diff(
     }
 }
 
+async fn handle_pending_write_edit(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+    Json(body): Json<PendingEditRequest>,
+) -> impl IntoResponse {
+    let (ws, proj, detail) = match pending_detail(&state, &id, &query).await {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
+    if detail.summary.target_kind != PendingProposalTargetKind::ProjectInstruction {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "unsupported_target_kind",
+                "error": "Wiki proposals do not support instruction wording edits"
+            })),
+        );
+    }
+    if body.proposed_content.len() > MAX_PROJECT_INSTRUCTION_CONTENT_BYTES {
+        return bad_request("project-instruction target content exceeds the 1 MiB limit");
+    }
+    let sanitizer = Sanitizer::builtin();
+    if sanitizer.scrub(&body.proposed_content) != body.proposed_content {
+        return bad_request("proposed content contains credential-shaped or secret-shaped content");
+    }
+    let expected_approval_sha256 = match hex_to_sha256(&body.expected_approval_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid expected_approval_sha256: {error}")
+                })),
+            );
+        }
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let result = state
+        .writer
+        .edit_project_instruction_proposal(EditProjectInstructionProposal {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id: detail.summary.id,
+            expected_approval_sha256,
+            proposed_content: body.proposed_content,
+            actor,
+            author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await;
+    match result {
+        Ok(EditProjectInstructionProposalResult::Updated {
+            revision,
+            approval_sha256,
+            estimated_token_delta,
+        }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "proposal_id": id,
+                "status": "pending",
+                "review_revision": revision,
+                "approval_sha256": sha256_to_hex(&approval_sha256),
+                "estimated_token_delta": estimated_token_delta,
+                "idempotent": false,
+            })),
+        ),
+        Ok(EditProjectInstructionProposalResult::Unchanged {
+            revision,
+            approval_sha256,
+            estimated_token_delta,
+        }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "proposal_id": id,
+                "status": "pending",
+                "review_revision": revision,
+                "approval_sha256": sha256_to_hex(&approval_sha256),
+                "estimated_token_delta": estimated_token_delta,
+                "idempotent": true,
+            })),
+        ),
+        Ok(EditProjectInstructionProposalResult::Conflict { reason }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "status": "conflict", "error": reason })),
+        ),
+        Err(error) => internal_err(error.to_string()),
+    }
+}
+
 async fn handle_pending_write_approve(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
     author_ext: Option<axum::Extension<engram_core::UserId>>,
-    level_ext: Option<axum::Extension<engram_core::AuthLevel>>,
-    headers: HeaderMap,
+    request_context: (Option<axum::Extension<engram_core::AuthLevel>>, HeaderMap),
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<PendingWriteScopeQuery>,
+    body: Option<Json<PendingApproveRequest>>,
 ) -> impl IntoResponse {
+    let (level_ext, headers) = request_context;
     let proposal_id: AutoImproveProposalId = match id.parse() {
         Ok(id) => id,
         Err(e) => {
@@ -2384,23 +2425,12 @@ async fn handle_pending_write_approve(
         Ok(ids) => ids,
         Err(e) => return e,
     };
-    match state
+    let detail = match state
         .reader
         .auto_improve_proposal_detail(ws, proj, proposal_id)
         .await
     {
-        Ok(Some(detail))
-            if detail.summary.target_kind == PendingProposalTargetKind::ProjectInstruction =>
-        {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "status": "approval_not_implemented",
-                    "error": "project-instruction approval is intentionally deferred"
-                })),
-            );
-        }
-        Ok(Some(_)) => {}
+        Ok(Some(detail)) => detail,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -2408,11 +2438,64 @@ async fn handle_pending_write_approve(
             );
         }
         Err(error) => return internal_err(error.to_string()),
-    }
+    };
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(engram_core::ActorContext::anonymous);
     let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    if detail.summary.target_kind == PendingProposalTargetKind::ProjectInstruction {
+        let expected = body
+            .and_then(|Json(body)| body.expected_approval_sha256)
+            .ok_or_else(|| "expected_approval_sha256 is required".to_owned())
+            .and_then(|value| hex_to_sha256(&value));
+        let expected_approval_sha256 = match expected {
+            Ok(hash) => hash,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error })),
+                );
+            }
+        };
+        return match state
+            .writer
+            .approve_project_instruction_proposal(ApproveProjectInstructionProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id,
+                expected_approval_sha256,
+                actor,
+                author_id,
+            })
+            .await
+        {
+            Ok(ApproveProjectInstructionProposalResult::Approved { approval_sha256 }) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "proposal_id": id,
+                    "status": "approved",
+                    "apply_ready": true,
+                    "approval_sha256": sha256_to_hex(&approval_sha256),
+                    "idempotent": false,
+                })),
+            ),
+            Ok(ApproveProjectInstructionProposalResult::AlreadyApproved { approval_sha256 }) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "proposal_id": id,
+                    "status": "approved",
+                    "apply_ready": true,
+                    "approval_sha256": sha256_to_hex(&approval_sha256),
+                    "idempotent": true,
+                })),
+            ),
+            Ok(ApproveProjectInstructionProposalResult::Conflict { reason }) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "status": "conflict", "error": reason })),
+            ),
+            Err(error) => internal_err(error.to_string()),
+        };
+    }
     let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
     let admission_ctx = Some(AdmissionContext {
         op: AdmissionOp::WritePage,
@@ -2458,6 +2541,46 @@ async fn handle_pending_write_reject(
         Ok(ids) => ids,
         Err(e) => return e,
     };
+    let target_kind = match state
+        .reader
+        .auto_improve_proposal_detail(ws, proj, proposal_id)
+        .await
+    {
+        Ok(Some(detail)) => {
+            if detail.summary.target_kind == PendingProposalTargetKind::ProjectInstruction {
+                if detail.summary.status == AutoImproveProposalStatus::Rejected {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "proposal_id": id,
+                            "status": "rejected",
+                            "idempotent": true,
+                        })),
+                    );
+                }
+                if detail.summary.status != AutoImproveProposalStatus::Pending {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "status": "conflict",
+                            "error": format!(
+                                "project-instruction proposal is terminal: {}",
+                                detail.summary.status.as_str()
+                            )
+                        })),
+                    );
+                }
+            }
+            detail.summary.target_kind
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "proposal not found in scope" })),
+            );
+        }
+        Err(error) => return internal_err(error.to_string()),
+    };
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(engram_core::ActorContext::anonymous);
@@ -2480,8 +2603,19 @@ async fn handle_pending_write_reject(
     {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "status": "rejected" })),
+            Json(serde_json::json!({
+                "status": "rejected",
+                "idempotent": false,
+            })),
         ),
+        Err(StoreError::InvalidState(message))
+            if target_kind == PendingProposalTargetKind::ProjectInstruction =>
+        {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "status": "conflict", "error": message })),
+            )
+        }
         Err(e) => internal_err(e.to_string()),
     }
 }
@@ -6842,6 +6976,14 @@ mod tests {
                 "GET",
                 "/admin/pending-writes/00000000-0000-0000-0000-000000000000/diff?workspace=default&project=scratch",
                 serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/edit?workspace=default&project=scratch",
+                serde_json::json!({
+                    "proposed_content": "reviewed wording",
+                    "expected_approval_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                }),
             ),
             (
                 "POST",

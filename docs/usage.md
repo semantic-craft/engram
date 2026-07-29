@@ -181,10 +181,11 @@ The proposal stores `target_kind = "project_instruction"`, its operation
 `move_to_wiki`, `move_to_enforcement`, or `no_change`), logical target, context
 layer, base SHA-256, exact anchor or owned region, proposed content, unified
 diff, estimated token delta, rationale, complete provenance, proposing actor,
-and timestamps. The server recomputes the hash, diff, and token delta instead of
-trusting client-supplied derived fields. Missing evidence, assistant-only
-restatements, web or issue instructions, one-off or resolved transient state,
-and secret-shaped base/proposed/evidence content are rejected before staging.
+and timestamps. The server recomputes the hash, diff, token delta, and approval
+binding instead of trusting client-supplied derived fields. Missing evidence,
+assistant-only restatements, web or issue instructions, one-off or resolved
+transient state, and secret-shaped base/proposed/evidence content are rejected
+before staging.
 
 Review uses the existing surface:
 
@@ -192,16 +193,30 @@ Review uses the existing surface:
 engram pending-writes list --workspace default --project my-project
 engram pending-writes show <proposal-id> --workspace default --project my-project
 engram pending-writes diff <proposal-id> --workspace default --project my-project
+engram pending-writes edit <proposal-id> \
+  --content "reviewed instruction wording" \
+  --workspace default --project my-project
+engram pending-writes approve <proposal-id> \
+  --workspace default --project my-project
 engram pending-writes reject <proposal-id> --reason "not a project invariant" \
   --workspace default --project my-project
 ```
 
 The record is DB-only and persists across server restarts. It creates no Wiki
 sidecar and does not change the repository, Wiki target, index, or Git state.
-It is not an active project rule, and `pending-writes approve` intentionally
-refuses this target kind until the separate human editing/approval and local
-apply phases exist. Existing `wiki_page` proposals continue to use their
-current sidecar and Wiki approval path.
+Each edit is an optimistic, hash-bound full-content replacement: the server
+rejects stale review state, recomputes the target diff and token delta against
+the stored base content, and appends the reviewed content and actor to the
+revision audit. `pending-writes approve` binds to that exact revision and moves
+only the proposal state to `approved`/apply-ready with a separate deciding
+actor. It does not apply the instruction. Repeated identical edits and
+approvals are idempotent and do not duplicate audit events.
+
+Existing `wiki_page` proposals continue to use their current sidecar and Wiki
+approval path. Conversely, provider availability, the background scheduler,
+`[auto_improve] require_approval`, and Wiki auto-approval behavior cannot
+approve or apply a `project_instruction`; only the explicit human review route
+can mark it apply-ready. Local application remains a separate phase.
 
 ## Install the routing snippet and Agent Skills
 
