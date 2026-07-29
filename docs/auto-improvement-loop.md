@@ -35,6 +35,10 @@ is the project wiki page, not a `SKILL.md` package. The analogous targets are
 engram Agent Skills installed with routing are a narrow prompt-packaging
 exception: static files that teach agents when to call MCP tools, not durable
 memory pages or auto-improvement outputs.
+The `engram-project-instruction-maintenance` Skill packages the separate
+doctor/proposal/review/local-apply CLI workflow on demand. It does not make
+project instructions an auto-improvement target, does not add an MCP tool, and
+does not let the scheduler, provider, or remote server write a repository.
 
 ## Hermes Findings
 
@@ -418,6 +422,10 @@ write completed but reporting did not, a proposal-bound HMAC receipt in local
 Git metadata plus its exact approved-base backup permits a retry to finish the
 immutable audit. Matching bytes or a lookalike backup without that receipt fail
 as a conflict instead of synthesizing a false application.
+The managed maintenance Skill exposes this sequence to agents only after its
+trigger matches, requires explicit human review and approval, and ends after
+reporting local apply evidence; it never directs the agent to stage, commit,
+push, or merge repository changes.
 
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the

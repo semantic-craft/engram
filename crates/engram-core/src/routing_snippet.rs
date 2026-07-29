@@ -56,8 +56,8 @@ permanently.
 Detailed tool-routing guidance lives in the installed engram Agent
 Skills. When a task matches an installed engram Agent Skill, load and
 follow that skill before calling engram tools. The skills cover memory
-retrieval, handoffs, durable pages, learning maintenance, and routing
-install or refresh work.
+retrieval, handoffs, durable pages, learning maintenance,
+project-instruction maintenance, and routing install or refresh work.
 
 ### When you write a project rule, write it here
 
@@ -104,4 +104,32 @@ disturbing the rest of the file.
 #[must_use]
 pub fn full_block() -> String {
     format!("{MARKER_START}\n{}\n{MARKER_END}\n", SNIPPET_BODY.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SNIPPET_BODY;
+
+    #[test]
+    fn routes_project_instruction_maintenance_without_embedding_the_workflow() {
+        assert!(
+            SNIPPET_BODY.contains("project-instruction maintenance"),
+            "the slim routing block must point agents at the maintenance skill"
+        );
+        for detailed_command in [
+            "instructions doctor",
+            "instructions propose",
+            "pending-writes approve",
+            "instructions apply",
+        ] {
+            assert!(
+                !SNIPPET_BODY.contains(detailed_command),
+                "the always-loaded block must not embed `{detailed_command}`"
+            );
+        }
+        assert!(
+            SNIPPET_BODY.lines().count() <= 70,
+            "the always-loaded block must remain concise"
+        );
+    }
 }

@@ -1232,11 +1232,16 @@ fn ensure_not_managed_skill_path(logical: &str) -> Result<()> {
 }
 
 fn ensure_target_within_repository(root: &Path, target: &Path) -> Result<()> {
-    if target.strip_prefix(root).ok().is_none_or(|relative| {
-        relative
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    }) {
+    let canonical_root = root.canonicalize()?;
+    if target
+        .strip_prefix(&canonical_root)
+        .ok()
+        .is_none_or(|relative| {
+            relative
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+        })
+    {
         bail!("instruction target escapes the repository");
     }
     let check = match fs::symlink_metadata(target) {
@@ -1252,7 +1257,6 @@ fn ensure_target_within_repository(root: &Path, target: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("inspecting {}", target.display()));
         }
     };
-    let canonical_root = root.canonicalize()?;
     if !check.starts_with(&canonical_root) {
         bail!("instruction target resolves outside the repository");
     }
@@ -2135,6 +2139,8 @@ fn path_string(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::ensure_target_within_repository;
     #[cfg(unix)]
     use super::read_repository_target_at_root;
     use super::{
@@ -2144,6 +2150,17 @@ mod tests {
         validate_owned_region,
     };
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_target_is_accepted_inside_noncanonical_root() {
+        let repository = tempfile::tempdir().unwrap();
+        let target = repository.path().join("AGENTS.md");
+        fs::write(&target, "# Instructions\n").unwrap();
+
+        ensure_target_within_repository(repository.path(), &target.canonicalize().unwrap())
+            .unwrap();
+    }
 
     #[test]
     fn audit_reason_is_utf8_safe_and_server_bounded() {

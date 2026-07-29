@@ -17,6 +17,7 @@ const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal i
 const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
 const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit durable wiki mutation in engram: saving project knowledge, recording a rule or annotation, updating a permanent note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
 const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any engram knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
+const PROJECT_INSTRUCTION_MAINTENANCE_DESCRIPTION: &str = "Use this skill when asked to inspect, diagnose, propose, review, approve, or locally apply maintenance to a repository's CLAUDE.md, AGENTS.md, or other canonical project instruction file through engram. Trigger for project-instruction stewardship, context-budget cleanup, durable rule placement, or pending instruction proposals; keep proposal storage on the server and repository apply on the local host.";
 const ROUTING_INSTALL_DESCRIPTION: &str = "Use this skill for any request to install, refresh, repair, inspect, or remove engram's agent-facing routing: managed instruction snippets, Agent Skills, CLAUDE.md/AGENTS.md integration, or local/global skill roots. Trigger by semantic intent rather than exact wording.";
 
 /// One engram-managed Agent Skill file bundled by the core crate.
@@ -59,6 +60,12 @@ pub const MANAGED_SKILLS: &[ManagedSkill] = &[
         content: include_str!("routing_skills/engram-learning-maintenance/SKILL.md"),
     },
     ManagedSkill {
+        name: "engram-project-instruction-maintenance",
+        description: PROJECT_INSTRUCTION_MAINTENANCE_DESCRIPTION,
+        relative_path: "engram-project-instruction-maintenance/SKILL.md",
+        content: include_str!("routing_skills/engram-project-instruction-maintenance/SKILL.md"),
+    },
+    ManagedSkill {
         name: "engram-routing-install",
         description: ROUTING_INSTALL_DESCRIPTION,
         relative_path: "engram-routing-install/SKILL.md",
@@ -79,6 +86,7 @@ mod tests {
         "engram-handoff",
         "engram-durable-pages",
         "engram-learning-maintenance",
+        "engram-project-instruction-maintenance",
         "engram-routing-install",
     ];
 
@@ -111,6 +119,75 @@ mod tests {
     fn exposes_exact_managed_skill_set() {
         let names: Vec<_> = MANAGED_SKILLS.iter().map(|skill| skill.name).collect();
         assert_eq!(names, EXPECTED_SKILLS);
+    }
+
+    #[test]
+    fn exposes_progressively_disclosed_project_instruction_maintenance() {
+        let skill = MANAGED_SKILLS
+            .iter()
+            .find(|skill| skill.name == "engram-project-instruction-maintenance")
+            .expect("project-instruction maintenance must be a managed Agent Skill");
+        let lower = skill.content.to_ascii_lowercase();
+
+        for command in [
+            "engram instructions doctor",
+            "engram instructions propose",
+            "engram pending-writes diff",
+            "engram pending-writes approve",
+            "engram instructions apply",
+        ] {
+            assert!(
+                lower.contains(command),
+                "maintenance skill must teach `{command}`"
+            );
+        }
+        assert!(
+            lower.contains("explicit human") && lower.contains("approval"),
+            "maintenance skill must require explicit human approval"
+        );
+        assert!(
+            lower.contains("do not automatically advance")
+                && lower.contains("inspect or diagnose")
+                && lower.contains("do not create a proposal")
+                && lower.contains("review an existing proposal")
+                && lower.contains("do not create or approve")
+                && lower.contains("separate explicit request"),
+            "maintenance skill must branch by intent and stop before later write stages"
+        );
+        assert!(
+            lower.contains("server")
+                && lower.contains("proposal")
+                && lower.contains("local host")
+                && lower.contains("repository"),
+            "maintenance skill must separate server proposal storage from local repository apply"
+        );
+        assert!(
+            lower.contains(".engram.toml")
+                && lower.contains("effective workspace")
+                && lower.contains("effective project")
+                && lower.contains("--workspace")
+                && lower.contains("--project")
+                && lower.contains("closest")
+                && lower.contains("actual working directory")
+                && lower.contains("not applicable")
+                && lower.contains("worktree common directory")
+                && lower.contains("baked into the installed lifecycle hook")
+                && lower.contains("fail-safe default"),
+            "maintenance skill must preserve marker-resolved workspace/project scope"
+        );
+        for forbidden in [
+            "automatically apply",
+            "force apply",
+            "git add",
+            "git commit",
+            "git push",
+            "git merge",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "maintenance skill must not recommend `{forbidden}`"
+            );
+        }
     }
 
     #[test]
