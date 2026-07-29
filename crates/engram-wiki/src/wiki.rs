@@ -605,6 +605,12 @@ impl Wiki {
             .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
             .await?
             .ok_or_else(|| engram_wiki_error("auto-improve proposal not found in scope"))?;
+        if detail.summary.target_kind == engram_store::PendingProposalTargetKind::ProjectInstruction
+        {
+            return Err(engram_wiki_error(
+                "project-instruction proposals do not have Wiki sidecars",
+            ));
+        }
         let path = self.auto_improve_sidecar_path(workspace_id, project_id, proposal_id);
         let content = self.sanitizer.scrub(&render_auto_improve_sidecar(&detail)?);
         let _guard = self.mutation_lock.read().await;
@@ -634,6 +640,12 @@ impl Wiki {
             .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
             .await?
             .ok_or_else(|| engram_wiki_error("auto-improve proposal not found in scope"))?;
+        if detail.summary.target_kind == engram_store::PendingProposalTargetKind::ProjectInstruction
+        {
+            return Err(engram_wiki_error(
+                "project-instruction proposal approval is not implemented",
+            ));
+        }
 
         let path = detail.summary.target_path.clone();
         let mut frontmatter = serde_json::json!({

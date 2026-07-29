@@ -499,6 +499,29 @@ possible root file. See
 [`docs/usage.md`](docs/usage.md#audit-project-instruction-chains) for the
 supported loading semantics and structured report.
 
+After reviewing the report, stage one evidence-backed instruction proposal from
+an explicit durable rule or an exact doctor finding:
+
+```bash
+engram instructions propose \
+  --rule _rules/single-writer.md --target AGENTS.md
+engram instructions propose \
+  --finding generic_harness_guidance --source AGENTS.md --line 12
+
+engram pending-writes list
+engram pending-writes show <proposal-id>
+engram pending-writes diff <proposal-id>
+engram pending-writes reject <proposal-id> --reason "keep this in the Wiki"
+```
+
+This is a proposal-only bridge. A staged `project_instruction` record is not an
+active rule: it lives in SQLite, creates no Wiki sidecar, and cannot use the
+Wiki approval path. Staging, inspection, and rejection leave repository files
+and Git state untouched. The server rejects missing or non-durable evidence and
+secret-shaped content before storage. See
+[`docs/usage.md`](docs/usage.md#stage-project-instruction-proposals) for the
+operation and provenance model.
+
 Install the managed routing package once so agents proactively call the right
 MCP tool for those prompts:
 
