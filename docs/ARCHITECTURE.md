@@ -262,6 +262,13 @@ The managed Agent Skills are a narrow prompt-packaging exception to the
 otherwise wiki-centered architecture. They are static `SKILL.md` files that
 teach agents when to call engram MCP tools; they are not durable wiki pages,
 not auto-improvement output, and not a runtime skill router inside engram.
+`engram-project-instruction-maintenance` is the CLI-workflow member of that
+package: the slim routing block only names the maintenance intent, while the
+Skill loads the doctor → propose → review → approve → local-apply procedure on
+demand. It grants no MCP capability. The server persists proposal, revision,
+approval, provenance, and audit data; only the local CLI holds repository
+apply authority, after explicit human approval, and it performs no subsequent
+Git stage, commit, push, or merge.
 
 MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and

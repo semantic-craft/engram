@@ -652,6 +652,15 @@ default:
    `<!-- engram:end -->`.
 2. Managed engram Agent Skills containing the detailed tool-routing guidance.
 
+The package currently contains `engram-retrieval`, `engram-handoff`,
+`engram-durable-pages`, `engram-learning-maintenance`,
+`engram-project-instruction-maintenance`, and `engram-routing-install`. The
+project-instruction Skill keeps the detailed doctor → propose → review →
+approve → local-apply sequence out of the always-loaded block. It requires
+explicit human approval and separates server-side proposal storage from
+local-host repository apply; it adds no repository-writing MCP tool and no Git
+stage, commit, push, or merge step.
+
 Re-running the command is safe. If a project still has the old long engram
 block between those markers, the refresh replaces that block in place with the
 slim snippet, leaves unrelated instructions before and after it alone, and
@@ -700,6 +709,11 @@ Default skill target roots:
 | `global` | `~/.claude/skills` | `~/.agents/skills` |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
+`engram-project-instruction-maintenance` follows the same root inference and
+ownership-marker rules as every other managed Skill. A same-name file without
+the marker remains user-owned unless the operator explicitly supplies the
+installer's force option; the maintenance workflow itself never asks the agent
+to force an apply.
 
 `engram uninstall --only skills --apply` removes managed skill files only
 from the default project/global roots shown above, after validating the

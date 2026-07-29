@@ -12,6 +12,20 @@ below start from the fork.
 
 ### Added
 
+- The managed routing package now includes
+  `engram-project-instruction-maintenance`, a progressively disclosed Agent
+  Skill for the existing doctor → propose → review → explicit human approval →
+  local-apply workflow. The slim always-loaded block gains only a maintenance
+  trigger; the Skill keeps proposal storage on the server, repository apply on
+  the local host, and Git stage/commit/push/merge outside the workflow. The MCP
+  surface remains the same 16 tools. Compiled-CLI black-box coverage now spans
+  generic cleanup with protected project knowledge, provenance, CAS, backup,
+  audit, Git-index preservation, idempotency, an LLM-disabled durable-rule
+  path, managed-Skill installation, and remote MCP denial of repository write
+  authority. Before any scoped proposal, review, approval, rejection, or apply
+  command, the Skill follows lifecycle capture precedence from the closest
+  working-directory ancestor marker through explicit scope and project
+  strategy, then passes the effective workspace and project explicitly.
 - `engram instructions doctor` provides a deterministic, read-only audit of
   Claude Code and Codex project instruction loading. Human-readable and JSON
   reports identify canonical, adapter, tool-specific, path-scoped, and
@@ -86,6 +100,13 @@ below start from the fork.
   The local receipt path is exclusively reserved before mutation; receipt
   finalization failure restores the approved base with the same no-clobber
   protocol and retains recovery artifacts.
+
+### Fixed
+
+- Local project-instruction apply now compares canonical repository and target
+  paths in the same Windows verbatim-path form. A target inside the repository
+  is no longer misclassified as escaping it solely because `canonicalize`
+  returned a `\\?\`-prefixed target path.
 
 ## 2.0.0 - 2026-07-19
 

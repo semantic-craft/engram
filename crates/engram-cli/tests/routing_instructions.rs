@@ -52,8 +52,9 @@ fn skill_conflict_preflight_keeps_instruction_file_unchanged_until_force() {
 
     let unmanaged = project
         .path()
-        .join(".claude/skills/engram-retrieval/SKILL.md");
-    let unmanaged_content = b"---\nname: engram-retrieval\n---\nuser skill\n".to_vec();
+        .join(".claude/skills/engram-project-instruction-maintenance/SKILL.md");
+    let unmanaged_content =
+        b"---\nname: engram-project-instruction-maintenance\n---\nuser skill\n".to_vec();
     fs::create_dir_all(unmanaged.parent().unwrap()).unwrap();
     fs::write(&unmanaged, &unmanaged_content).unwrap();
 
@@ -213,6 +214,12 @@ fn inferred_instruction_targets_select_matching_skill_agents() {
             .join(".agents/skills/engram-retrieval/SKILL.md")
             .exists()
     );
+    assert!(
+        project
+            .path()
+            .join(".agents/skills/engram-project-instruction-maintenance/SKILL.md")
+            .exists()
+    );
     assert!(!project.path().join(".claude/skills").exists());
 
     let both_project = tempfile::tempdir().unwrap();
@@ -237,6 +244,18 @@ fn inferred_instruction_targets_select_matching_skill_agents() {
         both_project
             .path()
             .join(".agents/skills/engram-retrieval/SKILL.md")
+            .exists()
+    );
+    assert!(
+        both_project
+            .path()
+            .join(".claude/skills/engram-project-instruction-maintenance/SKILL.md")
+            .exists()
+    );
+    assert!(
+        both_project
+            .path()
+            .join(".agents/skills/engram-project-instruction-maintenance/SKILL.md")
             .exists()
     );
 }
