@@ -2075,11 +2075,13 @@ fn path_string(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_repository_target_at_root;
     use super::{
         ApplyOutcome, ApplyReport, bounded_audit_text, contains_complete_instruction_blocks,
         finalize_apply_receipt, prepare_apply_receipt_storage, preserves_disjoint_outside_bytes,
-        read_repository_target_at_root, recover_unrecorded_apply, reserve_apply_receipt,
-        validate_exact_anchor, validate_owned_region,
+        recover_unrecorded_apply, reserve_apply_receipt, validate_exact_anchor,
+        validate_owned_region,
     };
     use std::fs;
 
