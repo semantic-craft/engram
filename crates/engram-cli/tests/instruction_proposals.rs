@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -37,6 +37,54 @@ fn reserve_addr() -> String {
     let (listener, addr) = reserve_listener();
     drop(listener);
     addr
+}
+
+fn read_complete_http_request(stream: &mut TcpStream) -> io::Result<()> {
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut expected_len = None;
+
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTP request ended before its declared body",
+            ));
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.len() > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fake-provider request exceeded test limit",
+            ));
+        }
+        if expected_len.is_none()
+            && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+        {
+            let headers = std::str::from_utf8(&request[..header_end])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "fake-provider request omitted Content-Length",
+                    )
+                })?;
+            expected_len = Some(header_end + 4 + content_len);
+        }
+        if expected_len.is_some_and(|expected| request.len() >= expected) {
+            return Ok(());
+        }
+    }
 }
 
 struct Server {
@@ -143,8 +191,9 @@ impl FakeProvider {
                     continue;
                 };
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut request = [0_u8; 16 * 1024];
-                let _ = stream.read(&mut request);
+                if read_complete_http_request(&mut stream).is_err() {
+                    continue;
+                }
                 worker_calls.fetch_add(1, Ordering::SeqCst);
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1093,7 +1142,9 @@ fn installed_maintenance_skill_guides_llm_disabled_explicit_rule_apply() {
     let skill_path = repository
         .path()
         .join(".agents/skills/engram-project-instruction-maintenance/SKILL.md");
-    let skill = fs::read_to_string(&skill_path).unwrap();
+    let skill = fs::read_to_string(&skill_path)
+        .unwrap()
+        .replace("\r\n", "\n");
     for command in [
         "engram instructions doctor",
         "engram instructions propose",
