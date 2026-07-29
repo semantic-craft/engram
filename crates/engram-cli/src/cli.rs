@@ -1163,6 +1163,7 @@ pub enum PendingWritesCommand {
     List(PendingWritesListArgs),
     Show(PendingWriteIdArgs),
     Diff(PendingWriteIdArgs),
+    Edit(PendingWriteEditArgs),
     Approve(PendingWriteIdArgs),
     Reject(PendingWriteRejectArgs),
 }
@@ -1188,6 +1189,20 @@ pub struct PendingWriteIdArgs {
     pub workspace: String,
     #[arg(long)]
     pub project: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PendingWriteEditArgs {
+    pub id: String,
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Full replacement instruction content to review.
+    #[arg(long)]
+    pub content: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -1675,11 +1690,34 @@ mod tests {
                     assert_eq!(args.id, id);
                     assert_eq!(args.project.as_deref(), Some("scratch"));
                 }
-                PendingWritesCommand::List(_) | PendingWritesCommand::Reject(_) => {
+                PendingWritesCommand::List(_)
+                | PendingWritesCommand::Edit(_)
+                | PendingWritesCommand::Reject(_) => {
                     panic!("wrong subcommand parsed")
                 }
             }
         }
+
+        let edit = Cli::try_parse_from([
+            "engram",
+            "pending-writes",
+            "edit",
+            id,
+            "--project",
+            "scratch",
+            "--content",
+            "reviewed wording",
+        ])
+        .expect("pending-writes edit parses");
+        let Command::PendingWrites(args) = edit.command else {
+            panic!("expected pending-writes command");
+        };
+        let PendingWritesCommand::Edit(args) = args.command else {
+            panic!("expected edit subcommand");
+        };
+        assert_eq!(args.id, id);
+        assert_eq!(args.project.as_deref(), Some("scratch"));
+        assert_eq!(args.content, "reviewed wording");
 
         let reject = Cli::try_parse_from([
             "engram",

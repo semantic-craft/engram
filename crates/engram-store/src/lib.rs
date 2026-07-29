@@ -26,13 +26,16 @@ mod writer;
 pub use fts_query::prepare_fts5_query;
 
 pub use auto_improve::{
-    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    PendingProposalTargetKind, RejectAutoImproveProposal, StageAutoImproveRun,
-    StageProjectInstructionProposal, StagedAutoImproveRun, StagedProjectInstructionProposal,
-    artifact_path_for,
+    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
+    ApproveProjectInstructionProposal, ApproveProjectInstructionProposalResult,
+    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
+    AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, EditProjectInstructionProposal,
+    EditProjectInstructionProposalResult, FailAutoImproveProposal, NewAutoImproveProposal,
+    PendingProposalTargetKind, ProjectInstructionProposalRevision, RejectAutoImproveProposal,
+    StageAutoImproveRun, StageProjectInstructionProposal, StagedAutoImproveRun,
+    StagedProjectInstructionProposal, artifact_path_for, project_instruction_token_delta,
+    project_instruction_unified_diff,
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
@@ -3234,6 +3237,7 @@ mod tests {
             "auto_improve_runs",
             "auto_improve_proposals",
             "auto_improve_proposal_events",
+            "project_instruction_proposal_revisions",
             "auto_improve_scheduler_state",
             "auto_improve_scheduler_claims",
         ] {
