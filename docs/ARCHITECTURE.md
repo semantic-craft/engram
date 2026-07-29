@@ -292,7 +292,11 @@ configuration, constructing an LLM provider, or opening the store. Its only
 environment reads are the harness-owned `HOME` / `USERPROFILE` and
 `CODEX_HOME` locations required to read Codex's project-discovery settings.
 It never invokes the routing installer; malformed markers and asset drift are
-diagnostics, not repair requests.
+diagnostics, not repair requests. The sibling `instruction_placement` module
+consumes only that in-memory inventory and normalized chains. It emits
+deterministic content categories, evidence, recommended actions and destination
+layers without opening the Wiki, proposal store, index, or audit state. The
+classification layer is diagnostic only and has no repository-write path.
 
 ## Cross-cutting invariants
 
