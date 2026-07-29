@@ -316,18 +316,37 @@ Approval binds to the exact current revision and stores a separate deciding
 actor, but only advances the SQLite record to `approved`/apply-ready. It never
 invokes a repository or Wiki mutation. `instructions apply` is the separate
 local executor: it reruns doctor discovery, resolves the stored logical target
-inside the same canonical checkout whose identity hash was captured at staging,
+inside the same canonical checkout and to the same canonical target whose
+combined identity hash was captured at staging,
 recomputes the approval hash, checks the approved boundary and base hash inside
 the atomic mutator's final read, protects the managed routing block, and
-replaces the file through a synced sibling tempfile with a timestamped backup.
+rotates the old file into an unpredictable private sibling recovery directory,
+then installs the synced sibling tempfile with no-clobber semantics.
+The executor is fail-closed across repository and file preflight: it rejects
+active Git operations, a dirty or concurrently changed target, malformed or
+overlapping routing/approved-rules markers, ambiguous anchors, managed Skills,
+unsafe symlinks or escaped paths, unresolved/cyclic/external imports, and
+non-UTF-8 or mixed-newline sources. Safe in-repository adapters resolve to one
+canonical write. The final compare-and-swap read, no-clobber handoff, and
+permission/newline preservation leave unowned bytes and the Git index intact.
+Local failures are reported through a root-gated metadata-only endpoint; the
+single writer actor atomically moves the proposal to `conflict` or `failed` and
+appends the stable diagnostic/repair event without an `applied` event.
 Add/update/stale-delete/no-change are single-target operations; move proposals
 remain apply-ineligible until their destination can be written as part of the
 same operation. If the local write succeeded but recording was interrupted, a
-retry recognizes the approved bytes only when an exact base backup proves the
-prior update, then completes the missing audit. It performs no Git operation. Only the resulting
-hashes, outcome, recovery path, and local actor return to a root-gated admin
-endpoint; that endpoint owns no repository path or content and records the
-application plus one `applied` event through the single writer actor. The MCP
+retry recognizes the approved bytes only when an HMAC-authenticated receipt in
+local Git metadata binds the proposal, approval hash, canonical target, hashes,
+outcome, and exact base backup. Matching bytes or a lookalike backup without
+that receipt conflict instead. The receipt slot is reserved before mutation;
+if finalization fails, the executor restores the approved base without
+overwriting a concurrent path and retains both recovery artifacts. It performs
+no Git staging, merge, or rebase.
+Only successful hashes/outcome/recovery metadata, or a failed attempt's stable
+code/reason/repair metadata, and the local actor return to root-gated admin
+endpoints; those endpoints own no repository path or content. The single writer
+records either the application plus one `applied` event or the typed terminal
+failure event. The MCP
 tool surface is unchanged. Wiki scheduler/provider/auto-approval settings
 cannot enter either manual path.
 

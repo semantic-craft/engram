@@ -23,11 +23,15 @@ use crate::cli::{
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::install_skills;
 use crate::config::Config;
+use crate::instruction_steward::managed_instruction_regions;
 
 // Markers + the snippet body live in `engram_core::routing_snippet`
 // so the `memory_install_self_routing` MCP tool can return the same
 // block this subcommand writes. Single source of truth.
-use engram_core::{MARKER_END, MARKER_START, full_block};
+use engram_core::full_block;
+
+#[cfg(test)]
+use engram_core::{MARKER_END, MARKER_START};
 
 /// Run the `install-instructions` subcommand.
 ///
@@ -59,7 +63,7 @@ pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
     } else {
         for target in &targets {
             let outcome = apply_atomic(target, |existing| {
-                Ok(merge_instructions_block(existing, &block))
+                merge_instructions_block(existing, &block)
             })?;
             println!(
                 "✓ {} {} ({})",
@@ -160,36 +164,66 @@ fn infer_skills_agent_from_instruction_targets(targets: &[PathBuf]) -> InstallSk
 /// between them (inclusive) with `block`. When they don't, append
 /// `block` to the end of the file with a single blank-line
 /// separator. The user's other content is never touched.
-fn merge_instructions_block(existing: &str, block: &str) -> String {
-    if let Some(start_idx) = existing.find(MARKER_START)
-        && let Some(end_idx_rel) = existing[start_idx..].find(MARKER_END)
-    {
-        let end_idx = start_idx + end_idx_rel + MARKER_END.len();
+fn merge_instructions_block(existing: &str, block: &str) -> Result<String> {
+    let existing_regions = managed_instruction_regions(existing)?;
+    let newline = instruction_newline(existing)?;
+    let normalized_block = block.replace("\r\n", "\n").replace('\r', "\n");
+    let block = if newline == "\r\n" {
+        normalized_block.replace('\n', "\r\n")
+    } else {
+        normalized_block
+    };
+    let out = if let Some(routing) = existing_regions.routing {
+        let start_idx = routing.start;
+        let end_idx = routing.end;
         // Consume a trailing newline after the end marker if present
         // so we don't accumulate blank lines on every re-run.
-        let after_end = if existing.as_bytes().get(end_idx).copied() == Some(b'\n') {
+        let after_end = if existing[end_idx..].starts_with("\r\n") {
+            end_idx + 2
+        } else if existing.as_bytes().get(end_idx).copied() == Some(b'\n') {
             end_idx + 1
         } else {
             end_idx
         };
         let mut out = String::with_capacity(existing.len() + block.len());
         out.push_str(&existing[..start_idx]);
-        out.push_str(block);
+        out.push_str(&block);
         out.push_str(&existing[after_end..]);
-        return out;
+        out
+    } else {
+        // No prior block — append. If the file already ends with a
+        // newline, separate with one blank line; otherwise add the
+        // newline + a blank line.
+        let mut out = existing.to_string();
+        if !out.is_empty() && !out.ends_with(newline) {
+            out.push_str(newline);
+        }
+        if !out.is_empty() {
+            out.push_str(newline);
+        }
+        out.push_str(&block);
+        out
+    };
+    let output_regions = managed_instruction_regions(&out)?;
+    let existing_approved = existing_regions
+        .approved_rules
+        .map(|range| &existing[range]);
+    let output_approved = output_regions.approved_rules.map(|range| &out[range]);
+    if existing_approved != output_approved {
+        anyhow::bail!("routing refresh would modify the approved-rules region");
     }
-    // No prior block — append. If the file already ends with a
-    // newline, separate with one blank line; otherwise add the
-    // newline + a blank line.
-    let mut out = existing.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+    Ok(out)
+}
+
+fn instruction_newline(content: &str) -> Result<&'static str> {
+    let without_crlf = content.replace("\r\n", "");
+    let has_crlf = content.contains("\r\n");
+    let has_lf = without_crlf.contains('\n');
+    let has_bare_cr = without_crlf.contains('\r');
+    if has_bare_cr || (has_crlf && has_lf) {
+        anyhow::bail!("instruction target uses unsupported mixed or bare-CR newlines");
     }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(block);
-    out
+    Ok(if has_crlf { "\r\n" } else { "\n" })
 }
 
 #[cfg(test)]
@@ -198,14 +232,14 @@ mod tests {
 
     #[test]
     fn merge_appends_to_empty_file() {
-        let out = merge_instructions_block("", "BLOCK\n");
+        let out = merge_instructions_block("", "BLOCK\n").unwrap();
         assert_eq!(out, "BLOCK\n");
     }
 
     #[test]
     fn merge_appends_when_no_markers_present() {
         let original = "# My project\n\nSome notes.\n";
-        let out = merge_instructions_block(original, "BLOCK\n");
+        let out = merge_instructions_block(original, "BLOCK\n").unwrap();
         assert!(out.starts_with("# My project"));
         assert!(out.ends_with("BLOCK\n"));
         // One blank line between user content and our block.
@@ -220,7 +254,7 @@ mod tests {
         let original =
             format!("# My project\n\n{MARKER_START}\nOLD\n{MARKER_END}\n\nMore notes.\n");
         let new_block = format!("{MARKER_START}\nNEW BLOCK\n{MARKER_END}\n");
-        let out = merge_instructions_block(&original, &new_block);
+        let out = merge_instructions_block(&original, &new_block).unwrap();
         assert!(out.contains("# My project"));
         assert!(out.contains("NEW BLOCK"));
         // Old content gone.
@@ -235,8 +269,8 @@ mod tests {
     #[test]
     fn merge_idempotent_double_run() {
         let block = format!("{MARKER_START}\nBLOCK\n{MARKER_END}\n");
-        let first = merge_instructions_block("# Title\n", &block);
-        let second = merge_instructions_block(&first, &block);
+        let first = merge_instructions_block("# Title\n", &block).unwrap();
+        let second = merge_instructions_block(&first, &block).unwrap();
         assert_eq!(first, second, "second merge must be a no-op");
     }
 
@@ -244,8 +278,42 @@ mod tests {
     /// should still produce well-formed output.
     #[test]
     fn merge_tolerates_missing_trailing_newline() {
-        let out = merge_instructions_block("# Title", "BLOCK\n");
+        let out = merge_instructions_block("# Title", "BLOCK\n").unwrap();
         assert!(out.starts_with("# Title\n"));
         assert!(out.ends_with("BLOCK\n"));
+    }
+
+    #[test]
+    fn routing_refresh_preserves_approved_rules_region_exactly() {
+        let approved = "<!-- engram:approved-rules:start -->\nhuman-approved\n<!-- engram:approved-rules:end -->";
+        let original =
+            format!("# Rules\n\n{approved}\n\n{MARKER_START}\nOLD\n{MARKER_END}\n\nHuman tail.\n");
+        let block = format!("{MARKER_START}\nNEW\n{MARKER_END}\n");
+        let out = merge_instructions_block(&original, &block).unwrap();
+        assert!(out.contains(approved));
+        assert!(out.contains("NEW"));
+        assert!(out.ends_with("Human tail.\n"));
+    }
+
+    #[test]
+    fn routing_refresh_rejects_malformed_or_crossed_markers() {
+        let approved_start = "<!-- engram:approved-rules:start -->";
+        let approved_end = "<!-- engram:approved-rules:end -->";
+        for malformed in [
+            format!("{MARKER_START}\nmissing end\n"),
+            format!("{MARKER_START}\none\n{MARKER_END}\n{MARKER_START}\ntwo\n{MARKER_END}"),
+            format!("{MARKER_START}\n{approved_start}\ncrossed\n{MARKER_END}\n{approved_end}"),
+        ] {
+            assert!(merge_instructions_block(&malformed, "BLOCK\n").is_err());
+        }
+    }
+
+    #[test]
+    fn routing_refresh_preserves_crlf_style() {
+        let original = format!("# Rules\r\n\r\n{MARKER_START}\r\nOLD\r\n{MARKER_END}\r\n");
+        let block = format!("{MARKER_START}\nNEW\n{MARKER_END}\n");
+        let out = merge_instructions_block(&original, &block).unwrap();
+        assert!(!out.replace("\r\n", "").contains('\n'));
+        assert!(out.contains("\r\nNEW\r\n"));
     }
 }

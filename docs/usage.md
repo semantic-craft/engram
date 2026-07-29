@@ -263,25 +263,47 @@ approvals are idempotent and do not duplicate audit events.
 `instructions apply` must run from the repository that owns the target. It
 accepts only an approved `project_instruction` revision, reruns the instruction
 doctor to resolve the repository root and logical target, requires the canonical
-repository-root identity hash captured at staging, recomputes the approval
+repository-root plus canonical-target identity hash captured at staging, recomputes the approval
 binding, and verifies the stored base SHA-256 and approved ownership boundary
 on the atomic writer's final read. The normal
 `<!-- engram:start -->` / `<!-- engram:end -->` routing block must remain
-byte-identical. A changed existing file is copied to a sibling
-`<target>.bak-<timestamp>` before tempfile sync and atomic rename; the command
+byte-identical and disjoint from the
+`<!-- engram:approved-rules:start -->` /
+`<!-- engram:approved-rules:end -->` owned region. Every managed marker family
+must contain at most one complete, ordered pair; duplicate, missing, crossed,
+or nested regions require manual repair. A changed existing file is moved into
+an unpredictably named private sibling recovery directory before the synced
+tempfile is installed with no-clobber semantics; the command
 prints that exact path and records it with the before/after hashes and all three
 actors. To recover, copy the reported backup over the target after inspecting
-both files. No-op and repeated applies create no backup, and the command never
+both files. An interrupted post-write audit is recoverable only when a
+proposal-bound HMAC receipt in local Git metadata authenticates the canonical
+target, hashes, outcome, and backup; matching bytes or a lookalike backup alone
+conflict. No-op and repeated applies create no backup, and the command never
 runs Git stage, commit, or push.
+
+The executor rejects a changed or Git-dirty target, any active merge, rebase,
+cherry-pick, or similar ambiguous repository state, ambiguous line anchors,
+managed Skill targets, unsupported encodings, unresolved/cyclic/external
+imports, repository-escaping paths, and unsafe symlinks before mutation. Safe
+in-repository symlinks and imports resolve to the canonical file so an adapter
+is not replaced or written twice. Successful writes preserve all bytes outside
+the approved boundary, the target's Unix permissions, and its existing LF or
+CRLF convention. A last-moment content check runs before the original is moved
+into private recovery storage; the proposed tempfile is then installed only if
+the target path remains absent. A failed preflight or write changes the proposal to typed
+`conflict` or `failed` and appends one diagnostic event with a stable code and
+manual repair guidance; it never records `applied`, forces an overwrite, or
+tries a merge/rebase fallback.
 
 This first executor supports `add`, `update`, `stale_delete`, and `no_change`.
 It rejects `move_to_skill`, `move_to_path_rule`, `move_to_wiki`, and
 `move_to_enforcement` because deleting the source without writing the approved
 destination would lose instructions. If the local replacement completed but
 the audit request was interrupted, rerunning the command can complete the
-record only when the target already equals the approved content and an exact
-timestamped backup matches the approved base (or the approved base was an
-absent file). It otherwise fails closed.
+record only when the target already equals the approved content and a
+proposal-bound HMAC receipt authenticates the exact base backup (or the
+approved create), canonical target, and hashes. It otherwise fails closed.
 
 Existing `wiki_page` proposals continue to use their current sidecar and Wiki
 approval path. Conversely, provider availability, the background scheduler,
@@ -324,7 +346,11 @@ engram install-instructions --no-skills
 `install-instructions` installs or updates managed skills by default. Use
 `--no-skills` only when you intentionally want a snippet-only refresh.
 The CLI replaces only the markered engram block, preserves unrelated content,
-and writes a timestamped backup before changing an existing instruction file.
+preserves a disjoint approved-rules region, permissions, and newline style, and
+retains the old file in a private, unpredictably named sibling recovery
+directory before changing an existing instruction file.
+Malformed, duplicate, crossed, or nested managed markers abort the refresh
+without writing.
 `install-instructions --print` previews the instruction snippet only; use
 `install-skills --print` to preview skill payloads. Skill flags mirror
 `install-skills` with an `--skills-` prefix:

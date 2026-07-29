@@ -26,6 +26,7 @@
 //! - `POST /admin/instructions/proposals` — stage a DB-only project-instruction proposal.
 //! - `POST /admin/instructions/semantic-proposals` — bounded provider assistance, then stage only.
 //! - `POST /admin/pending-writes/{id}/apply` — record a completed local instruction apply.
+//! - `POST /admin/pending-writes/{id}/apply-failure` — record typed fail-closed diagnostics.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -62,8 +63,9 @@ use engram_store::{
     ApproveProjectInstructionProposalResult, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, EditProjectInstructionProposal,
     EditProjectInstructionProposalResult, EmbeddingWrite, NewAutoImproveProposal,
-    PendingProposalTargetKind, ProjectInstructionApplyOutcome, ReaderPool,
-    RecordProjectInstructionApplication, RecordProjectInstructionApplicationResult,
+    PendingProposalTargetKind, ProjectInstructionApplyFailureKind, ProjectInstructionApplyOutcome,
+    ReaderPool, RecordProjectInstructionApplication, RecordProjectInstructionApplicationResult,
+    RecordProjectInstructionApplyFailure, RecordProjectInstructionApplyFailureResult,
     RejectAutoImproveProposal, ScopeResolutionError, StageAutoImproveRun,
     StageProjectInstructionProposal, StoreError, WriterHandle, create_explicit_scope,
     f32_vec_to_bytes, lookup_existing_scope, project_instruction_token_delta,
@@ -389,6 +391,15 @@ struct PendingApplyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PendingApplyFailureRequest {
+    expected_approval_sha256: String,
+    kind: ProjectInstructionApplyFailureKind,
+    code: String,
+    reason: String,
+    repair: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectInstructionProposalRequest {
     workspace: String,
     project: String,
@@ -569,6 +580,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/admin/pending-writes/{id}/apply",
             post(handle_pending_write_apply),
+        )
+        .route(
+            "/admin/pending-writes/{id}/apply-failure",
+            post(handle_pending_write_apply_failure),
         )
         .route(
             "/admin/pending-writes/{id}/reject",
@@ -3260,6 +3275,99 @@ async fn handle_pending_write_apply(
         object.insert("idempotent".into(), serde_json::json!(idempotent));
     }
     (StatusCode::OK, Json(response))
+}
+
+async fn handle_pending_write_apply_failure(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    author_ext: Option<axum::Extension<engram_core::UserId>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+    Json(body): Json<PendingApplyFailureRequest>,
+) -> impl IntoResponse {
+    let (ws, proj, detail) = match pending_detail(&state, &id, &query).await {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
+    if detail.summary.target_kind != PendingProposalTargetKind::ProjectInstruction {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "unsupported_target_kind",
+                "error": "Wiki proposals cannot record local instruction apply failures"
+            })),
+        );
+    }
+    let expected_approval_sha256 = match hex_to_sha256(&body.expected_approval_sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid expected_approval_sha256: {error}")
+                })),
+            );
+        }
+    };
+    if body.code.is_empty()
+        || body.code.len() > 64
+        || !body
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        || body.reason.trim().is_empty()
+        || body.reason.len() > 1024
+        || body.repair.trim().is_empty()
+        || body.repair.len() > 1024
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "code must be lowercase snake_case (64 bytes max); reason and repair must be non-empty (1024 bytes max each)"
+            })),
+        );
+    }
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(engram_core::ActorContext::anonymous);
+    let result = state
+        .writer
+        .record_project_instruction_apply_failure(RecordProjectInstructionApplyFailure {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id: detail.summary.id,
+            expected_approval_sha256,
+            kind: body.kind,
+            code: body.code,
+            reason: body.reason,
+            repair: body.repair,
+            actor,
+            author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await;
+    match result {
+        Ok(RecordProjectInstructionApplyFailureResult::Recorded) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "proposal_id": id,
+                "status": body.kind.status().as_str(),
+                "idempotent": false,
+            })),
+        ),
+        Ok(RecordProjectInstructionApplyFailureResult::AlreadyRecorded) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "proposal_id": id,
+                "status": body.kind.status().as_str(),
+                "idempotent": true,
+            })),
+        ),
+        Err(StoreError::InvalidState(message)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "status": "conflict", "error": message })),
+        ),
+        Err(error) => internal_err(error.to_string()),
+    }
 }
 
 async fn handle_pending_write_reject(
@@ -7743,6 +7851,17 @@ mod tests {
                     "before_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
                     "after_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
                     "outcome": "no_op"
+                }),
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/apply-failure?workspace=default&project=scratch",
+                serde_json::json!({
+                    "expected_approval_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "kind": "conflict",
+                    "code": "target_changed",
+                    "reason": "target changed",
+                    "repair": "restage and reapprove"
                 }),
             ),
             (

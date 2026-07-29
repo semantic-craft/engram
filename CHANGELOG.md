@@ -58,18 +58,34 @@ below start from the fork.
   tool or repository-writing surface is added.
 - `engram instructions apply <proposal-id>` is the first local-only mutation
   path for an approved project-instruction proposal. The CLI re-resolves the
-  canonical repository target, verifies the staging checkout's hashed identity,
+  canonical repository target, verifies the staging checkout and target's hashed identity,
   recomputes the approval binding, checks the approved boundary and base
   SHA-256 on the final read, preserves Engram's routing block, and writes
-  through a sibling tempfile plus atomic rename. Single-target apply accepts
+  through a sibling tempfile plus a no-clobber handoff. Single-target apply accepts
   add/update/stale-delete/no-change but rejects move proposals until their
   destination mutation exists.
-  Changed files receive a timestamped recovery backup; no-change and repeated
-  applies are idempotent, and a retry can finish a missing audit record when
-  the target already matches and an exact base backup proves the prior update.
+  Changed files move into an unpredictable private sibling recovery directory;
+  no-change and repeated applies are idempotent, and a retry can finish a
+  missing audit record only when an HMAC-authenticated, proposal-bound local
+  receipt and its exact base backup prove the prior update.
   The single writer actor records proposing,
   approving, and applying actors, approval/before/after hashes, outcome, and
   backup path without granting the server or MCP any repository write access.
+- Local project-instruction apply now fails closed across target concurrency,
+  relevant dirty Git state, active merge/rebase-like operations, every malformed
+  or overlapping routing/approved-rules marker shape, ambiguous anchors,
+  managed Skill targets, unresolved/cyclic/external imports, unsafe symlinks or
+  escaped paths, unsupported encodings/newlines, and write races. Safe
+  in-repository adapters resolve to one canonical write and cannot be retargeted
+  after approval; successful updates use exclusive recovery paths and
+  preserve unowned bytes, permissions, newline style, and the Git index.
+  Rejected attempts atomically become typed `conflict` or `failed` audit events
+  with stable repair diagnostics and never use force/merge/rebase/staging
+  fallbacks or record a false application. Routing refreshes now enforce the
+  same disjoint marker structure and preserve approved-rules bytes.
+  The local receipt path is exclusively reserved before mutation; receipt
+  finalization failure restores the approved base with the same no-clobber
+  protocol and retains recovery artifacts.
 
 ## 2.0.0 - 2026-07-19
 

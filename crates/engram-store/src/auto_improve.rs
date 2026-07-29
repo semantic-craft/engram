@@ -639,6 +639,62 @@ pub enum RecordProjectInstructionApplicationResult {
     },
 }
 
+/// Terminal classification for a local apply attempt that did not mutate the
+/// repository or complete an application record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectInstructionApplyFailureKind {
+    /// The checkout or approved base changed and must be reviewed again.
+    Conflict,
+    /// A malformed or unsupported safety condition requires manual repair.
+    Failed,
+}
+
+impl ProjectInstructionApplyFailureKind {
+    /// Terminal proposal status and event name for this classification.
+    #[must_use]
+    pub const fn status(self) -> AutoImproveProposalStatus {
+        match self {
+            Self::Conflict => AutoImproveProposalStatus::Conflict,
+            Self::Failed => AutoImproveProposalStatus::Failed,
+        }
+    }
+}
+
+/// Record one fail-closed local apply result for an approved instruction.
+#[derive(Debug, Clone)]
+pub struct RecordProjectInstructionApplyFailure {
+    /// Owning workspace (exact scope check).
+    pub workspace_id: WorkspaceId,
+    /// Owning project (exact scope check).
+    pub project_id: ProjectId,
+    /// Approved proposal whose local attempt failed closed.
+    pub proposal_id: AutoImproveProposalId,
+    /// Approval binding loaded by the local host.
+    pub expected_approval_sha256: [u8; 32],
+    /// Conflict versus non-conflict failure classification.
+    pub kind: ProjectInstructionApplyFailureKind,
+    /// Stable machine-readable diagnostic code.
+    pub code: String,
+    /// Accurate operator-facing failure reason without repository content.
+    pub reason: String,
+    /// Manual repair guidance; local apply never attempts a fallback.
+    pub repair: String,
+    /// Local actor that attempted the apply.
+    pub actor: ActorContext,
+    /// Stable applying user id when authenticated.
+    pub author_id: Option<UserId>,
+}
+
+/// Whether a failure audit was newly recorded or was already terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordProjectInstructionApplyFailureResult {
+    /// The terminal status and audit event were newly recorded.
+    Recorded,
+    /// The proposal already had the same terminal status.
+    AlreadyRecorded,
+}
+
 /// One append-only status-history entry for a proposal.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalEvent {
@@ -646,7 +702,7 @@ pub struct AutoImproveProposalEvent {
     pub id: i64,
     /// Proposal this event belongs to.
     pub proposal_id: AutoImproveProposalId,
-    /// Event name: `staged`, `approved`, `rejected`, `failed`, or `conflict`.
+    /// Event name: `staged`, `approved`, `rejected`, `failed`, `conflict`, or `applied`.
     pub event: String,
     /// Actor context (JSON) that caused the event.
     pub actor_json: serde_json::Value,
@@ -2018,6 +2074,132 @@ pub fn record_project_instruction_application(
         applied_at: now,
     };
     Ok(RecordProjectInstructionApplicationResult::Recorded { application })
+}
+
+/// Transition an approved project-instruction proposal to a typed terminal
+/// conflict/failure and append exactly one diagnostic audit event. This never
+/// records an application and refuses to alter a proposal that already has one.
+pub fn record_project_instruction_apply_failure(
+    conn: &mut Connection,
+    input: &RecordProjectInstructionApplyFailure,
+) -> StoreResult<RecordProjectInstructionApplyFailureResult> {
+    if input.code.is_empty()
+        || input.code.len() > 64
+        || !input
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        || input.reason.trim().is_empty()
+        || input.reason.len() > 1024
+        || input.repair.trim().is_empty()
+        || input.repair.len() > 1024
+    {
+        return Err(StoreError::InvalidState(
+            "local apply failure requires bounded snake-case code, reason, and repair guidance"
+                .into(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    let proposal = tx
+        .query_row(
+            "SELECT status, target_kind, approval_sha256, \
+                    EXISTS(SELECT 1 FROM project_instruction_applications a \
+                           WHERE a.proposal_id = p.id) \
+             FROM auto_improve_proposals p \
+             WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
+            params![
+                input.proposal_id.as_bytes(),
+                input.workspace_id.as_bytes(),
+                input.project_id.as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, target_kind, approval_sha256, has_application)) = proposal else {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposal not found in scope".into(),
+        ));
+    };
+    if target_kind != PendingProposalTargetKind::ProjectInstruction.as_str() {
+        return Err(StoreError::InvalidState(
+            "Wiki proposals cannot record local instruction apply failures".into(),
+        ));
+    }
+    if has_application {
+        return Err(StoreError::InvalidState(
+            "an applied project-instruction proposal cannot be marked failed".into(),
+        ));
+    }
+    let approval_sha256 = approval_sha256.map(bytes32).transpose()?.ok_or_else(|| {
+        StoreError::InvalidState("project-instruction proposal has no approval binding".into())
+    })?;
+    if approval_sha256 != input.expected_approval_sha256 {
+        return Err(StoreError::InvalidState(
+            "stale project-instruction review hash".into(),
+        ));
+    }
+    let terminal_status = input.kind.status();
+    if status == terminal_status.as_str() {
+        return Ok(RecordProjectInstructionApplyFailureResult::AlreadyRecorded);
+    }
+    if status != AutoImproveProposalStatus::Approved.as_str() {
+        return Err(StoreError::InvalidState(format!(
+            "project-instruction proposal is not apply-ready: {status}"
+        )));
+    }
+
+    let actor_json = serde_json::to_string(&input.actor)?;
+    let now = Timestamp::now().as_microsecond();
+    let decision_reason = format!("{}: {}", input.code, input.reason);
+    let changed = tx.execute(
+        "UPDATE auto_improve_proposals \
+         SET status = ?1, decided_at = ?2, decision_reason = ?3, \
+             decided_by_author_id = ?4, decided_by_actor_json = ?5 \
+         WHERE id = ?6 AND workspace_id = ?7 AND project_id = ?8 \
+           AND status = 'approved' AND target_kind = 'project_instruction' \
+           AND approval_sha256 = ?9 \
+           AND NOT EXISTS (SELECT 1 FROM project_instruction_applications a \
+                           WHERE a.proposal_id = auto_improve_proposals.id)",
+        params![
+            terminal_status.as_str(),
+            now,
+            decision_reason,
+            input.author_id.map(|id| id.as_bytes().to_vec()),
+            actor_json,
+            input.proposal_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            approval_sha256.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(
+            "project-instruction apply failure raced another terminal decision".into(),
+        ));
+    }
+    insert_event_in_tx(
+        &tx,
+        input.proposal_id,
+        terminal_status.as_str(),
+        &input.actor,
+        input.author_id,
+        &serde_json::json!({
+            "approval_sha256": hex_bytes(&approval_sha256),
+            "code": input.code,
+            "reason": input.reason,
+            "repair": input.repair,
+        }),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(RecordProjectInstructionApplyFailureResult::Recorded)
 }
 
 /// Mark a pending proposal `failed`, record the rejection fingerprint, and
