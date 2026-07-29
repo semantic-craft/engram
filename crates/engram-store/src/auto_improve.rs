@@ -366,6 +366,8 @@ pub struct AutoImproveProposalDetail {
     pub review_revision: Option<i64>,
     /// Append-only wording revisions for project-instruction proposals.
     pub revisions: Vec<ProjectInstructionProposalRevision>,
+    /// Immutable local apply record, once this instruction proposal was applied.
+    pub application: Option<ProjectInstructionApplication>,
     /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
 }
@@ -520,6 +522,112 @@ pub enum ApproveProjectInstructionProposalResult {
     Conflict {
         /// Stable operator-facing reason.
         reason: String,
+    },
+}
+
+/// Filesystem result reported by the local project-instruction apply path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectInstructionApplyOutcome {
+    /// The canonical instruction file did not exist and was created.
+    Created,
+    /// The existing canonical instruction file changed and was backed up.
+    Updated,
+    /// The approved content already matched; no write or backup occurred.
+    NoOp,
+}
+
+impl ProjectInstructionApplyOutcome {
+    /// Stable spelling stored in SQLite and exposed in JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::NoOp => "no_op",
+        }
+    }
+}
+
+impl FromStr for ProjectInstructionApplyOutcome {
+    type Err = StoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "created" => Ok(Self::Created),
+            "updated" => Ok(Self::Updated),
+            "no_op" => Ok(Self::NoOp),
+            other => Err(StoreError::MalformedRecord(format!(
+                "unknown project-instruction apply outcome: {other}"
+            ))),
+        }
+    }
+}
+
+/// Immutable audit record for one locally-applied project instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectInstructionApplication {
+    /// Proposal whose approved content was applied.
+    pub proposal_id: AutoImproveProposalId,
+    /// Approval binding hash authorized by the human reviewer (lowercase hex).
+    pub approval_sha256: String,
+    /// Canonical target hash immediately before local application (lowercase hex).
+    pub before_sha256: String,
+    /// Canonical target hash after local application (lowercase hex).
+    pub after_sha256: String,
+    /// Whether the local file was created, updated, or already identical.
+    pub outcome: ProjectInstructionApplyOutcome,
+    /// Recoverable local backup path for an update.
+    pub backup_path: Option<String>,
+    /// Actor snapshot retained from proposal staging.
+    pub proposing_actor: ActorContext,
+    /// Actor snapshot retained from human approval.
+    pub approving_actor: ActorContext,
+    /// Actor snapshot supplied by the local applying host.
+    pub applying_actor: ActorContext,
+    /// Stable applying user id when authenticated.
+    pub applied_by_author_id: Option<UserId>,
+    /// Application time (Unix microseconds).
+    pub applied_at: i64,
+}
+
+/// Record the result of a completed local project-instruction application.
+#[derive(Debug, Clone)]
+pub struct RecordProjectInstructionApplication {
+    /// Owning workspace (exact scope check).
+    pub workspace_id: WorkspaceId,
+    /// Owning project (exact scope check).
+    pub project_id: ProjectId,
+    /// Approved project-instruction proposal that was applied.
+    pub proposal_id: AutoImproveProposalId,
+    /// Approval hash loaded and applied by the local host.
+    pub expected_approval_sha256: [u8; 32],
+    /// Canonical target hash immediately before local application.
+    pub before_sha256: [u8; 32],
+    /// Canonical target hash after local application.
+    pub after_sha256: [u8; 32],
+    /// Filesystem result observed by the local host.
+    pub outcome: ProjectInstructionApplyOutcome,
+    /// Recoverable backup path; required only for updates.
+    pub backup_path: Option<String>,
+    /// Local actor that applied the approved content.
+    pub actor: ActorContext,
+    /// Stable applying user id when authenticated.
+    pub author_id: Option<UserId>,
+}
+
+/// Result of atomically recording one local instruction application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordProjectInstructionApplicationResult {
+    /// A new immutable application and its single audit event were recorded.
+    Recorded {
+        /// Newly persisted application.
+        application: ProjectInstructionApplication,
+    },
+    /// This proposal already had an application; the existing record is returned.
+    AlreadyRecorded {
+        /// Previously persisted application.
+        application: ProjectInstructionApplication,
     },
 }
 
@@ -1648,6 +1756,209 @@ pub fn approve_project_instruction_proposal(
     Ok(ApproveProjectInstructionProposalResult::Approved { approval_sha256 })
 }
 
+/// Record the result of applying one approved project-instruction proposal on
+/// the local host. This transaction does not mutate repository files or the
+/// proposal lifecycle status: it atomically inserts the immutable application
+/// snapshot and exactly one `applied` audit event.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when the proposal is missing from the
+/// exact scope, is not an approved project-instruction proposal, its approval
+/// or content hashes do not match, or the filesystem outcome is inconsistent.
+pub fn record_project_instruction_application(
+    conn: &mut Connection,
+    input: &RecordProjectInstructionApplication,
+) -> StoreResult<RecordProjectInstructionApplicationResult> {
+    let tx = conn.transaction()?;
+    let proposal = tx
+        .query_row(
+            "SELECT p.status, p.target_kind, p.approval_sha256, p.base_sha256, \
+                    p.body_markdown, p.base_content, r.proposal_actor_json, \
+                    p.decided_by_actor_json \
+             FROM auto_improve_proposals p \
+             JOIN auto_improve_runs r ON r.id = p.run_id \
+             WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
+            params![
+                input.proposal_id.as_bytes(),
+                input.workspace_id.as_bytes(),
+                input.project_id.as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        status,
+        target_kind,
+        approval_sha256,
+        base_sha256,
+        proposed_content,
+        base_content,
+        proposing_actor_json,
+        approving_actor_json,
+    )) = proposal
+    else {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposal not found in scope".into(),
+        ));
+    };
+    if target_kind != PendingProposalTargetKind::ProjectInstruction.as_str() {
+        return Err(StoreError::InvalidState(
+            "Wiki proposals cannot use the local instruction apply path".into(),
+        ));
+    }
+    if status != AutoImproveProposalStatus::Approved.as_str() {
+        return Err(StoreError::InvalidState(format!(
+            "project-instruction proposal is not apply-ready: {status}"
+        )));
+    }
+    let approval_sha256 = approval_sha256.map(bytes32).transpose()?.ok_or_else(|| {
+        StoreError::InvalidState("project-instruction proposal predates approval metadata".into())
+    })?;
+    if approval_sha256 != input.expected_approval_sha256 {
+        return Err(StoreError::InvalidState(
+            "stale project-instruction review hash".into(),
+        ));
+    }
+
+    if let Some(application) = tx
+        .query_row(
+            "SELECT proposal_id, approval_sha256, before_sha256, after_sha256, outcome, \
+                    backup_path, proposing_actor_json, approving_actor_json, \
+                    applying_actor_json, applied_by_author_id, applied_at \
+             FROM project_instruction_applications WHERE proposal_id = ?1",
+            params![input.proposal_id.as_bytes()],
+            project_instruction_application_from_row,
+        )
+        .optional()?
+    {
+        let matches_existing = application.approval_sha256 == hex_bytes(&approval_sha256)
+            && application.before_sha256 == hex_bytes(&input.before_sha256)
+            && application.after_sha256 == hex_bytes(&input.after_sha256)
+            && application.outcome == input.outcome
+            && application.backup_path == input.backup_path;
+        if !matches_existing {
+            return Err(StoreError::InvalidState(
+                "project-instruction proposal already has a different application record".into(),
+            ));
+        }
+        return Ok(RecordProjectInstructionApplicationResult::AlreadyRecorded { application });
+    }
+
+    let base_sha256 = base_sha256.map(bytes32).transpose()?.ok_or_else(|| {
+        StoreError::InvalidState("project-instruction proposal predates base hash metadata".into())
+    })?;
+    if input.before_sha256 != base_sha256 {
+        return Err(StoreError::InvalidState(
+            "project-instruction target no longer matches the approved base".into(),
+        ));
+    }
+    if input.after_sha256 != sha256(proposed_content.as_bytes()) {
+        return Err(StoreError::InvalidState(
+            "project-instruction applied content does not match the approved proposal".into(),
+        ));
+    }
+    match input.outcome {
+        ProjectInstructionApplyOutcome::Created => {
+            if base_content.as_deref() != Some("")
+                || input.before_sha256 != sha256(b"")
+                || input.before_sha256 == input.after_sha256
+                || input.backup_path.is_some()
+            {
+                return Err(StoreError::InvalidState(
+                    "created application requires an empty base, changed content, and no backup"
+                        .into(),
+                ));
+            }
+        }
+        ProjectInstructionApplyOutcome::Updated => {
+            if input.before_sha256 == input.after_sha256
+                || input.backup_path.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(StoreError::InvalidState(
+                    "updated application requires changed content and a backup path".into(),
+                ));
+            }
+        }
+        ProjectInstructionApplyOutcome::NoOp => {
+            if input.before_sha256 != input.after_sha256 || input.backup_path.is_some() {
+                return Err(StoreError::InvalidState(
+                    "no-op application requires identical hashes and no backup".into(),
+                ));
+            }
+        }
+    }
+
+    let proposing_actor: ActorContext = serde_json::from_str(&proposing_actor_json)?;
+    let approving_actor_json = approving_actor_json.ok_or_else(|| {
+        StoreError::InvalidState("approved project-instruction proposal has no approver".into())
+    })?;
+    let approving_actor: ActorContext = serde_json::from_str(&approving_actor_json)?;
+    let applying_actor_json = serde_json::to_string(&input.actor)?;
+    let now = Timestamp::now().as_microsecond();
+    tx.execute(
+        "INSERT INTO project_instruction_applications \
+         (proposal_id, approval_sha256, before_sha256, after_sha256, outcome, backup_path, \
+          proposing_actor_json, approving_actor_json, applying_actor_json, \
+          applied_by_author_id, applied_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            input.proposal_id.as_bytes(),
+            approval_sha256.as_slice(),
+            input.before_sha256.as_slice(),
+            input.after_sha256.as_slice(),
+            input.outcome.as_str(),
+            input.backup_path.as_deref(),
+            proposing_actor_json,
+            approving_actor_json,
+            applying_actor_json,
+            input.author_id.map(|id| id.as_bytes().to_vec()),
+            now,
+        ],
+    )?;
+    insert_event_in_tx(
+        &tx,
+        input.proposal_id,
+        "applied",
+        &input.actor,
+        input.author_id,
+        &serde_json::json!({
+            "approval_sha256": hex_bytes(&approval_sha256),
+            "before_sha256": hex_bytes(&input.before_sha256),
+            "after_sha256": hex_bytes(&input.after_sha256),
+            "outcome": input.outcome.as_str(),
+            "backup_path": input.backup_path,
+        }),
+        now,
+    )?;
+    tx.commit()?;
+
+    let application = ProjectInstructionApplication {
+        proposal_id: input.proposal_id,
+        approval_sha256: hex_bytes(&approval_sha256),
+        before_sha256: hex_bytes(&input.before_sha256),
+        after_sha256: hex_bytes(&input.after_sha256),
+        outcome: input.outcome,
+        backup_path: input.backup_path.clone(),
+        proposing_actor,
+        approving_actor,
+        applying_actor: input.actor.clone(),
+        applied_by_author_id: input.author_id,
+        applied_at: now,
+    };
+    Ok(RecordProjectInstructionApplicationResult::Recorded { application })
+}
+
 /// Mark a pending proposal `failed`, record the rejection fingerprint, and
 /// append a `failed` event.
 ///
@@ -2198,6 +2509,39 @@ fn hex_bytes(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+pub(crate) fn project_instruction_application_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<ProjectInstructionApplication> {
+    let proposal_id =
+        AutoImproveProposalId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(to_sql_err)?;
+    let approval_sha256 = bytes32(row.get(1)?).map_err(to_sql_err)?;
+    let before_sha256 = bytes32(row.get(2)?).map_err(to_sql_err)?;
+    let after_sha256 = bytes32(row.get(3)?).map_err(to_sql_err)?;
+    let outcome =
+        ProjectInstructionApplyOutcome::from_str(&row.get::<_, String>(4)?).map_err(to_sql_err)?;
+    let proposing_actor = serde_json::from_str(&row.get::<_, String>(6)?).map_err(to_sql_err)?;
+    let approving_actor = serde_json::from_str(&row.get::<_, String>(7)?).map_err(to_sql_err)?;
+    let applying_actor = serde_json::from_str(&row.get::<_, String>(8)?).map_err(to_sql_err)?;
+    let applied_by_author_id = row
+        .get::<_, Option<Vec<u8>>>(9)?
+        .map(|bytes| UserId::from_slice(&bytes))
+        .transpose()
+        .map_err(to_sql_err)?;
+    Ok(ProjectInstructionApplication {
+        proposal_id,
+        approval_sha256: hex_bytes(&approval_sha256),
+        before_sha256: hex_bytes(&before_sha256),
+        after_sha256: hex_bytes(&after_sha256),
+        outcome,
+        backup_path: row.get(5)?,
+        proposing_actor,
+        approving_actor,
+        applying_actor,
+        applied_by_author_id,
+        applied_at: row.get(10)?,
+    })
 }
 
 pub(crate) fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<AutoImproveProposalSummary> {

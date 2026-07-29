@@ -22,6 +22,21 @@ struct ProposalSummary {
     kind: String,
     title: String,
     confidence: f64,
+    proposing_actor: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProjectInstructionApplication {
+    approval_sha256: String,
+    before_sha256: String,
+    after_sha256: String,
+    outcome: String,
+    backup_path: Option<String>,
+    proposing_actor: serde_json::Value,
+    approving_actor: serde_json::Value,
+    applying_actor: serde_json::Value,
+    applied_by_author_id: Option<String>,
+    applied_at: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +55,8 @@ struct ProposalDetail {
     review_revision: Option<i64>,
     revisions: Vec<serde_json::Value>,
     events: Vec<serde_json::Value>,
+    #[serde(default)]
+    application: Option<ProjectInstructionApplication>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

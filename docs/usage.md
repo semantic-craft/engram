@@ -152,7 +152,7 @@ must name a readable file. This declaration affects doctor classification
 only; it does not change Claude Code or Codex loading behavior and does not
 change `install-instructions` output.
 
-## Stage project instruction proposals
+## Stage and apply project instruction proposals
 
 `engram instructions propose` turns exactly one explicit evidence source into a
 pending `project_instruction` record:
@@ -244,6 +244,8 @@ engram pending-writes edit <proposal-id> \
   --workspace default --project my-project
 engram pending-writes approve <proposal-id> \
   --workspace default --project my-project
+engram instructions apply <proposal-id> \
+  --workspace default --project my-project
 engram pending-writes reject <proposal-id> --reason "not a project invariant" \
   --workspace default --project my-project
 ```
@@ -258,11 +260,26 @@ only the proposal state to `approved`/apply-ready with a separate deciding
 actor. It does not apply the instruction. Repeated identical edits and
 approvals are idempotent and do not duplicate audit events.
 
+`instructions apply` must run from the repository that owns the target. It
+accepts only an approved `project_instruction` revision, reruns the instruction
+doctor to resolve the repository root and logical target, recomputes the
+approval binding, and verifies the stored base SHA-256 and approved ownership
+boundary on the atomic writer's final read. The normal
+`<!-- engram:start -->` / `<!-- engram:end -->` routing block must remain
+byte-identical. A changed existing file is copied to a sibling
+`<target>.bak-<timestamp>` before tempfile sync and atomic rename; the command
+prints that exact path and records it with the before/after hashes and all three
+actors. To recover, copy the reported backup over the target after inspecting
+both files. No-op and repeated applies create no backup, and the command never
+runs Git stage, commit, or push.
+
 Existing `wiki_page` proposals continue to use their current sidecar and Wiki
 approval path. Conversely, provider availability, the background scheduler,
 `[auto_improve] require_approval`, and Wiki auto-approval behavior cannot
 approve or apply a `project_instruction`; only the explicit human review route
-can mark it apply-ready. Local application remains a separate phase.
+can mark it apply-ready. Application remains an explicit local CLI action; the
+admin server only records its hashes, outcome, actor, and recovery path and
+never receives target content or a repository path to mutate.
 Semantic assistance is available only through the explicit CLI/admin proposal
 path. No repository-writing MCP tool is added, and scheduled learning review
 has no repository access: it can at most stage pending data through the same

@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use engram_core::{MARKER_END, MARKER_START};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_engram")
@@ -204,6 +206,13 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut out = BTreeMap::new();
     visit(root, root, &mut out);
     out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[test]
@@ -816,4 +825,336 @@ fn reviewer_edits_and_approves_instruction_without_applying_target_changes() {
     );
     assert_eq!(snapshot(repository.path()), repository_before);
     assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
+}
+
+#[test]
+fn approved_instruction_applies_locally_once_with_cas_backup_and_audit() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let original = format!(
+        "# Rules\n\nKeep this human-owned preface.\n\n{MARKER_START}\nmanaged routing stays byte-identical\n{MARKER_END}\n\nKeep this human-owned tail.\n"
+    );
+    let target = repository.path().join("AGENTS.md");
+    fs::write(&target, &original).unwrap();
+    Command::new("git")
+        .args(["add", "AGENTS.md"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let git_index_before = fs::read(repository.path().join(".git/index")).unwrap();
+
+    let project = "instruction-local-apply";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let doctor = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &["instructions", "doctor", "--json"],
+    ));
+    assert_eq!(doctor["canonical"]["path"], "AGENTS.md");
+
+    let rule_body = "# Local apply\n\nKeep SQLite writes behind the single writer actor.";
+    let wrote = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            "_rules/local-apply.md",
+            "--kind",
+            "rule",
+            "--body",
+            rule_body,
+        ],
+    );
+    assert!(wrote.status.success());
+    let wiki_before = snapshot(&data.path().join("wiki"));
+
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/local-apply.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap().to_owned();
+    let approved = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "approve",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(approved["apply_ready"], true);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let expected = format!("{original}\nKeep SQLite writes behind the single writer actor.\n");
+    let applied = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["proposal_id"], proposal_id);
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["outcome"], "updated");
+    assert_eq!(applied["idempotent"], false);
+    assert_eq!(applied["before_sha256"], sha256_hex(original.as_bytes()));
+    assert_eq!(applied["after_sha256"], sha256_hex(expected.as_bytes()));
+    let backup = PathBuf::from(applied["backup_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    assert_eq!(fs::read_to_string(&target).unwrap(), expected);
+    assert_eq!(
+        fs::read(repository.path().join(".git/index")).unwrap(),
+        git_index_before
+    );
+    assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
+
+    let after_first = snapshot(repository.path());
+    let repeated = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(repeated["status"], "applied");
+    assert_eq!(repeated["idempotent"], true);
+    assert_eq!(snapshot(repository.path()), after_first);
+
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            &proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert_eq!(detail["summary"]["status"], "approved");
+    assert!(detail["summary"]["proposing_actor"].is_object());
+    let application = &detail["application"];
+    assert!(application["proposing_actor"].is_object());
+    assert!(application["approving_actor"].is_object());
+    assert!(application["applying_actor"].is_object());
+    assert_eq!(
+        application["before_sha256"],
+        sha256_hex(original.as_bytes())
+    );
+    assert_eq!(application["after_sha256"], sha256_hex(expected.as_bytes()));
+    assert_eq!(application["outcome"], "updated");
+    assert_eq!(
+        application["backup_path"],
+        backup.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "applied")
+            .count(),
+        1,
+        "idempotent retry must not duplicate terminal apply audit events"
+    );
+}
+
+#[test]
+fn instruction_apply_rejects_unapproved_and_base_mismatch_without_writing() {
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    let target = repository.path().join("AGENTS.md");
+    let original = "# Rules\n";
+    fs::write(&target, original).unwrap();
+
+    let project = "instruction-local-apply-cas";
+    let addr = reserve_addr();
+    let server = Server::start(data.path(), project, &addr);
+    let wrote = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "write-page",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--path",
+            "_rules/local-apply-cas.md",
+            "--kind",
+            "rule",
+            "--body",
+            "# CAS\n\nKeep the approved base hash stable.",
+        ],
+    );
+    assert!(wrote.status.success());
+    let wiki_before = snapshot(&data.path().join("wiki"));
+    let proposal = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "propose",
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--rule",
+            "_rules/local-apply-cas.md",
+            "--target",
+            "AGENTS.md",
+            "--json",
+        ],
+    ));
+    let proposal_id = proposal["proposal_id"].as_str().unwrap();
+    let repository_before = snapshot(repository.path());
+
+    let pending_apply = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!pending_apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&pending_apply.stderr).contains("only approved"),
+        "{}",
+        String::from_utf8_lossy(&pending_apply.stderr)
+    );
+    assert_eq!(snapshot(repository.path()), repository_before);
+
+    let approved = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "approve",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+        ],
+    );
+    assert!(approved.status.success());
+    fs::write(&target, "# Rules\n\nconcurrent local change\n").unwrap();
+    let mismatched_before = snapshot(repository.path());
+
+    let mismatched_apply = run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "instructions",
+            "apply",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    );
+    assert!(!mismatched_apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatched_apply.stderr)
+            .contains("changed after proposal staging"),
+        "{}",
+        String::from_utf8_lossy(&mismatched_apply.stderr)
+    );
+    assert_eq!(snapshot(repository.path()), mismatched_before);
+    assert_eq!(snapshot(&data.path().join("wiki")), wiki_before);
+
+    let detail = json_success(run(
+        repository.path(),
+        data.path(),
+        &server.url,
+        &[
+            "pending-writes",
+            "show",
+            proposal_id,
+            "--workspace",
+            "default",
+            "--project",
+            project,
+            "--json",
+        ],
+    ));
+    assert!(detail["application"].is_null());
+    assert!(
+        !detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "applied")
+    );
 }
