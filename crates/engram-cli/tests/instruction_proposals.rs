@@ -1,13 +1,13 @@
 //! Black-box acceptance tests for instruction proposal and human-review stewardship.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,11 +19,23 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_engram")
 }
 
+static RESERVED_ADDRS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn reserve_listener() -> (TcpListener, String) {
+    let reserved = RESERVED_ADDRS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        if reserved.lock().unwrap().insert(addr.clone()) {
+            return (listener, addr);
+        }
+    }
+}
+
 fn reserve_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, addr) = reserve_listener();
     drop(listener);
-    addr.to_string()
+    addr
 }
 
 struct Server {
@@ -93,9 +105,8 @@ struct FakeProvider {
 
 impl FakeProvider {
     fn start(structured: Value) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (listener, addr) = reserve_listener();
         listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_calls = Arc::clone(&calls);
