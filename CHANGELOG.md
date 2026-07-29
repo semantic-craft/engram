@@ -108,6 +108,9 @@ below start from the fork.
 
 ### Fixed
 
+- The desktop SvelteKit toolchain now resolves `cookie` 0.7.2 through npm's
+  supported override mechanism, removing the vulnerable transitive 0.6.0
+  release without requiring an unrelated framework major-version upgrade.
 - Local project-instruction apply now compares canonical repository and target
   paths in the same Windows verbatim-path form. A target inside the repository
   is no longer misclassified as escaping it solely because `canonicalize`
