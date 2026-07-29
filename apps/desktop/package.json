@@ -1,6 +1,6 @@
 {
   "name": "engram-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Engram desktop app — browse, search, and curate your agents' long-term memory",
   "type": "module",
   "scripts": {
@@ -10,7 +10,8 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "build:release": "./scripts/build-release.sh"
+    "build:release": "./scripts/build-release.sh",
+    "release:macos": "./scripts/release-macos.sh"
   },
   "license": "MIT",
   "dependencies": {

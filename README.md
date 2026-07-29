@@ -459,10 +459,14 @@ Useful entry points:
   screenshots and e2e tests — lives at
   [djalmajr/engram-ui](https://github.com/djalmajr/engram-ui).
 
-  The early-stage Tauri desktop client lives at
-  [`apps/desktop`](apps/desktop). It is co-located in this repository for
-  unified management, keeps its own Cargo workspace, and talks to the daemon
-  through the same public HTTP/MCP surfaces.
+  The Tauri desktop workbench lives at [`apps/desktop`](apps/desktop). It is
+  co-located in this repository for unified management, keeps its own Cargo
+  workspace, and talks to the daemon through the same public HTTP/MCP surfaces.
+  Signed and notarized macOS releases use independent `desktop-vX.Y.Z` tags so
+  the CLI's `releases/latest` downloads continue to resolve to the native engine
+  archives. The current Apple Silicon build is
+  [`desktop-v0.1.1`](https://github.com/semantic-craft/engram/releases/tag/desktop-v0.1.1)
+  and expects a separately installed, locally running Engram engine.
 
   Richer products such as import/migration pipelines and write-capable
   browser chat/editors should live as optional companion crates or projects
