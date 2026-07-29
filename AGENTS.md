@@ -146,6 +146,22 @@ without disturbing the rest of the file.
   pending proposal storage, approval flows, or prompt routing for learning
   review.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live in GitHub Issues for `semantic-craft/engram`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical engineering-skill triage roles and their repository label
+mapping. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context domain-document layout. See `docs/agents/domain.md`.
+
 ## Project Summary
 
 engram is a self-contained Rust binary providing long-term memory for AI
