@@ -164,17 +164,55 @@ pub struct InstructionsArgs {
     pub command: InstructionsCommand,
 }
 
-/// Read-only project instruction maintenance commands.
+/// Audit and stage project instruction maintenance proposals.
 #[derive(Debug, Subcommand)]
 pub enum InstructionsCommand {
     /// Explain the effective Claude Code and Codex instruction chains.
     Doctor(InstructionsDoctorArgs),
+    /// Stage an evidence-backed project-instruction proposal without applying it.
+    Propose(InstructionsProposeArgs),
 }
 
 /// Arguments for `instructions doctor`.
 #[derive(Debug, Args)]
 pub struct InstructionsDoctorArgs {
     /// Emit the complete machine-readable report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `instructions propose`.
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("evidence_source")
+        .required(true)
+        .multiple(false)
+        .args(["rule", "finding"])
+))]
+pub struct InstructionsProposeArgs {
+    /// Explicit durable Wiki rule path under `_rules/`.
+    #[arg(long)]
+    pub rule: Option<String>,
+    /// Doctor finding code to select from the current repository report.
+    #[arg(long)]
+    pub finding: Option<String>,
+    /// Finding source path used to disambiguate repeated codes.
+    #[arg(long, requires = "finding")]
+    pub source: Option<String>,
+    /// Line inside the finding used to disambiguate repeated codes/sources.
+    #[arg(long, requires = "finding")]
+    pub line: Option<usize>,
+    /// Repository-relative instruction target. Durable rules default to the
+    /// doctor-selected canonical source; findings always target their source.
+    #[arg(long)]
+    pub target: Option<PathBuf>,
+    /// Existing workspace scope.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Existing project scope. Omit to resolve from the current repository.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit the staged proposal identity as JSON.
     #[arg(long)]
     pub json: bool,
 }

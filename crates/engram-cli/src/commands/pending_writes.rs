@@ -14,8 +14,11 @@ use crate::http_client::{ServerEndpoint, get_json, post_json_with_query};
 struct ProposalSummary {
     id: String,
     status: String,
+    target_kind: String,
     operation: String,
     target_path: String,
+    logical_target: String,
+    target_context_layer: String,
     kind: String,
     title: String,
     confidence: f64,
@@ -26,6 +29,13 @@ struct ProposalDetail {
     summary: ProposalSummary,
     rationale: String,
     body_markdown: String,
+    proposed_content: String,
+    base_sha256: Option<String>,
+    boundary_kind: Option<String>,
+    boundary_value: Option<String>,
+    unified_diff: Option<String>,
+    estimated_token_delta: Option<i64>,
+    provenance: serde_json::Value,
     events: Vec<serde_json::Value>,
 }
 
@@ -63,7 +73,10 @@ async fn list(ep: &ServerEndpoint, args: PendingWritesListArgs) -> Result<()> {
         println!("(no pending writes)");
     } else {
         for p in proposals {
-            println!("{}  {}  {}  {}", p.id, p.status, p.operation, p.target_path);
+            println!(
+                "{}  {}  {}  {}  {}",
+                p.id, p.status, p.target_kind, p.operation, p.logical_target
+            );
         }
     }
     Ok(())
@@ -85,11 +98,15 @@ async fn show(ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
     } else {
         println!(
             "{} [{}] {}",
-            detail.summary.target_path, detail.summary.status, detail.summary.title
+            detail.summary.logical_target, detail.summary.status, detail.summary.title
         );
         println!(
-            "\n{}\n\n--- body ---\n{}",
-            detail.rationale, detail.body_markdown
+            "target: {} ({})\noperation: {}\n\n{}\n\n--- proposed content ---\n{}",
+            detail.summary.target_kind,
+            detail.summary.target_context_layer,
+            detail.summary.operation,
+            detail.rationale,
+            detail.proposed_content
         );
     }
     Ok(())

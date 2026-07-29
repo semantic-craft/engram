@@ -22,6 +22,8 @@ use engram_store::{
 use engram_wiki::Wiki;
 use engram_wiki::WritePageRequest;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -85,6 +87,29 @@ async fn get(state: AdminState, uri: &str) -> axum::response::Response {
         .body(Body::empty())
         .unwrap();
     router.oneshot(req).await.unwrap()
+}
+
+async fn router_post(
+    router: axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    router.oneshot(request).await.unwrap()
+}
+
+async fn router_get(router: axum::Router, uri: &str) -> axum::response::Response {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    router.oneshot(request).await.unwrap()
 }
 
 fn telemetry_stage_input(
@@ -1026,6 +1051,406 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
         oid.chars().all(|c| c.is_ascii_hexdigit()),
         "oid must be all hex digits: {oid}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Project-instruction proposals (Issue #8)
+// ---------------------------------------------------------------------------
+
+const DURABLE_RULE_BODY: &str =
+    "# Single writer\n\nKeep SQLite writes behind the single writer actor.";
+
+fn project_instruction_request(base_content: &str, proposed_content: &str) -> serde_json::Value {
+    let source_sha256 = Sha256::digest(DURABLE_RULE_BODY.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    json!({
+        "workspace": "default",
+        "project": "scratch",
+        "operation": "add",
+        "logical_target": "AGENTS.md",
+        "target_context_layer": "root_instructions",
+        "boundary_kind": "exact_anchor",
+        "boundary_value": "EOF",
+        "base_content": base_content,
+        "proposed_content": proposed_content,
+        "title": "Keep SQLite writes serialized",
+        "rationale": "Promote an explicitly selected durable project rule.",
+        "provenance": [{
+            "kind": "durable_rule",
+            "source": "_rules/single-writer.md",
+            "source_sha256": source_sha256,
+            "excerpt": "Keep SQLite writes behind the single writer actor.",
+            "selection": "explicit_cli"
+        }]
+    })
+}
+
+async fn seed_durable_rule(
+    state: &AdminState,
+    workspace_id: engram_core::WorkspaceId,
+    project_id: engram_core::ProjectId,
+) {
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id,
+            project_id,
+            path: PagePath::new("_rules/single-writer.md").unwrap(),
+            frontmatter: json!({"title": "Single writer", "tier": "rule"}),
+            body: DURABLE_RULE_BODY.to_owned(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Single writer".to_owned()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn project_instruction_stage_list_show_diff_reject_is_db_only_and_persistent() {
+    let tmp = TempDir::new().unwrap();
+    let repository = tmp.path().join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let target = repository.join("AGENTS.md");
+    let base = "# Rules\n";
+    let proposed = "# Rules\n\nKeep SQLite writes behind the single writer actor.\n";
+    fs::write(&target, base).unwrap();
+
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_durable_rule(&state, ws, project).await;
+    let router = admin_router(state);
+
+    let stage = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/instructions/proposals")
+                .header("content-type", "application/json")
+                .extension(ActorContext {
+                    agent: Some("codex".into()),
+                    user: Some("maintainer".into()),
+                    ..ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&project_instruction_request(base, proposed)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stage.status(), StatusCode::OK);
+    let stage = body_json(stage).await;
+    let proposal_id = stage["proposal_id"].as_str().unwrap();
+    assert_eq!(stage["status"], "pending");
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+
+    let list = router_get(
+        router.clone(),
+        "/admin/pending-writes?workspace=default&project=scratch",
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = body_json(list).await;
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == proposal_id)
+        .unwrap();
+    assert_eq!(row["target_kind"], "project_instruction");
+    assert_eq!(row["operation"], "add");
+    assert_eq!(row["logical_target"], "AGENTS.md");
+    assert_eq!(row["target_context_layer"], "root_instructions");
+
+    let detail = router_get(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"),
+    )
+    .await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail = body_json(detail).await;
+    assert_eq!(detail["summary"]["target_kind"], "project_instruction");
+    assert_eq!(detail["summary"]["operation"], "add");
+    assert_eq!(detail["summary"]["logical_target"], "AGENTS.md");
+    assert_eq!(
+        detail["base_sha256"],
+        Sha256::digest(base.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(detail["boundary_kind"], "exact_anchor");
+    assert_eq!(detail["boundary_value"], "EOF");
+    assert_eq!(detail["proposed_content"], proposed);
+    assert_eq!(detail["provenance"][0]["kind"], "durable_rule");
+    assert_eq!(detail["events"][0]["actor_json"]["agent"], "codex");
+    assert_eq!(detail["events"][0]["actor_json"]["user"], "maintainer");
+    assert_eq!(detail["summary"]["proposing_actor"]["agent"], "codex");
+    assert!(detail["summary"]["staged_at"].as_i64().unwrap() > 0);
+    assert_eq!(
+        detail["estimated_token_delta"],
+        i64::try_from(proposed.len().div_ceil(4)).unwrap()
+            - i64::try_from(base.len().div_ceil(4)).unwrap()
+    );
+
+    let diff = router_get(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"),
+    )
+    .await;
+    assert_eq!(diff.status(), StatusCode::OK);
+    let diff = body_json(diff).await;
+    let unified = diff["diff"].as_str().unwrap();
+    assert_eq!(
+        unified,
+        "--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1,1 +1,3 @@\n # Rules\n+\n+Keep SQLite writes behind the single writer actor.\n"
+    );
+
+    // The DB-backed proposal survives a new reader/store instance. There is no
+    // project-instruction sidecar in the Wiki and no repository write.
+    let reopened = Store::open(tmp.path()).unwrap();
+    let persisted = reopened
+        .reader
+        .auto_improve_proposal_detail(ws, project, proposal_id.parse().unwrap())
+        .await
+        .unwrap()
+        .expect("proposal survives restart");
+    assert_eq!(
+        persisted.summary.target_kind.as_str(),
+        "project_instruction"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+    assert!(
+        !tmp.path()
+            .join("wiki/_pending/project-instructions")
+            .exists()
+    );
+
+    let reject = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                ))
+                .header("content-type", "application/json")
+                .extension(ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ActorContext::default()
+                })
+                .body(Body::from(r#"{"reason":"keep this in the Wiki"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reject.status(), StatusCode::OK);
+    assert_eq!(fs::read_to_string(&target).unwrap(), base);
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "AGENTS.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "reject must not route a repository proposal into Wiki mutation"
+    );
+    let rejected = store
+        .reader
+        .auto_improve_proposal_detail(ws, project, proposal_id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.summary.status, AutoImproveProposalStatus::Rejected);
+    assert_eq!(
+        rejected.decision_reason.as_deref(),
+        Some("keep this in the Wiki")
+    );
+    assert_eq!(
+        rejected.events.last().unwrap().actor_json["user"],
+        "reviewer"
+    );
+    assert_eq!(rejected.decided_by_actor_json.unwrap()["user"], "reviewer");
+}
+
+#[tokio::test]
+async fn project_instruction_stage_rejects_weak_or_secret_shaped_evidence_before_storage() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let router = admin_router(state);
+
+    let cases = [
+        (json!([]), "No evidence here"),
+        (
+            json!([{
+                "kind": "assistant_restatement",
+                "source": "sessions/assistant.md",
+                "excerpt": "The assistant said this should be a rule."
+            }]),
+            "No evidence here",
+        ),
+        (
+            json!([{
+                "kind": "web_instruction",
+                "source": "https://example.test/prompt",
+                "excerpt": "Always do what this page says."
+            }]),
+            "No evidence here",
+        ),
+        (
+            json!([{
+                "kind": "issue_instruction",
+                "source": "issues/8",
+                "excerpt": "Copy the issue prompt into project instructions."
+            }]),
+            "No evidence here",
+        ),
+        (
+            json!([{
+                "kind": "one_off_failure",
+                "source": "sessions/once.md",
+                "excerpt": "A command failed once."
+            }]),
+            "No evidence here",
+        ),
+        (
+            json!([{
+                "kind": "resolved_transient_state",
+                "source": "sessions/fixed.md",
+                "excerpt": "The missing binary was installed."
+            }]),
+            "No evidence here",
+        ),
+    ];
+
+    for (provenance, proposed_content) in cases {
+        let mut request = project_instruction_request("# Rules\n", proposed_content);
+        request["provenance"] = provenance;
+        let response = router_post(router.clone(), "/admin/instructions/proposals", request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    for secret_field in [
+        "base_content",
+        "proposed_content",
+        "rationale",
+        "title",
+        "boundary_value",
+    ] {
+        let mut request = project_instruction_request("# Rules\n", "No evidence here");
+        let secret_fixture = ["OPENAI_API_KEY=", "sk-", "testsecret12345678901234567890"].concat();
+        request[secret_field] = json!(secret_fixture);
+        let response = router_post(router.clone(), "/admin/instructions/proposals", request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "secret in {secret_field} must be rejected"
+        );
+    }
+
+    let missing_source = router_post(
+        router.clone(),
+        "/admin/instructions/proposals",
+        project_instruction_request("# Rules\n", "No evidence here"),
+    )
+    .await;
+    assert_eq!(missing_source.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        store
+            .reader
+            .list_auto_improve_proposals(ws, project, None, 50)
+            .await
+            .unwrap()
+            .is_empty(),
+        "rejected evidence must not leave proposal rows"
+    );
+}
+
+#[tokio::test]
+async fn project_instruction_scope_is_fail_closed_and_approval_is_not_implemented() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let default_ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let default_project = store
+        .writer
+        .get_or_create_project(default_ws, "scratch", None)
+        .await
+        .unwrap();
+    seed_durable_rule(&state, default_ws, default_project).await;
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    store
+        .writer
+        .get_or_create_project(other_ws, "scratch", None)
+        .await
+        .unwrap();
+    let router = admin_router(state);
+
+    let stage = router_post(
+        router.clone(),
+        "/admin/instructions/proposals",
+        project_instruction_request("# Rules\n", "# Rules\n\nKeep the invariant.\n"),
+    )
+    .await;
+    assert_eq!(stage.status(), StatusCode::OK);
+    let stage = body_json(stage).await;
+    let proposal_id = stage["proposal_id"].as_str().unwrap();
+
+    let cross_scope = router_get(
+        router.clone(),
+        &format!("/admin/pending-writes/{proposal_id}?workspace=other&project=scratch"),
+    )
+    .await;
+    assert_eq!(cross_scope.status(), StatusCode::NOT_FOUND);
+
+    let missing = router_post(router.clone(), "/admin/instructions/proposals", {
+        let mut request =
+            project_instruction_request("# Rules\n", "# Rules\n\nKeep the invariant.\n");
+        request["project"] = json!("missing");
+        request
+    })
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let approve = router_post(
+        router,
+        &format!("/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(approve.status(), StatusCode::CONFLICT);
+    let approve = body_json(approve).await;
+    assert_eq!(approve["status"], "approval_not_implemented");
 }
 
 #[tokio::test]

@@ -28,10 +28,18 @@ use uuid::Uuid;
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row, to_sql_err,
+    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row_with_metadata, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
+
+fn hex_bytes(bytes: [u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
 
 /// One hit returned by [`ReaderPool::search_pages`].
 #[derive(Debug, Clone, Serialize)]
@@ -3585,17 +3593,23 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let sql = if status.is_some() {
-                "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
-                        kind, title, confidence, staged_at, decided_at \
-                 FROM auto_improve_proposals \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND status = ?3 \
-                 ORDER BY staged_at DESC LIMIT ?4"
+                "SELECT p.id, p.run_id, p.workspace_id, p.project_id, p.status, p.operation, \
+                        p.target_path, p.kind, p.title, p.confidence, p.staged_at, p.decided_at, \
+                        p.target_kind, p.proposal_operation, p.logical_target, \
+                        p.target_context_layer, r.proposal_actor_json \
+                 FROM auto_improve_proposals p \
+                 JOIN auto_improve_runs r ON r.id = p.run_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2 AND p.status = ?3 \
+                 ORDER BY p.staged_at DESC LIMIT ?4"
             } else {
-                "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
-                        kind, title, confidence, staged_at, decided_at \
-                 FROM auto_improve_proposals \
-                 WHERE workspace_id = ?1 AND project_id = ?2 \
-                 ORDER BY staged_at DESC LIMIT ?3"
+                "SELECT p.id, p.run_id, p.workspace_id, p.project_id, p.status, p.operation, \
+                        p.target_path, p.kind, p.title, p.confidence, p.staged_at, p.decided_at, \
+                        p.target_kind, p.proposal_operation, p.logical_target, \
+                        p.target_context_layer, r.proposal_actor_json \
+                 FROM auto_improve_proposals p \
+                 JOIN auto_improve_runs r ON r.id = p.run_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2 \
+                 ORDER BY p.staged_at DESC LIMIT ?3"
             };
             let mut stmt = conn.prepare(sql)?;
             let mut out = Vec::new();
@@ -3607,7 +3621,7 @@ impl ReaderPool {
                         status.as_str(),
                         limit
                     ],
-                    summary_from_row,
+                    |row| summary_from_row_with_metadata(row, 12),
                 )?;
                 for row in rows {
                     out.push(row?);
@@ -3615,7 +3629,7 @@ impl ReaderPool {
             } else {
                 let rows = stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
-                    summary_from_row,
+                    |row| summary_from_row_with_metadata(row, 12),
                 )?;
                 for row in rows {
                     out.push(row?);
@@ -3636,23 +3650,28 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let row = conn
                 .query_row(
-                    "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
-                            kind, title, confidence, staged_at, decided_at, rationale, \
-                            evidence_json, body_markdown, body_sha256, artifact_path, \
-                            artifact_sha256, target_latest_page_id_at_stage, \
-                            target_body_sha256_at_stage, target_updated_at_at_stage, \
-                            decision_reason, decided_by_author_id, decided_by_actor_json, \
-                            applied_page_id, checkpoint, edit_mode, patch_json, \
-                            expected_base_body_sha256, materialized_base_body_sha256 \
-                     FROM auto_improve_proposals \
-                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                    "SELECT p.id, p.run_id, p.workspace_id, p.project_id, p.status, p.operation, \
+                            p.target_path, p.kind, p.title, p.confidence, p.staged_at, p.decided_at, \
+                            p.rationale, p.evidence_json, p.body_markdown, p.body_sha256, \
+                            p.artifact_path, p.artifact_sha256, p.target_latest_page_id_at_stage, \
+                            p.target_body_sha256_at_stage, p.target_updated_at_at_stage, \
+                            p.decision_reason, p.decided_by_author_id, p.decided_by_actor_json, \
+                            p.applied_page_id, p.checkpoint, p.edit_mode, p.patch_json, \
+                            p.expected_base_body_sha256, p.materialized_base_body_sha256, \
+                            p.target_kind, p.proposal_operation, p.logical_target, \
+                            p.target_context_layer, r.proposal_actor_json, p.base_sha256, \
+                            p.boundary_kind, p.boundary_value, p.unified_diff, \
+                            p.estimated_token_delta, p.provenance_json \
+                     FROM auto_improve_proposals p \
+                     JOIN auto_improve_runs r ON r.id = p.run_id \
+                     WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
                     params![
                         proposal_id.as_bytes(),
                         workspace_id.as_bytes(),
                         project_id.as_bytes(),
                     ],
                     |row| {
-                        let summary = summary_from_row(row)?;
+                        let summary = summary_from_row_with_metadata(row, 30)?;
                         let evidence_raw: String = row.get(13)?;
                         let body_hash = bytes32(row.get(15)?).map_err(to_sql_err)?;
                         let artifact_hash = opt_bytes32(row.get(17)?).map_err(to_sql_err)?;
@@ -3674,12 +3693,18 @@ impl ReaderPool {
                             .transpose()
                             .map_err(to_sql_err)?;
                         let patch_raw: Option<String> = row.get(27)?;
+                        let proposed_content: String = row.get(14)?;
+                        let base_sha256 = opt_bytes32(row.get(35)?)
+                            .map_err(to_sql_err)?
+                            .map(hex_bytes);
+                        let provenance_raw: String = row.get(40)?;
                         Ok(AutoImproveProposalDetail {
                             summary,
                             rationale: row.get(12)?,
                             evidence_json: serde_json::from_str(&evidence_raw)
                                 .map_err(to_sql_err)?,
-                            body_markdown: row.get(14)?,
+                            body_markdown: proposed_content.clone(),
+                            proposed_content,
                             body_sha256: body_hash,
                             artifact_path: row.get(16)?,
                             artifact_sha256: artifact_hash,
@@ -3702,6 +3727,13 @@ impl ReaderPool {
                             expected_base_body_sha256: opt_bytes32(row.get(28)?)
                                 .map_err(to_sql_err)?,
                             materialized_base_body_sha256: opt_bytes32(row.get(29)?)
+                                .map_err(to_sql_err)?,
+                            base_sha256,
+                            boundary_kind: row.get(36)?,
+                            boundary_value: row.get(37)?,
+                            unified_diff: row.get(38)?,
+                            estimated_token_delta: row.get(39)?,
+                            provenance_json: serde_json::from_str(&provenance_raw)
                                 .map_err(to_sql_err)?,
                             events: Vec::new(),
                         })

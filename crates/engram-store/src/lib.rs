@@ -30,7 +30,9 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+    PendingProposalTargetKind, RejectAutoImproveProposal, StageAutoImproveRun,
+    StageProjectInstructionProposal, StagedAutoImproveRun, StagedProjectInstructionProposal,
+    artifact_path_for,
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
@@ -368,6 +370,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_kind, PendingProposalTargetKind::WikiPage);
+        assert_eq!(pending[0].logical_target, "notes/a.md");
+        assert_eq!(pending[0].target_context_layer, "wiki");
         assert_eq!(pending[0].target_path.as_str(), "notes/a.md");
         let detail = store
             .reader
@@ -377,6 +382,9 @@ mod tests {
             .unwrap();
         assert_eq!(detail.events.len(), 1);
         assert_eq!(detail.edit_mode, "full_page");
+        assert_eq!(detail.proposed_content, "# A");
+        assert!(detail.base_sha256.is_none());
+        assert_eq!(detail.provenance_json, serde_json::json!([]));
         assert!(detail.patch_json.is_none());
         assert!(detail.expected_base_body_sha256.is_none());
         assert_eq!(

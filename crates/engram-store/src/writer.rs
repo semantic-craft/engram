@@ -19,7 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    RejectAutoImproveProposal, StageAutoImproveRun, StageProjectInstructionProposal,
+    StagedAutoImproveRun, StagedProjectInstructionProposal,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{self, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
@@ -205,6 +206,10 @@ pub(crate) enum WriteCmd {
     StageAutoImproveRun {
         input: StageAutoImproveRun,
         reply: oneshot::Sender<StoreResult<StagedAutoImproveRun>>,
+    },
+    StageProjectInstructionProposal {
+        input: StageProjectInstructionProposal,
+        reply: oneshot::Sender<StoreResult<StagedProjectInstructionProposal>>,
     },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
@@ -870,6 +875,17 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Stage one DB-only project-instruction proposal.
+    pub async fn stage_project_instruction_proposal(
+        &self,
+        input: StageProjectInstructionProposal,
+    ) -> StoreResult<StagedProjectInstructionProposal> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StageProjectInstructionProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reject a pending auto-improvement proposal and append an event.
     pub async fn reject_auto_improve_proposal(
         &self,
@@ -1219,6 +1235,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StageAutoImproveRun { input, reply } => {
                 let result = crate::auto_improve::stage_run(&mut conn, &input);
                 send_or_warn(reply, result, "stage_auto_improve_run");
+            }
+            WriteCmd::StageProjectInstructionProposal { input, reply } => {
+                let result =
+                    crate::auto_improve::stage_project_instruction_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "stage_project_instruction_proposal");
             }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);

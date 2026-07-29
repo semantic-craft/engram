@@ -83,23 +83,44 @@ impl FromStr for AutoImproveProposalStatus {
     }
 }
 
-/// What a proposal wants to do to its target page.
+/// What a proposal wants to do to its Wiki or project-instruction target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoImproveProposalOperation {
     /// Create a page that must not exist yet at stage time.
     Create,
+    /// Add new project-instruction content.
+    Add,
     /// Rewrite a page that must already exist at stage time.
     Update,
+    /// Remove instruction content proven stale, generic, or duplicated.
+    StaleDelete,
+    /// Relocate a procedure to an Agent Skill.
+    MoveToSkill,
+    /// Relocate component guidance to path-scoped instructions.
+    MoveToPathRule,
+    /// Relocate evidence or history to the Wiki.
+    MoveToWiki,
+    /// Reinforce a mandatory requirement in a technical control.
+    MoveToEnforcement,
+    /// Record that reviewed content should remain unchanged.
+    NoChange,
 }
 
 impl AutoImproveProposalOperation {
-    /// Snake-case string stored in the `operation` column.
+    /// Stable snake-case spelling stored or exposed for review.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Create => "create",
+            Self::Add => "add",
             Self::Update => "update",
+            Self::StaleDelete => "stale_delete",
+            Self::MoveToSkill => "move_to_skill",
+            Self::MoveToPathRule => "move_to_path_rule",
+            Self::MoveToWiki => "move_to_wiki",
+            Self::MoveToEnforcement => "move_to_enforcement",
+            Self::NoChange => "no_change",
         }
     }
 }
@@ -109,9 +130,51 @@ impl FromStr for AutoImproveProposalOperation {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "create" => Ok(Self::Create),
+            "add" => Ok(Self::Add),
             "update" => Ok(Self::Update),
+            "stale_delete" => Ok(Self::StaleDelete),
+            "move_to_skill" => Ok(Self::MoveToSkill),
+            "move_to_path_rule" => Ok(Self::MoveToPathRule),
+            "move_to_wiki" => Ok(Self::MoveToWiki),
+            "move_to_enforcement" => Ok(Self::MoveToEnforcement),
+            "no_change" => Ok(Self::NoChange),
             other => Err(StoreError::MalformedRecord(format!(
                 "unknown auto-improve proposal operation: {other}"
+            ))),
+        }
+    }
+}
+
+/// Mutation domain a pending proposal targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingProposalTargetKind {
+    /// Existing auto-improvement proposal that mutates one Wiki page.
+    WikiPage,
+    /// Proposal-only project instruction change; never routed to Wiki apply.
+    ProjectInstruction,
+}
+
+impl PendingProposalTargetKind {
+    /// Stable database / structured-output spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WikiPage => "wiki_page",
+            Self::ProjectInstruction => "project_instruction",
+        }
+    }
+}
+
+impl FromStr for PendingProposalTargetKind {
+    type Err = StoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "wiki_page" => Ok(Self::WikiPage),
+            "project_instruction" => Ok(Self::ProjectInstruction),
+            other => Err(StoreError::MalformedRecord(format!(
+                "unknown pending proposal target kind: {other}"
             ))),
         }
     }
@@ -211,10 +274,16 @@ pub struct AutoImproveProposalSummary {
     pub project_id: ProjectId,
     /// Current lifecycle status.
     pub status: AutoImproveProposalStatus,
-    /// Create vs update.
+    /// Wiki page or project instruction target domain.
+    pub target_kind: PendingProposalTargetKind,
+    /// Target-specific create, update, relocation, deletion, or no-change action.
     pub operation: AutoImproveProposalOperation,
     /// Wiki path of the targeted page.
     pub target_path: PagePath,
+    /// Logical target shown to reviewers (same as `target_path` for legacy rows).
+    pub logical_target: String,
+    /// Intended context layer (`wiki`, `root_instructions`, `agent_skill`, ...).
+    pub target_context_layer: String,
     /// Proposal category for telemetry.
     pub kind: String,
     /// Human-readable proposal title.
@@ -225,6 +294,9 @@ pub struct AutoImproveProposalSummary {
     pub staged_at: i64,
     /// Decision time (Unix microseconds), once decided.
     pub decided_at: Option<i64>,
+    /// Actor that staged the proposal, retained separately from the decider.
+    #[serde(rename = "proposing_actor")]
+    pub proposed_by_actor_json: serde_json::Value,
 }
 
 /// Full proposal record: summary plus bodies, stage-time target snapshot,
@@ -239,6 +311,8 @@ pub struct AutoImproveProposalDetail {
     pub evidence_json: serde_json::Value,
     /// Full proposed page body.
     pub body_markdown: String,
+    /// Target-domain-neutral alias for `body_markdown` in structured review UX.
+    pub proposed_content: String,
     /// SHA-256 of `body_markdown`, computed at stage time.
     pub body_sha256: [u8; 32],
     /// `_pending/auto-improve/<id>.md` artifact path for this proposal.
@@ -270,8 +344,65 @@ pub struct AutoImproveProposalDetail {
     pub expected_base_body_sha256: Option<[u8; 32]>,
     /// Base body hash the staged `body_markdown` was materialized from.
     pub materialized_base_body_sha256: Option<[u8; 32]>,
+    /// SHA-256 of repository target content used to construct an instruction proposal.
+    pub base_sha256: Option<String>,
+    /// `exact_anchor` or `owned_region` for project-instruction proposals.
+    pub boundary_kind: Option<String>,
+    /// Stable anchor/region identifier approved for later application.
+    pub boundary_value: Option<String>,
+    /// Stage-time unified diff. Project proposals return this exact stored diff.
+    pub unified_diff: Option<String>,
+    /// Estimated context-token change (`ceil(after/4) - ceil(before/4)`).
+    pub estimated_token_delta: Option<i64>,
+    /// Complete source selection and evidence provenance.
+    #[serde(rename = "provenance")]
+    pub provenance_json: serde_json::Value,
     /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
+}
+
+/// One proposal-only project-instruction change to persist.
+#[derive(Debug, Clone)]
+pub struct StageProjectInstructionProposal {
+    /// Existing workspace scope.
+    pub workspace_id: WorkspaceId,
+    /// Existing project scope.
+    pub project_id: ProjectId,
+    /// Instruction-specific operation (never `create`).
+    pub operation: AutoImproveProposalOperation,
+    /// Repository-relative logical target.
+    pub logical_target: PagePath,
+    /// Destination context layer.
+    pub target_context_layer: String,
+    /// Stage-time SHA-256 of target content.
+    pub base_sha256: [u8; 32],
+    /// `exact_anchor` or `owned_region`.
+    pub boundary_kind: String,
+    /// Exact anchor or owned-region identifier.
+    pub boundary_value: String,
+    /// Complete proposed target content.
+    pub proposed_content: String,
+    /// Exact stage-time unified diff.
+    pub unified_diff: String,
+    /// Estimated context-token delta.
+    pub estimated_token_delta: i64,
+    /// Human-facing proposal title.
+    pub title: String,
+    /// Evidence-backed classification rationale.
+    pub rationale: String,
+    /// Full provenance array.
+    pub provenance_json: serde_json::Value,
+    /// Actor that selected and staged the proposal.
+    pub proposing_actor: ActorContext,
+    /// Stable proposing user id when authenticated.
+    pub proposing_author_id: Option<UserId>,
+}
+
+/// Identity returned after staging one project-instruction proposal.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagedProjectInstructionProposal {
+    /// Persisted proposal id.
+    pub proposal_id: AutoImproveProposalId,
 }
 
 /// One append-only status-history entry for a proposal.
@@ -655,6 +786,11 @@ pub fn stage_run(
                 });
                 continue;
             }
+            _ => {
+                return Err(StoreError::InvalidState(
+                    "Wiki proposals support only create or update operations".into(),
+                ));
+            }
         };
         if edit_mode == "patch" {
             // Patch-shape guards. Like the target guards above these are
@@ -737,6 +873,165 @@ pub fn stage_run(
         skipped,
         proposal_ids,
     })
+}
+
+/// Stage one project-instruction proposal without writing a repository file,
+/// Wiki page, or pending sidecar. The proposal and its initial audit event land
+/// together in one transaction owned by the writer actor.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] for an invalid scope, operation,
+/// boundary, context layer, missing provenance, or an already-pending target.
+pub fn stage_project_instruction_proposal(
+    conn: &mut Connection,
+    input: &StageProjectInstructionProposal,
+) -> StoreResult<StagedProjectInstructionProposal> {
+    if input.operation == AutoImproveProposalOperation::Create {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposals use add, not create".into(),
+        ));
+    }
+    let valid_layer = match input.operation {
+        AutoImproveProposalOperation::Add
+        | AutoImproveProposalOperation::Update
+        | AutoImproveProposalOperation::StaleDelete => matches!(
+            input.target_context_layer.as_str(),
+            "root_instructions" | "path_rules"
+        ),
+        AutoImproveProposalOperation::MoveToSkill => input.target_context_layer == "agent_skill",
+        AutoImproveProposalOperation::MoveToPathRule => input.target_context_layer == "path_rules",
+        AutoImproveProposalOperation::MoveToWiki => input.target_context_layer == "wiki",
+        AutoImproveProposalOperation::MoveToEnforcement => {
+            input.target_context_layer == "enforcement"
+        }
+        AutoImproveProposalOperation::NoChange => input.target_context_layer == "no_change",
+        AutoImproveProposalOperation::Create => false,
+    };
+    if !valid_layer {
+        return Err(StoreError::InvalidState(
+            "project-instruction operation and target context layer do not match".into(),
+        ));
+    }
+    if !matches!(
+        input.boundary_kind.as_str(),
+        "exact_anchor" | "owned_region"
+    ) || input.boundary_value.trim().is_empty()
+    {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposal requires an exact anchor or owned region".into(),
+        ));
+    }
+    if input.provenance_json.as_array().is_none_or(Vec::is_empty) {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposal requires provenance".into(),
+        ));
+    }
+
+    let now = Timestamp::now().as_microsecond();
+    let run_id = AutoImproveRunId::new();
+    let proposal_id = AutoImproveProposalId::new();
+    let actor_json = serde_json::to_string(&input.proposing_actor)?;
+    let provenance_json = serde_json::to_string(&input.provenance_json)?;
+    let body_sha256 = sha256(input.proposed_content.as_bytes());
+    let tx = conn.transaction()?;
+
+    tx.query_row(
+        "SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2",
+        params![input.project_id.as_bytes(), input.workspace_id.as_bytes()],
+        |_| Ok(()),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        StoreError::InvalidState("project-instruction proposal scope does not exist".into())
+    })?;
+
+    let pending_exists = tx
+        .query_row(
+            "SELECT 1 FROM auto_improve_proposals \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND target_path = ?3 AND status = 'pending'",
+            params![
+                input.workspace_id.as_bytes(),
+                input.project_id.as_bytes(),
+                input.logical_target.as_str(),
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if pending_exists {
+        return Err(StoreError::InvalidState(
+            "a pending proposal already targets this path".into(),
+        ));
+    }
+
+    tx.execute(
+        "INSERT INTO auto_improve_runs \
+         (id, workspace_id, project_id, session_id, provider, model, summary, warnings_json, \
+          rejected_candidates_json, config_json, proposal_actor_json, created_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, '[]', '[]', ?5, ?6, ?7)",
+        params![
+            run_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            input.title.as_str(),
+            serde_json::json!({ "source": "instructions_propose" }).to_string(),
+            actor_json,
+            now,
+        ],
+    )?;
+
+    tx.execute(
+        "INSERT INTO auto_improve_proposals \
+         (id, run_id, workspace_id, project_id, status, operation, target_path, kind, title, \
+          confidence, rationale, evidence_json, body_markdown, body_sha256, artifact_path, \
+          artifact_sha256, target_latest_page_id_at_stage, target_body_sha256_at_stage, \
+          target_updated_at_at_stage, staged_at, edit_mode, patch_json, \
+          expected_base_body_sha256, materialized_base_body_sha256, target_kind, \
+          proposal_operation, logical_target, target_context_layer, base_sha256, \
+          boundary_kind, boundary_value, unified_diff, estimated_token_delta, provenance_json) \
+         VALUES (?1, ?2, ?3, ?4, 'pending', 'update', ?5, 'project_instruction', ?6, 1.0, \
+                 ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, NULL, ?12, 'full_page', NULL, NULL, \
+                 NULL, 'project_instruction', ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            proposal_id.as_bytes(),
+            run_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            input.logical_target.as_str(),
+            input.title.as_str(),
+            input.rationale.as_str(),
+            provenance_json,
+            input.proposed_content.as_str(),
+            body_sha256.as_slice(),
+            format!("db:project-instruction:{proposal_id}"),
+            now,
+            input.operation.as_str(),
+            input.logical_target.as_str(),
+            input.target_context_layer.as_str(),
+            input.base_sha256.as_slice(),
+            input.boundary_kind.as_str(),
+            input.boundary_value.as_str(),
+            input.unified_diff.as_str(),
+            input.estimated_token_delta,
+            serde_json::to_string(&input.provenance_json)?,
+        ],
+    )?;
+    insert_event_in_tx(
+        &tx,
+        proposal_id,
+        "staged",
+        &input.proposing_actor,
+        input.proposing_author_id,
+        &serde_json::json!({
+            "target_kind": "project_instruction",
+            "operation": input.operation.as_str(),
+            "logical_target": input.logical_target.as_str(),
+        }),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(StagedProjectInstructionProposal { proposal_id })
 }
 
 /// Mark a pending proposal `failed`, record the rejection fingerprint, and
@@ -858,7 +1153,7 @@ pub fn approve_proposal(
     let proposal = tx
         .query_row(
             "SELECT operation, target_path, target_latest_page_id_at_stage, \
-                    target_body_sha256_at_stage, target_updated_at_at_stage \
+                    target_body_sha256_at_stage, target_updated_at_at_stage, target_kind \
              FROM auto_improve_proposals \
              WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND status = 'pending'",
             params![
@@ -873,17 +1168,29 @@ pub fn approve_proposal(
                     row.get::<_, Option<Vec<u8>>>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((operation, target_path, staged_page_id, staged_body_hash, staged_updated_at)) =
-        proposal
+    let Some((
+        operation,
+        target_path,
+        staged_page_id,
+        staged_body_hash,
+        staged_updated_at,
+        target_kind,
+    )) = proposal
     else {
         return Err(StoreError::InvalidState(
             "auto-improve proposal is not pending or not in scope".into(),
         ));
     };
+    if target_kind != PendingProposalTargetKind::WikiPage.as_str() {
+        return Err(StoreError::InvalidState(
+            "project-instruction proposals cannot use the Wiki approval path".into(),
+        ));
+    }
     if input.page.path.as_str() != target_path {
         return Err(StoreError::InvalidState(
             "approval page path does not match proposal target".into(),
@@ -926,6 +1233,11 @@ pub fn approve_proposal(
             }
             None => true,
         },
+        _ => {
+            return Err(StoreError::InvalidState(
+                "project-instruction proposals cannot use the Wiki approval path".into(),
+            ));
+        }
     };
     if conflict {
         insert_rejection_for_proposal_in_tx(
@@ -1158,8 +1470,9 @@ fn insert_rejection_for_proposal_in_tx(
     now: i64,
 ) -> StoreResult<()> {
     let record = tx.query_row(
-        "SELECT run_id, workspace_id, project_id, operation, target_path, kind, title, rationale, \
-                evidence_json, edit_mode \
+        "SELECT run_id, workspace_id, project_id, COALESCE(proposal_operation, operation), \
+                COALESCE(logical_target, target_path), kind, title, rationale, evidence_json, \
+                edit_mode \
          FROM auto_improve_proposals WHERE id = ?1",
         params![proposal_id.as_bytes()],
         |row| {
@@ -1278,14 +1591,40 @@ pub(crate) fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<AutoImprovePro
         workspace_id,
         project_id,
         status: AutoImproveProposalStatus::from_str(&status).map_err(to_sql_err)?,
+        target_kind: PendingProposalTargetKind::WikiPage,
         operation: AutoImproveProposalOperation::from_str(&operation).map_err(to_sql_err)?,
+        logical_target: target_path.as_str().to_owned(),
+        target_context_layer: "wiki".to_owned(),
         target_path,
         kind: row.get(7)?,
         title: row.get(8)?,
         confidence: row.get(9)?,
         staged_at: row.get(10)?,
         decided_at: row.get(11)?,
+        proposed_by_actor_json: serde_json::json!({}),
     })
+}
+
+pub(crate) fn summary_from_row_with_metadata(
+    row: &Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<AutoImproveProposalSummary> {
+    let mut summary = summary_from_row(row)?;
+    let target_kind: String = row.get(offset)?;
+    let proposal_operation: Option<String> = row.get(offset + 1)?;
+    let logical_target: Option<String> = row.get(offset + 2)?;
+    let target_context_layer: Option<String> = row.get(offset + 3)?;
+    let proposed_actor_raw: String = row.get(offset + 4)?;
+    summary.target_kind = PendingProposalTargetKind::from_str(&target_kind).map_err(to_sql_err)?;
+    if let Some(operation) = proposal_operation {
+        summary.operation =
+            AutoImproveProposalOperation::from_str(&operation).map_err(to_sql_err)?;
+    }
+    summary.logical_target = logical_target.unwrap_or_else(|| summary.target_path.to_string());
+    summary.target_context_layer = target_context_layer.unwrap_or_else(|| "wiki".to_owned());
+    summary.proposed_by_actor_json =
+        serde_json::from_str(&proposed_actor_raw).map_err(to_sql_err)?;
+    Ok(summary)
 }
 
 pub(crate) fn bytes32(bytes: Vec<u8>) -> StoreResult<[u8; 32]> {
