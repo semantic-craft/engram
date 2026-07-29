@@ -11,7 +11,7 @@
 #   3. Runs cargo-deny and cargo-audit (warn-only — a known advisory should
 #      not block a release; the operator reviews the output).
 #   4. Updates [workspace.package] version in Cargo.toml.
-#   5. Moves CHANGELOG.md [Unreleased] entries to a new [X.Y.Z] section
+#   5. Moves CHANGELOG.md Unreleased entries to a new X.Y.Z section
 #      dated today.
 #   6. Commits both files as "release: vX.Y.Z".
 #   7. Creates an annotated git tag vX.Y.Z whose message is the changelog
@@ -132,41 +132,26 @@ import pathlib, re, sys
 path = pathlib.Path("$CHANGELOG")
 text = path.read_text()
 
-unreleased_pattern = re.compile(
-    r'(## \[Unreleased\]\n)(.*?)(\n## \[)',
-    re.DOTALL,
-)
+unreleased_pattern = re.compile(r'(## Unreleased\n)(.*?)(?=\n## \d)', re.DOTALL)
 m = unreleased_pattern.search(text)
-if not m:
-    print("  [warn] no [Unreleased] section with content found; CHANGELOG not updated", file=sys.stderr)
+if not m or not m.group(2).strip():
+    print("  [warn] no Unreleased section with content found; CHANGELOG not updated", file=sys.stderr)
     sys.exit(0)
 
 unreleased_body = m.group(2)
 
-# Build new [Unreleased] (empty) + new version section.
-new_version_header = f"## [$VERSION] - $TODAY"
+# Build new Unreleased (empty) + new version section.
+new_version_header = f"## $VERSION - $TODAY"
 new_block = (
-    "## [Unreleased]\n\n"
+    "## Unreleased\n\n"
     + new_version_header + "\n"
     + unreleased_body
 )
 
-new_text = unreleased_pattern.sub(lambda _: new_block + "\n## [", text, count=1)
-
-# Update the reference links at the bottom.
-# Replace the Unreleased compare link to point from this version to HEAD.
-new_text = re.sub(
-    r'^\[Unreleased\]:.*$',
-    lambda _: (
-        "[Unreleased]: https://github.com/semantic-craft/engram/compare/$TAG...HEAD\n"
-        "[$VERSION]: https://github.com/semantic-craft/engram/releases/tag/$TAG"
-    ),
-    new_text,
-    flags=re.MULTILINE,
-)
+new_text = unreleased_pattern.sub(lambda _: new_block, text, count=1)
 
 path.write_text(new_text)
-print("  moved [Unreleased] entries to [$VERSION] - $TODAY")
+print("  moved Unreleased entries to $VERSION - $TODAY")
 PYEOF
 
 # ── commit + tag ───────────────────────────────────────────────────────────
@@ -184,7 +169,7 @@ text = path.read_text()
 
 # Extract the new version section body.
 m = re.search(
-    r'## \[$VERSION\] - $TODAY\n(.*?)(?=\n## \[|\Z)',
+    r'## $VERSION - $TODAY\n(.*?)(?=\n## |\Z)',
     text,
     re.DOTALL,
 )
