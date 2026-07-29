@@ -28,7 +28,8 @@ use uuid::Uuid;
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row_with_metadata, to_sql_err,
+    AutoImproveTelemetryCount, ProjectInstructionProposalRevision, bytes32, opt_bytes32,
+    summary_from_row_with_metadata, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
@@ -3661,7 +3662,8 @@ impl ReaderPool {
                             p.target_kind, p.proposal_operation, p.logical_target, \
                             p.target_context_layer, r.proposal_actor_json, p.base_sha256, \
                             p.boundary_kind, p.boundary_value, p.unified_diff, \
-                            p.estimated_token_delta, p.provenance_json \
+                            p.estimated_token_delta, p.provenance_json, p.base_content, \
+                            p.approval_sha256 \
                      FROM auto_improve_proposals p \
                      JOIN auto_improve_runs r ON r.id = p.run_id \
                      WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
@@ -3698,6 +3700,9 @@ impl ReaderPool {
                             .map_err(to_sql_err)?
                             .map(hex_bytes);
                         let provenance_raw: String = row.get(40)?;
+                        let approval_sha256 = opt_bytes32(row.get(42)?)
+                            .map_err(to_sql_err)?
+                            .map(hex_bytes);
                         Ok(AutoImproveProposalDetail {
                             summary,
                             rationale: row.get(12)?,
@@ -3735,6 +3740,10 @@ impl ReaderPool {
                             estimated_token_delta: row.get(39)?,
                             provenance_json: serde_json::from_str(&provenance_raw)
                                 .map_err(to_sql_err)?,
+                            base_content: row.get(41)?,
+                            approval_sha256,
+                            review_revision: None,
+                            revisions: Vec::new(),
                             events: Vec::new(),
                         })
                     },
@@ -3743,6 +3752,38 @@ impl ReaderPool {
             let Some(mut detail) = row else {
                 return Ok(None);
             };
+            let mut revision_stmt = conn.prepare(
+                "SELECT revision, proposed_content, proposed_content_sha256, unified_diff, \
+                        estimated_token_delta, approval_sha256, actor_json, author_id, at \
+                 FROM project_instruction_proposal_revisions \
+                 WHERE proposal_id = ?1 ORDER BY revision ASC",
+            )?;
+            let revision_rows =
+                revision_stmt.query_map(params![proposal_id.as_bytes()], |row| {
+                    let content_sha256 = bytes32(row.get(2)?).map_err(to_sql_err)?;
+                    let approval_sha256 = bytes32(row.get(5)?).map_err(to_sql_err)?;
+                    let actor_raw: String = row.get(6)?;
+                    let author_id = row
+                        .get::<_, Option<Vec<u8>>>(7)?
+                        .map(|bytes| UserId::from_slice(&bytes))
+                        .transpose()
+                        .map_err(to_sql_err)?;
+                    Ok(ProjectInstructionProposalRevision {
+                        revision: row.get(0)?,
+                        proposed_content: row.get(1)?,
+                        proposed_content_sha256: hex_bytes(content_sha256),
+                        unified_diff: row.get(3)?,
+                        estimated_token_delta: row.get(4)?,
+                        approval_sha256: hex_bytes(approval_sha256),
+                        actor: serde_json::from_str(&actor_raw).map_err(to_sql_err)?,
+                        author_id,
+                        at: row.get(8)?,
+                    })
+                })?;
+            for row in revision_rows {
+                detail.revisions.push(row?);
+            }
+            detail.review_revision = detail.revisions.last().map(|revision| revision.revision);
             let mut stmt = conn.prepare(
                 "SELECT id, proposal_id, event, actor_json, author_id, detail_json, at \
                  FROM auto_improve_proposal_events \

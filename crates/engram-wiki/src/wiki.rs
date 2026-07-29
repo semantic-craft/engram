@@ -643,7 +643,7 @@ impl Wiki {
         if detail.summary.target_kind == engram_store::PendingProposalTargetKind::ProjectInstruction
         {
             return Err(engram_wiki_error(
-                "project-instruction proposal approval is not implemented",
+                "project-instruction proposals require the DB-only human review approval path",
             ));
         }
 

@@ -18,7 +18,9 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::auto_improve::{
-    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
+    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
+    ApproveProjectInstructionProposal, ApproveProjectInstructionProposalResult,
+    EditProjectInstructionProposal, EditProjectInstructionProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StageProjectInstructionProposal,
     StagedAutoImproveRun, StagedProjectInstructionProposal,
 };
@@ -210,6 +212,14 @@ pub(crate) enum WriteCmd {
     StageProjectInstructionProposal {
         input: StageProjectInstructionProposal,
         reply: oneshot::Sender<StoreResult<StagedProjectInstructionProposal>>,
+    },
+    EditProjectInstructionProposal {
+        input: EditProjectInstructionProposal,
+        reply: oneshot::Sender<StoreResult<EditProjectInstructionProposalResult>>,
+    },
+    ApproveProjectInstructionProposal {
+        input: ApproveProjectInstructionProposal,
+        reply: oneshot::Sender<StoreResult<ApproveProjectInstructionProposalResult>>,
     },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
@@ -886,6 +896,28 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Edit one pending project-instruction proposal and append a revision.
+    pub async fn edit_project_instruction_proposal(
+        &self,
+        input: EditProjectInstructionProposal,
+    ) -> StoreResult<EditProjectInstructionProposalResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EditProjectInstructionProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Approve one project-instruction proposal without applying its target.
+    pub async fn approve_project_instruction_proposal(
+        &self,
+        input: ApproveProjectInstructionProposal,
+    ) -> StoreResult<ApproveProjectInstructionProposalResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ApproveProjectInstructionProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reject a pending auto-improvement proposal and append an event.
     pub async fn reject_auto_improve_proposal(
         &self,
@@ -1240,6 +1272,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result =
                     crate::auto_improve::stage_project_instruction_proposal(&mut conn, &input);
                 send_or_warn(reply, result, "stage_project_instruction_proposal");
+            }
+            WriteCmd::EditProjectInstructionProposal { input, reply } => {
+                let result =
+                    crate::auto_improve::edit_project_instruction_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "edit_project_instruction_proposal");
+            }
+            WriteCmd::ApproveProjectInstructionProposal { input, reply } => {
+                let result =
+                    crate::auto_improve::approve_project_instruction_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "approve_project_instruction_proposal");
             }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);
