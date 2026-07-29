@@ -216,6 +216,10 @@ mod tests {
     ) -> (AutoImproveProposalId, [u8; 32]) {
         let target_context_layer = match operation {
             AutoImproveProposalOperation::NoChange => "no_change",
+            AutoImproveProposalOperation::MoveToSkill => "agent_skill",
+            AutoImproveProposalOperation::MoveToPathRule => "path_rules",
+            AutoImproveProposalOperation::MoveToWiki => "wiki",
+            AutoImproveProposalOperation::MoveToEnforcement => "enforcement",
             _ if logical_target.contains('/') => "path_rules",
             _ => "root_instructions",
         };
@@ -238,6 +242,8 @@ mod tests {
                 project_id: proj,
                 operation,
                 logical_target: PagePath::new(logical_target).unwrap(),
+                repository_identity_sha256: sha256("/test/repository"),
+                base_target_existed: !base_content.is_empty(),
                 target_context_layer: target_context_layer.into(),
                 base_sha256,
                 base_content: base_content.into(),
@@ -688,6 +694,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(detail.summary.status, AutoImproveProposalStatus::Approved);
+        assert_eq!(
+            detail.repository_identity_sha256,
+            Some(hash_hex(sha256("/test/repository")))
+        );
         assert_eq!(detail.application, Some(application));
         assert_eq!(
             detail
@@ -745,6 +755,41 @@ mod tests {
         ));
 
         let unchanged = "# Same\n";
+        let malformed_no_change = "# Changed\n";
+        assert!(matches!(
+            store
+                .writer
+                .stage_project_instruction_proposal(StageProjectInstructionProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    operation: AutoImproveProposalOperation::NoChange,
+                    logical_target: PagePath::new("CLAUDE.md").unwrap(),
+                    repository_identity_sha256: sha256("/test/repository"),
+                    base_target_existed: true,
+                    target_context_layer: "no_change".into(),
+                    base_sha256: sha256(unchanged),
+                    base_content: unchanged.into(),
+                    boundary_kind: "exact_anchor".into(),
+                    boundary_value: "whole_file_snapshot".into(),
+                    proposed_content: malformed_no_change.into(),
+                    unified_diff: project_instruction_unified_diff(
+                        "CLAUDE.md",
+                        unchanged,
+                        malformed_no_change,
+                    ),
+                    estimated_token_delta: project_instruction_token_delta(
+                        unchanged,
+                        malformed_no_change,
+                    ),
+                    title: "malformed no change".into(),
+                    rationale: "must preserve bytes".into(),
+                    provenance_json: serde_json::json!([{"kind":"test"}]),
+                    proposing_actor: ActorContext::default(),
+                    proposing_author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
         let (no_op_id, no_op_approval) = stage_approved_project_instruction(
             &store,
             ws,
@@ -755,6 +800,24 @@ mod tests {
             unchanged,
         )
         .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: no_op_id,
+                    expected_approval_sha256: no_op_approval,
+                    before_sha256: sha256(unchanged),
+                    after_sha256: sha256("# Changed\n"),
+                    outcome: ProjectInstructionApplyOutcome::Updated,
+                    backup_path: Some("/tmp/CLAUDE.md.bak-invalid-no-change".into()),
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
         assert!(matches!(
             store
                 .writer
@@ -811,6 +874,35 @@ mod tests {
             .unwrap();
         assert!(detail.application.is_none());
         assert!(!detail.events.iter().any(|event| event.event == "applied"));
+
+        let (move_id, move_approval) = stage_approved_project_instruction(
+            &store,
+            ws,
+            proj,
+            "AGENTS.md",
+            AutoImproveProposalOperation::MoveToSkill,
+            "procedure",
+            "",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .writer
+                .record_project_instruction_application(RecordProjectInstructionApplication {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: move_id,
+                    expected_approval_sha256: move_approval,
+                    before_sha256: sha256("procedure"),
+                    after_sha256: sha256(""),
+                    outcome: ProjectInstructionApplyOutcome::Updated,
+                    backup_path: Some("/tmp/AGENTS.md.bak-move".into()),
+                    actor: ActorContext::default(),
+                    author_id: None,
+                })
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[tokio::test]

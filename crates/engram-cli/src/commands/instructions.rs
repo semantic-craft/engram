@@ -14,7 +14,7 @@ use crate::cli::{
     InstructionsApplyArgs, InstructionsArgs, InstructionsCommand, InstructionsDoctorArgs,
     InstructionsProposeArgs,
 };
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic_report};
+use crate::commands::apply_shared::{ApplyOutcome, ApplyReport, apply_atomic_report};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json, post_json_with_query};
 use crate::instruction_placement::{PlacementAction, PlacementDestination, PlacementFinding};
@@ -54,6 +54,8 @@ struct StageRequest {
     project: String,
     operation: String,
     logical_target: String,
+    repository_identity_sha256: String,
+    base_target_existed: bool,
     target_context_layer: String,
     boundary_kind: String,
     boundary_value: String,
@@ -93,6 +95,8 @@ struct ApplyProposalDetail {
     summary: ApplyProposalSummary,
     proposed_content: String,
     base_sha256: Option<String>,
+    repository_identity_sha256: Option<String>,
+    base_target_existed: Option<bool>,
     boundary_kind: Option<String>,
     boundary_value: Option<String>,
     base_content: Option<String>,
@@ -139,6 +143,7 @@ struct LocalProposal {
 
 async fn propose(config: &Config, args: InstructionsProposeArgs) -> Result<()> {
     let report = DoctorReport::inspect_current_repository()?;
+    let repository_identity_sha256 = repository_identity_sha256(&report.repository_root)?;
     let project = super::resolve_project_name(args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let local = match (
@@ -167,6 +172,16 @@ async fn propose(config: &Config, args: InstructionsProposeArgs) -> Result<()> {
     } else {
         "/admin/instructions/proposals"
     };
+    let base_target_existed = report
+        .repository_root
+        .join(&local.logical_target)
+        .try_exists()
+        .with_context(|| {
+            format!(
+                "checking whether repository target {} existed at staging",
+                local.logical_target
+            )
+        })?;
     let response: StageResponse = post_json(
         &endpoint,
         route,
@@ -175,6 +190,8 @@ async fn propose(config: &Config, args: InstructionsProposeArgs) -> Result<()> {
             project,
             operation: local.operation.to_owned(),
             logical_target: local.logical_target,
+            repository_identity_sha256,
+            base_target_existed,
             target_context_layer: local.target_context_layer,
             boundary_kind: local.boundary_kind.to_owned(),
             boundary_value: local.boundary_value,
@@ -290,9 +307,15 @@ async fn apply(config: &Config, args: InstructionsApplyArgs) -> Result<()> {
 
     let operation = AutoImproveProposalOperation::from_str(&detail.summary.operation)
         .context("parsing approved project-instruction operation")?;
+    ensure_supported_apply_operation(operation)?;
     let base_content = detail
         .base_content
         .ok_or_else(|| anyhow::anyhow!("approved proposal has no base content"))?;
+    if operation == AutoImproveProposalOperation::NoChange
+        && base_content != detail.proposed_content
+    {
+        bail!("approved no-change proposal does not preserve the exact base content");
+    }
     let base_sha256 = detail
         .base_sha256
         .ok_or_else(|| anyhow::anyhow!("approved proposal has no base SHA-256"))?;
@@ -331,21 +354,45 @@ async fn apply(config: &Config, args: InstructionsApplyArgs) -> Result<()> {
         bail!("approved proposal fields do not match its approval binding");
     }
 
-    let report = DoctorReport::inspect_current_repository()?;
-    let target = resolve_apply_target(&report, &detail.summary)?;
-    let current = read_target(&target)?;
-    ensure_expected_base(&current, &base_content, &base_hash)?;
-
-    let proposed_content = detail.proposed_content;
-    let closure_base = base_content.clone();
-    let closure_proposed = proposed_content.clone();
-    let closure_kind = boundary_kind.clone();
-    let closure_value = boundary_value.clone();
-    let apply_report = apply_atomic_report(&target, move |existing| {
-        ensure_expected_base(existing, &closure_base, &base_hash)?;
-        validate_boundary(existing, &closure_proposed, &closure_kind, &closure_value)?;
-        Ok(closure_proposed)
+    let expected_repository_identity = detail.repository_identity_sha256.ok_or_else(|| {
+        anyhow::anyhow!("approved proposal has no originating repository identity")
     })?;
+    let base_target_existed = detail
+        .base_target_existed
+        .ok_or_else(|| anyhow::anyhow!("approved proposal has no target-existence metadata"))?;
+    let report = DoctorReport::inspect_current_repository()?;
+    let current_repository_identity = repository_identity_sha256(&report.repository_root)?;
+    if current_repository_identity != expected_repository_identity {
+        bail!("approved proposal belongs to a different repository; refusing local apply");
+    }
+    let target = resolve_apply_target(&report, &detail.summary)?;
+    let current_target_existed = target
+        .try_exists()
+        .with_context(|| format!("checking whether {} exists", target.display()))?;
+    let current = read_target(&target)?;
+    let proposed_content = detail.proposed_content;
+    let apply_report = if current == proposed_content {
+        recover_unrecorded_apply(
+            &target,
+            &base_content,
+            &proposed_content,
+            base_target_existed,
+        )?
+    } else {
+        if current_target_existed != base_target_existed {
+            bail!("instruction target existence changed after proposal staging");
+        }
+        ensure_expected_base(&current, &base_content, &base_hash)?;
+        let closure_base = base_content.clone();
+        let closure_proposed = proposed_content.clone();
+        let closure_kind = boundary_kind.clone();
+        let closure_value = boundary_value.clone();
+        apply_atomic_report(&target, move |existing| {
+            ensure_expected_base(existing, &closure_base, &base_hash)?;
+            validate_boundary(existing, &closure_proposed, &closure_kind, &closure_value)?;
+            Ok(closure_proposed)
+        })?
+    };
     let before_sha256 = sha256_hex(base_content.as_bytes());
     let after_sha256 = sha256_hex(proposed_content.as_bytes());
     let backup_path = apply_report
@@ -892,6 +939,102 @@ fn routing_block(content: &str) -> Option<&str> {
     let after_start = start + MARKER_START.len();
     let end = content[after_start..].find(MARKER_END)? + after_start + MARKER_END.len();
     Some(&content[start..end])
+}
+
+fn ensure_supported_apply_operation(operation: AutoImproveProposalOperation) -> Result<()> {
+    if matches!(
+        operation,
+        AutoImproveProposalOperation::Add
+            | AutoImproveProposalOperation::Update
+            | AutoImproveProposalOperation::StaleDelete
+            | AutoImproveProposalOperation::NoChange
+    ) {
+        return Ok(());
+    }
+    bail!(
+        "{} is not supported by the single-target local apply path",
+        operation.as_str()
+    )
+}
+
+fn repository_identity_sha256(repository_root: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(repository_root).with_context(|| {
+        format!(
+            "resolving canonical repository root {}",
+            repository_root.display()
+        )
+    })?;
+    let canonical = canonical.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "canonical repository root {} is not valid UTF-8",
+            canonical.display()
+        )
+    })?;
+    Ok(sha256_hex(canonical.as_bytes()))
+}
+
+fn recover_unrecorded_apply(
+    target: &Path,
+    base: &str,
+    proposed: &str,
+    base_target_existed: bool,
+) -> Result<ApplyReport> {
+    if base == proposed {
+        return Ok(ApplyReport {
+            outcome: ApplyOutcome::NoOp,
+            backup_path: None,
+        });
+    }
+    if !base_target_existed {
+        return Ok(ApplyReport {
+            outcome: ApplyOutcome::Created,
+            backup_path: None,
+        });
+    }
+    let backup_path = matching_recovery_backup(target, base)?;
+    Ok(ApplyReport {
+        outcome: ApplyOutcome::Updated,
+        backup_path: Some(backup_path),
+    })
+}
+
+fn matching_recovery_backup(target: &Path, base: &str) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("instruction target has no UTF-8 file name"))?;
+    let prefix = format!("{target_name}.bak-");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("scanning recovery backups in {}", parent.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading backup entry in {}", parent.display()))?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix)
+            || !entry
+                .file_type()
+                .with_context(|| format!("reading file type for {}", entry.path().display()))?
+                .is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
+        if fs::read(&path).with_context(|| format!("reading recovery backup {}", path.display()))?
+            == base.as_bytes()
+        {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    matches.pop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "instruction target already matches the approved content, but no exact recovery backup matches the approved base; refusing to synthesize an application audit"
+        )
+    })
 }
 
 fn parse_sha256(value: &str) -> Result<[u8; 32]> {

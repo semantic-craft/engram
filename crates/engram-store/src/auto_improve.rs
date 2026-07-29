@@ -347,6 +347,10 @@ pub struct AutoImproveProposalDetail {
     pub materialized_base_body_sha256: Option<[u8; 32]>,
     /// SHA-256 of repository target content used to construct an instruction proposal.
     pub base_sha256: Option<String>,
+    /// SHA-256 of the canonical local repository root captured at staging.
+    pub repository_identity_sha256: Option<String>,
+    /// Whether the repository target existed when its base bytes were captured.
+    pub base_target_existed: Option<bool>,
     /// `exact_anchor` or `owned_region` for project-instruction proposals.
     pub boundary_kind: Option<String>,
     /// Stable anchor/region identifier approved for later application.
@@ -406,6 +410,10 @@ pub struct StageProjectInstructionProposal {
     pub operation: AutoImproveProposalOperation,
     /// Repository-relative logical target.
     pub logical_target: PagePath,
+    /// SHA-256 of the canonical repository root that supplied the target.
+    pub repository_identity_sha256: [u8; 32],
+    /// Whether the repository target existed when the base bytes were captured.
+    pub base_target_existed: bool,
     /// Destination context layer.
     pub target_context_layer: String,
     /// Stage-time SHA-256 of target content.
@@ -1278,6 +1286,13 @@ pub fn stage_project_instruction_proposal(
             "project-instruction base content hash does not match".into(),
         ));
     }
+    if input.operation == AutoImproveProposalOperation::NoChange
+        && input.base_content != input.proposed_content
+    {
+        return Err(StoreError::InvalidState(
+            "no-change project-instruction proposals must preserve the exact base content".into(),
+        ));
+    }
     let expected_diff = project_instruction_unified_diff(
         input.logical_target.as_str(),
         &input.base_content,
@@ -1363,11 +1378,11 @@ pub fn stage_project_instruction_proposal(
           expected_base_body_sha256, materialized_base_body_sha256, target_kind, \
           proposal_operation, logical_target, target_context_layer, base_sha256, \
           boundary_kind, boundary_value, unified_diff, estimated_token_delta, provenance_json, \
-          base_content, approval_sha256) \
+          base_content, approval_sha256, repository_identity_sha256, base_target_existed) \
          VALUES (?1, ?2, ?3, ?4, 'pending', 'update', ?5, 'project_instruction', ?6, 1.0, \
                  ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, NULL, ?12, 'full_page', NULL, NULL, \
                  NULL, 'project_instruction', ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, \
-                 ?22, ?23)",
+                 ?22, ?23, ?24, ?25)",
         params![
             proposal_id.as_bytes(),
             run_id.as_bytes(),
@@ -1392,6 +1407,8 @@ pub fn stage_project_instruction_proposal(
             serde_json::to_string(&input.provenance_json)?,
             input.base_content.as_str(),
             approval_sha256.as_slice(),
+            input.repository_identity_sha256.as_slice(),
+            input.base_target_existed,
         ],
     )?;
     tx.execute(
@@ -1423,6 +1440,8 @@ pub fn stage_project_instruction_proposal(
             "logical_target": input.logical_target.as_str(),
             "review_revision": 0,
             "approval_sha256": hex_bytes(&approval_sha256),
+            "repository_identity_sha256": hex_bytes(&input.repository_identity_sha256),
+            "base_target_existed": input.base_target_existed,
         }),
         now,
     )?;
@@ -1561,6 +1580,14 @@ pub fn edit_project_instruction_proposal(
             reason: "project-instruction proposal predates editable review metadata".into(),
         });
     }
+    let operation = AutoImproveProposalOperation::from_str(&operation)?;
+    if operation == AutoImproveProposalOperation::NoChange && input.proposed_content != base_content
+    {
+        return Ok(EditProjectInstructionProposalResult::Conflict {
+            reason: "no-change project-instruction proposals must preserve the exact base content"
+                .into(),
+        });
+    }
     if current_content == input.proposed_content {
         return Ok(EditProjectInstructionProposalResult::Unchanged {
             revision,
@@ -1569,7 +1596,6 @@ pub fn edit_project_instruction_proposal(
         });
     }
 
-    let operation = AutoImproveProposalOperation::from_str(&operation)?;
     let unified_diff =
         project_instruction_unified_diff(&logical_target, &base_content, &input.proposed_content);
     let estimated_token_delta =
@@ -1772,9 +1798,9 @@ pub fn record_project_instruction_application(
     let tx = conn.transaction()?;
     let proposal = tx
         .query_row(
-            "SELECT p.status, p.target_kind, p.approval_sha256, p.base_sha256, \
-                    p.body_markdown, p.base_content, r.proposal_actor_json, \
-                    p.decided_by_actor_json \
+            "SELECT p.status, p.target_kind, p.proposal_operation, p.base_target_existed, \
+                    p.approval_sha256, p.base_sha256, p.body_markdown, p.base_content, \
+                    r.proposal_actor_json, p.decided_by_actor_json \
              FROM auto_improve_proposals p \
              JOIN auto_improve_runs r ON r.id = p.run_id \
              WHERE p.id = ?1 AND p.workspace_id = ?2 AND p.project_id = ?3",
@@ -1787,12 +1813,14 @@ pub fn record_project_instruction_application(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<bool>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
@@ -1800,6 +1828,8 @@ pub fn record_project_instruction_application(
     let Some((
         status,
         target_kind,
+        operation,
+        base_target_existed,
         approval_sha256,
         base_sha256,
         proposed_content,
@@ -1821,6 +1851,35 @@ pub fn record_project_instruction_application(
         return Err(StoreError::InvalidState(format!(
             "project-instruction proposal is not apply-ready: {status}"
         )));
+    }
+    let operation = operation
+        .ok_or_else(|| {
+            StoreError::InvalidState("project-instruction proposal has no typed operation".into())
+        })?
+        .parse::<AutoImproveProposalOperation>()?;
+    if !matches!(
+        operation,
+        AutoImproveProposalOperation::Add
+            | AutoImproveProposalOperation::Update
+            | AutoImproveProposalOperation::StaleDelete
+            | AutoImproveProposalOperation::NoChange
+    ) {
+        return Err(StoreError::InvalidState(format!(
+            "{} is not supported by the single-target local apply path",
+            operation.as_str()
+        )));
+    }
+    let base_target_existed = base_target_existed.ok_or_else(|| {
+        StoreError::InvalidState(
+            "project-instruction proposal predates target-existence metadata".into(),
+        )
+    })?;
+    if operation == AutoImproveProposalOperation::NoChange
+        && input.outcome != ProjectInstructionApplyOutcome::NoOp
+    {
+        return Err(StoreError::InvalidState(
+            "no-change project-instruction proposals can only record a no-op".into(),
+        ));
     }
     let approval_sha256 = approval_sha256.map(bytes32).transpose()?.ok_or_else(|| {
         StoreError::InvalidState("project-instruction proposal predates approval metadata".into())
@@ -1870,7 +1929,8 @@ pub fn record_project_instruction_application(
     }
     match input.outcome {
         ProjectInstructionApplyOutcome::Created => {
-            if base_content.as_deref() != Some("")
+            if base_target_existed
+                || base_content.as_deref() != Some("")
                 || input.before_sha256 != sha256(b"")
                 || input.before_sha256 == input.after_sha256
                 || input.backup_path.is_some()
@@ -1882,7 +1942,8 @@ pub fn record_project_instruction_application(
             }
         }
         ProjectInstructionApplyOutcome::Updated => {
-            if input.before_sha256 == input.after_sha256
+            if !base_target_existed
+                || input.before_sha256 == input.after_sha256
                 || input.backup_path.as_deref().is_none_or(str::is_empty)
             {
                 return Err(StoreError::InvalidState(

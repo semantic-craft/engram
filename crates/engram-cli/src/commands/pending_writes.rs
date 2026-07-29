@@ -53,6 +53,10 @@ struct ProposalDetail {
     provenance: serde_json::Value,
     approval_sha256: Option<String>,
     review_revision: Option<i64>,
+    #[serde(default)]
+    repository_identity_sha256: Option<String>,
+    #[serde(default)]
+    base_target_existed: Option<bool>,
     revisions: Vec<serde_json::Value>,
     events: Vec<serde_json::Value>,
     #[serde(default)]

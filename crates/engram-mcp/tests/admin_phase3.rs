@@ -1110,6 +1110,8 @@ fn project_instruction_request(base_content: &str, proposed_content: &str) -> se
         "project": "scratch",
         "operation": "add",
         "logical_target": "AGENTS.md",
+        "repository_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "base_target_existed": !base_content.is_empty(),
         "target_context_layer": "root_instructions",
         "boundary_kind": "exact_anchor",
         "boundary_value": "EOF",
@@ -1473,6 +1475,18 @@ async fn project_instruction_stage_rejects_weak_or_secret_shaped_evidence_before
     )
     .await;
     assert_eq!(missing_source.status(), StatusCode::BAD_REQUEST);
+
+    let malformed_no_change = router_post(router.clone(), "/admin/instructions/proposals", {
+        let mut request = project_instruction_request(
+            "# Rules\n",
+            "# Rules\n\nKeep SQLite writes behind the single writer actor.\n",
+        );
+        request["operation"] = json!("no_change");
+        request["target_context_layer"] = json!("no_change");
+        request
+    })
+    .await;
+    assert_eq!(malformed_no_change.status(), StatusCode::BAD_REQUEST);
 
     assert!(
         store

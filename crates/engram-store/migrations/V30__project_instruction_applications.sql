@@ -2,6 +2,15 @@
 -- Repository mutation remains outside the server; this table records the
 -- result after the local host has completed its compare-and-swap write.
 
+-- Bind newly staged project-instruction proposals to the canonical checkout
+-- that supplied their base bytes without exposing a local filesystem path.
+ALTER TABLE auto_improve_proposals
+    ADD COLUMN repository_identity_sha256 BLOB;
+
+ALTER TABLE auto_improve_proposals
+    ADD COLUMN base_target_existed INTEGER
+        CHECK (base_target_existed IN (0, 1));
+
 CREATE TABLE project_instruction_applications (
     proposal_id           BLOB PRIMARY KEY NOT NULL
         REFERENCES auto_improve_proposals(id) ON DELETE CASCADE,
