@@ -1370,8 +1370,8 @@ pub struct InstallHooksArgs {
     /// **Mutate** the selected agent's hook config in place instead of
     /// printing the snippet/plugin. Idempotent — replaces the engram
     /// hook entries or generated plugin and preserves unrelated config
-    /// where the agent format supports merging. A timestamped backup is
-    /// written next to the original before each modifying write.
+    /// where the agent format supports merging. A private, unpredictably named
+    /// recovery copy is retained beside the original before each modifying write.
     #[arg(long)]
     pub apply: bool,
     /// Override the settings/plugin/extension file path for the selected agent.
@@ -1411,8 +1411,8 @@ pub struct InstallMcpArgs {
     /// **Mutate** the client's config file in place instead of just
     /// printing the snippet. Idempotent: replaces any existing entry
     /// named `<name>` (default `engram`); preserves every other
-    /// MCP server the user has configured. A timestamped backup is
-    /// written next to the original before each modifying write.
+    /// MCP server the user has configured. A private, unpredictably named
+    /// recovery copy is retained beside the original before each modifying write.
     #[arg(long)]
     pub apply: bool,
     /// Override the config-file path. Auto-detected per client when

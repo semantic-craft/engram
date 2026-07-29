@@ -655,7 +655,8 @@ default:
 Re-running the command is safe. If a project still has the old long engram
 block between those markers, the refresh replaces that block in place with the
 slim snippet, leaves unrelated instructions before and after it alone, and
-writes a timestamped `.bak-*` backup before changing an existing file.
+retains the prior file inside an unpredictably named private recovery directory
+beside the target before changing an existing file.
 Managed skill files contain an engram ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 `install-instructions --print` previews only the instruction snippet; run
