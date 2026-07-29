@@ -120,7 +120,11 @@ fn durable_rule_stages_reviewable_proposal_without_touching_repository_or_wiki_t
         .current_dir(repository.path())
         .status()
         .unwrap();
-    fs::write(repository.path().join("AGENTS.md"), "# Rules\n").unwrap();
+    fs::write(
+        repository.path().join("AGENTS.md"),
+        "# Rules\n\nNever Keep SQLite writes behind the single writer actor.\n",
+    )
+    .unwrap();
     let project = "instruction-proposals";
     let addr = reserve_addr();
     let server = Server::start(data.path(), project, &addr);
