@@ -5,7 +5,7 @@
 //! approves, applies, or writes anything.
 
 use engram_core::Sanitizer;
-use engram_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use engram_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_once};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -194,7 +194,7 @@ pub async fn run_instruction_semantic_assistance(
     }
 
     budget.provider_calls = 1;
-    let response: InstructionSemanticLlmResponse = complete_structured(
+    let response: InstructionSemanticLlmResponse = complete_structured_once(
         llm,
         ChatRequest {
             system: Some(SYSTEM_PROMPT.into()),
@@ -450,6 +450,7 @@ fn protected_context_removed(before: &str, after: &str) -> bool {
             "deploy",
             "production",
             "internal tool",
+            "internal-tool",
             "migration",
             "business",
             "security",
@@ -527,7 +528,55 @@ fn preflight_rejection(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
+
+    struct SingleCallOnlyProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SingleCallOnlyProvider {
+        fn name(&self) -> &'static str {
+            "single-call-only"
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> engram_llm::LlmResult<engram_llm::ChatResponse> {
+            panic!("semantic assistance must not use plain completion")
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> engram_llm::LlmResult<serde_json::Value> {
+            panic!("semantic assistance must use the single-call structured path")
+        }
+
+        async fn complete_structured_raw_once(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> engram_llm::LlmResult<serde_json::Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({
+                "summary": "no change",
+                "findings": [],
+                "proposal": null,
+                "rejected_candidates": []
+            }))
+        }
+    }
 
     fn evidence(content: &str) -> Vec<InstructionSemanticEvidence> {
         vec![InstructionSemanticEvidence {
@@ -535,6 +584,27 @@ mod tests {
             source: "_rules/test.md".into(),
             content: content.into(),
         }]
+    }
+
+    #[tokio::test]
+    async fn semantic_assistance_uses_single_call_provider_path() {
+        let provider = SingleCallOnlyProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let report = run_instruction_semantic_assistance(
+            &provider,
+            InstructionSemanticInput {
+                logical_target: "AGENTS.md".into(),
+                base_content: "# Rules\n".into(),
+                evidence: evidence("Keep ownership explicit."),
+            },
+        )
+        .await
+        .expect("single-call semantic assistance");
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.budget.provider_calls, 1);
+        assert!(report.proposal.is_none());
     }
 
     #[test]
@@ -589,6 +659,29 @@ mod tests {
                 &proposal,
                 "# Rules\nKeep production deployments reviewed.\n",
                 &evidence("Keep deployments reviewed.")
+            )
+            .unwrap_err(),
+            "protected_context_removed"
+        );
+    }
+
+    #[test]
+    fn hyphenated_internal_tool_context_cannot_be_removed() {
+        let proposal = InstructionSemanticProposal {
+            operation: "update".into(),
+            target_context_layer: "root_instructions".into(),
+            proposed_content: "# Rules\n".into(),
+            rationale: "shorter".into(),
+            citations: vec![InstructionSemanticCitation {
+                source: "_rules/test.md".into(),
+                quote: "Keep ownership explicit.".into(),
+            }],
+        };
+        assert_eq!(
+            validate_proposal(
+                &proposal,
+                "# Rules\nInternal-tool ownership stays with Platform.\n",
+                &evidence("Keep ownership explicit.")
             )
             .unwrap_err(),
             "protected_context_removed"

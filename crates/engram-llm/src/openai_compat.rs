@@ -98,6 +98,60 @@ impl OpenAiCompatProvider {
         self.strict = strict;
         self
     }
+
+    async fn complete_strict_structured_raw_once(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        enforce_strict_object_schemas(&mut schema);
+        let value = self.inner.complete_structured_raw(request, schema).await?;
+        if value.is_object() {
+            Ok(value)
+        } else {
+            Err(LlmError::UnexpectedShape(
+                "openai-compat strict response was not a JSON object".into(),
+            ))
+        }
+    }
+
+    async fn complete_tolerant_structured_raw(
+        &self,
+        request: ChatRequest,
+    ) -> LlmResult<serde_json::Value> {
+        // Most older local engines don't honour `response_format`. Ask for
+        // JSON and extract the first balanced `{…}` object from the text.
+        let res = self.inner.complete(request).await?;
+        // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
+        // `<think>…</think>` before the JSON. Strip those blocks (and any
+        // surrounding markdown fences) before trying to parse — otherwise
+        // `first_json_object` latches onto a `{` inside the reasoning text.
+        let cleaned = strip_reasoning_blocks(&res.text);
+        match serde_json::from_str::<serde_json::Value>(&cleaned) {
+            Ok(v) if v.is_object() => Ok(v),
+            _ => {
+                let Some(slice) = first_json_object(&cleaned) else {
+                    // Dump enough text to actually see what the model
+                    // returned. 200 chars truncates inside code fences;
+                    // 4 KB tells the full story for any reasonable
+                    // structured-output response. Includes head + tail
+                    // because some failures truncate the closing brace.
+                    let head = truncate_with_ellipsis(&cleaned, 2000);
+                    let tail = suffix_within_bytes(&cleaned, 2000);
+                    debug!(
+                        head = %head,
+                        tail = %tail,
+                        total_len = cleaned.len(),
+                        "no balanced JSON object found"
+                    );
+                    return Err(LlmError::UnexpectedShape(
+                        "openai-compat response did not contain a JSON object".into(),
+                    ));
+                };
+                serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -147,17 +201,11 @@ impl LlmProvider for OpenAiCompatProvider {
         // routinely fall back (e.g. reasoning models with `<think>` in
         // `content`) should keep `strict=false` to avoid the double call.
         if self.strict {
-            let mut strict_schema = schema.clone();
-            enforce_strict_object_schemas(&mut strict_schema);
             match self
-                .inner
-                .complete_structured_raw(request.clone(), strict_schema)
+                .complete_strict_structured_raw_once(request.clone(), schema)
                 .await
             {
-                Ok(v) if v.is_object() => return Ok(v),
-                Ok(_) => {
-                    debug!("compat strict: non-object response, falling back to tolerant parser");
-                }
+                Ok(v) => return Ok(v),
                 Err(err) if is_parse_shape_error(&err) => {
                     debug!(error = %err, "compat strict parse-shape mismatch, falling back to tolerant parser");
                 }
@@ -169,38 +217,19 @@ impl LlmProvider for OpenAiCompatProvider {
                 }
             }
         }
-        // Default (and strict fallback): most older local engines don't
-        // honour `response_format`. Ask for JSON and extract the first
-        // balanced `{…}` object from the text.
-        let res = self.inner.complete(request).await?;
-        // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
-        // `<think>…</think>` before the JSON. Strip those blocks (and any
-        // surrounding markdown fences) before trying to parse — otherwise
-        // `first_json_object` latches onto a `{` inside the reasoning text.
-        let cleaned = strip_reasoning_blocks(&res.text);
-        match serde_json::from_str::<serde_json::Value>(&cleaned) {
-            Ok(v) if v.is_object() => Ok(v),
-            _ => {
-                let Some(slice) = first_json_object(&cleaned) else {
-                    // Dump enough text to actually see what the model
-                    // returned. 200 chars truncates inside code fences;
-                    // 4 KB tells the full story for any reasonable
-                    // structured-output response. Includes head + tail
-                    // because some failures truncate the closing brace.
-                    let head = truncate_with_ellipsis(&cleaned, 2000);
-                    let tail = suffix_within_bytes(&cleaned, 2000);
-                    debug!(
-                        head = %head,
-                        tail = %tail,
-                        total_len = cleaned.len(),
-                        "no balanced JSON object found"
-                    );
-                    return Err(LlmError::UnexpectedShape(
-                        "openai-compat response did not contain a JSON object".into(),
-                    ));
-                };
-                serde_json::from_str::<serde_json::Value>(slice).map_err(LlmError::from)
-            }
+        self.complete_tolerant_structured_raw(request).await
+    }
+
+    async fn complete_structured_raw_once(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        if self.strict {
+            self.complete_strict_structured_raw_once(request, schema)
+                .await
+        } else {
+            self.complete_tolerant_structured_raw(request).await
         }
     }
 }
