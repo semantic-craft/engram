@@ -24,19 +24,28 @@
 
   // 外部 agent 修改提示词的脚手架：{{files}} / {{notes}} 由当前文件自动填充，
   // 结尾留「我的需求」空槽，用户粘贴后自行补充，外部 agent 直接执行。
+  // 编辑准则取自官方文档：code.claude.com/docs/en/memory、
+  // code.claude.com/docs/en/best-practices、agents.md。
   const DEFAULT_TEMPLATE = `请修改以下 agent 指令文件。先完整读一遍目标文件再动手，按文末需求直接执行修改。
 
 目标文件：
 {{files}}
 
-注意事项：
+这些文件的性质（官方文档）：
+- 指令文件在每个会话开始时全文注入上下文——长度即成本，越长遵循度越差（官方建议单文件 < 200 行）。
+- 它们是给 agent 的持久指令而非强制配置：越具体、越简洁、结构越清晰，遵循越可靠。
+
+编辑准则：
 {{notes}}
-- 安全红线与不变式类规则，除非下面明确点名，一律保留。
-- 保持原有结构、语言与风格；最小 diff；不要重排无关段落。
-- 改完后用一句话总结每处改动。
+- 保留：模型猜不到的命令与环境怪癖、与默认不同的风格约定、架构决策、坑（gotcha）、安全红线（除非下面明确点名要删）。
+- 删除：模型读代码就能推出的内容（目录结构、依赖清单等）、模型本来就懂的通用常识、过时或一次性的信息。
+- 合并语义重复的条目；互相矛盾的条目会让 agent 随机选边，必须消解。
+- 判断标准（官方）：逐条自问"删掉这条会导致 agent 犯错吗？"——不会就删。
+- 写法：短 bullet + markdown 标题分组；模糊改具体（如"跑 npm test 再提交"优于"记得测试"）；IMPORTANT/YOU MUST 只用于最关键的少数规则。
+- 保持原有语言与结构；最小 diff；不要重排无关段落；改完逐文件用一句话总结改动。
 
 ## 我的需求
-（粘贴后在这里补充，例如：删掉关于 X 的过时条目 / 把 Y 规则改成 Z / 合并重复规则……）`;
+（粘贴后在这里补充，例如：删掉关于 X 的过时条目 / 把 Y 规则改成 Z / 只做瘦身……）`;
 
   let tab = $state<"global" | "project">("global");
   let globalFiles = $state<InstructionFile[]>([]);
@@ -138,7 +147,14 @@
       );
     }
     if (files.some(isPointer)) {
-      notes.push("- CLAUDE.md 是指针文件（@AGENTS.md），改动一律落在 AGENTS.md。");
+      notes.push(
+        "- CLAUDE.md 是指针文件（@AGENTS.md，官方推荐的两工具共用模式），改动一律落在 AGENTS.md。",
+      );
+    }
+    if (files.some((f) => f.exists && f.path.endsWith("AGENTS.md"))) {
+      notes.push(
+        "- AGENTS.md 是跨工具开放标准（Codex / Cursor / Gemini CLI 等都读取），改动影响所有 agent，不只某一家。",
+      );
     }
     return notes.join("\n");
   }
@@ -185,6 +201,12 @@
     return f.path === "CLAUDE.md" && (f.content ?? "").trimStart().startsWith("@AGENTS.md");
   }
 
+  // 官方指导：指令文件每会话全文注入，建议单文件 < 200 行。
+  function lineCount(f: InstructionFile): number | null {
+    if (!f.exists || f.content == null || f.truncated) return null;
+    return f.content.split("\n").length;
+  }
+
   /** 按 engram 托管标记切分内容，托管区块高亮。 */
   function segments(content: string): { managed: boolean; text: string }[] {
     const out: { managed: boolean; text: string }[] = [];
@@ -209,7 +231,17 @@
       <span class="path mono">{f.path}</span>
       {#if isPointer(f)}<span class="ptrtag">指针文件 → AGENTS.md</span>{/if}
       {#if f.exists}
-        <span class="meta">{fmtBytes(f.size)}{f.truncated ? " · 预览已截断" : ""}</span>
+        {@const lines = lineCount(f)}
+        <span class="meta">
+          {fmtBytes(f.size)}{lines != null ? ` · ${lines} 行` : ""}{f.truncated
+            ? " · 预览已截断"
+            : ""}
+        </span>
+        {#if lines != null && lines > 200}
+          <span class="linewarn" title="官方指导：指令文件每会话全文注入，单文件建议 < 200 行，越长遵循度越差">
+            ⚠ 超官方建议 200 行
+          </span>
+        {/if}
       {:else}
         <span class="meta">未找到</span>
       {/if}
@@ -434,6 +466,16 @@
     border-radius: 99px;
     background: rgba(74, 58, 167, 0.12);
     color: var(--k-slot);
+  }
+
+  .linewarn {
+    font-size: 10.5px;
+    font-weight: 650;
+    padding: 1px 8px;
+    border-radius: 99px;
+    background: rgba(250, 178, 25, 0.14);
+    color: var(--st-warn);
+    cursor: help;
   }
 
   .rootrow {
