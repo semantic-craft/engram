@@ -1485,7 +1485,10 @@ pub struct ServeArgs {
     /// stateless clients (OpenCode `type: "remote"`, `curl`) work without
     /// an `mcp-remote` stdio shim (issue #3). Enable this only for
     /// clients that need session continuity or server-initiated SSE
-    /// streams. No effect on `--transport stdio`.
+    /// streams. Applies only to clients that negotiate a pre-2026-07-28
+    /// protocol version: MCP 2026-07-28 removed protocol-level sessions,
+    /// so those requests are always served statelessly. No effect on
+    /// `--transport stdio`.
     #[arg(long)]
     pub http_stateful: bool,
     /// Origin allowed to call /api/v1 cross-origin (CORS). Repeat the flag
