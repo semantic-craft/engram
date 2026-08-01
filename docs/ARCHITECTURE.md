@@ -504,8 +504,10 @@ LLM_API_KEY                    accepted for openai embeddings only with a custom
 * **Richer curator actions.** The shipped curator stages only one report page;
   future work can add individual merge/supersession/link-fix proposals while
   keeping deletes and semantic rewrites review-gated.
-* **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
-  once the headless server has been load-tested.
+* **Multi-workspace UI / web dashboard.** The Tauri desktop app now ships a
+  project switcher (default workspace) with per-project dashboard, memory
+  layers, kind-grouped browsing, and a dedicated `_global` area; multi-
+  workspace switching and an administrative web dashboard remain future work.
 * **Real LongMemEval-S harness.** The recall-eval framework exists
   ([`crates/engram-consolidate/tests/recall_eval.rs`](../crates/engram-consolidate/tests/recall_eval.rs));
   porting LongMemEval-S itself requires the dataset.

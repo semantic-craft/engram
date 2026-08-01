@@ -255,6 +255,11 @@ Project resolution chain: explicit param → server's default → cwd-based heur
 
 To stay scoped:
 
+> Historical v1 boundary: later releases added the companion Tauri desktop
+> workbench (project-scoped memory management). The headless engine remains
+> usable without it, and the built-in web surface is still a read-only
+> browser rather than an administrative dashboard.
+
 - No multi-tenant auth/RBAC (single-user homelab).
 - No web UI / dashboard (use `sqlite3` + `glow`/Obsidian).
 - No Postgres backend (revisit if a real homelab user hits scale walls).
