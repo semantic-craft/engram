@@ -19,11 +19,41 @@
 
   const GLOBAL_CANDIDATES = ["~/.claude/CLAUDE.md", "~/.codex/AGENTS.md"];
   const CUSTOM_KEY = "engram.instructions.custom";
+  const TEMPLATE_KEY = "engram.instructions.promptTemplate";
   const rootKey = (p: string) => `engram.instructions.root.${p}`;
+
+  // 外部 agent 修改提示词的脚手架：{{files}} / {{notes}} 由当前文件自动填充，
+  // 结尾留「我的需求」空槽，用户粘贴后自行补充，外部 agent 直接执行。
+  // 编辑准则取自官方文档：code.claude.com/docs/en/memory、
+  // code.claude.com/docs/en/best-practices、agents.md。
+  const DEFAULT_TEMPLATE = `请修改以下 agent 指令文件。先完整读一遍目标文件再动手，按文末需求直接执行修改。
+
+目标文件：
+{{files}}
+
+这些文件的性质（官方文档）：
+- 指令文件在每个会话开始时全文注入上下文——长度即成本，越长遵循度越差（官方建议单文件 < 200 行）。
+- 它们是给 agent 的持久指令而非强制配置：越具体、越简洁、结构越清晰，遵循越可靠。
+
+编辑准则：
+{{notes}}
+- 保留：模型猜不到的命令与环境怪癖、与默认不同的风格约定、架构决策、坑（gotcha）、安全红线（除非下面明确点名要删）。
+- 删除：模型读代码就能推出的内容（目录结构、依赖清单等）、模型本来就懂的通用常识、过时或一次性的信息。
+- 合并语义重复的条目；互相矛盾的条目会让 agent 随机选边，必须消解。
+- 判断标准（官方）：逐条自问"删掉这条会导致 agent 犯错吗？"——不会就删。
+- 写法：短 bullet + markdown 标题分组；模糊改具体（如"跑 npm test 再提交"优于"记得测试"）；IMPORTANT/YOU MUST 只用于最关键的少数规则。
+- 保持原有语言与结构；最小 diff；不要重排无关段落；改完逐文件用一句话总结改动。
+
+## 我的需求
+（粘贴后在这里补充，例如：删掉关于 X 的过时条目 / 把 Y 规则改成 Z / 只做瘦身……）`;
 
   let tab = $state<"global" | "project">("global");
   let globalFiles = $state<InstructionFile[]>([]);
   let projectFiles = $state<InstructionFile[]>([]);
+  let template = $state(localStorage.getItem(TEMPLATE_KEY) ?? DEFAULT_TEMPLATE);
+  let editingTemplate = $state(false);
+  let templateDraft = $state("");
+  let copied = $state<string | null>(null);
   let customPaths = $state<string[]>(JSON.parse(localStorage.getItem(CUSTOM_KEY) ?? "[]"));
   let addingPath = $state("");
   let showAdd = $state(false);
@@ -102,8 +132,79 @@
     openInEditor(f.abs_path).catch((e) => onError(`打开失败：${e}`));
   }
 
+  function fileLine(f: InstructionFile): string {
+    const tags: string[] = [];
+    if (isPointer(f)) tags.push("指针文件 → AGENTS.md，规则不要写进这里");
+    else if (f.path === "AGENTS.md") tags.push("canonical 指令文件");
+    return `- ${f.abs_path}${tags.length ? `（${tags.join("；")}）` : ""}`;
+  }
+
+  function buildNotes(files: InstructionFile[]): string {
+    const notes: string[] = [];
+    if (files.some((f) => (f.content ?? "").includes("<!-- engram:start -->"))) {
+      notes.push(
+        "- 绝不修改 <!-- engram:start --> … <!-- engram:end --> 托管区块（engram 自动维护，手改会被重写）。",
+      );
+    }
+    if (files.some(isPointer)) {
+      notes.push(
+        "- CLAUDE.md 是指针文件（@AGENTS.md，官方推荐的两工具共用模式），改动一律落在 AGENTS.md。",
+      );
+    }
+    if (files.some((f) => f.exists && f.path.endsWith("AGENTS.md"))) {
+      notes.push(
+        "- AGENTS.md 是跨工具开放标准（Codex / Cursor / Gemini CLI 等都读取），改动影响所有 agent，不只某一家。",
+      );
+    }
+    return notes.join("\n");
+  }
+
+  function buildPrompt(files: InstructionFile[]): string {
+    const fs = files.filter((f) => f.exists);
+    return template
+      .replace("{{files}}", fs.map(fileLine).join("\n") || "-（无）")
+      .replace("{{notes}}", buildNotes(fs) || "-（该文件无 engram 托管区块，可整体编辑）");
+  }
+
+  async function copyText(text: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // WKWebView 剪贴板兜底
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    copied = key;
+    setTimeout(() => {
+      if (copied === key) copied = null;
+    }, 1600);
+  }
+
+  function startEditTemplate() {
+    templateDraft = template;
+    editingTemplate = true;
+  }
+
+  function saveTemplate() {
+    template = templateDraft;
+    localStorage.setItem(TEMPLATE_KEY, template);
+    editingTemplate = false;
+  }
+
+  let tabFiles = $derived(tab === "global" ? globalFiles : projectFiles);
+
   function isPointer(f: InstructionFile): boolean {
     return f.path === "CLAUDE.md" && (f.content ?? "").trimStart().startsWith("@AGENTS.md");
+  }
+
+  // 官方指导：指令文件每会话全文注入，建议单文件 < 200 行。
+  function lineCount(f: InstructionFile): number | null {
+    if (!f.exists || f.content == null || f.truncated) return null;
+    return f.content.split("\n").length;
   }
 
   /** 按 engram 托管标记切分内容，托管区块高亮。 */
@@ -130,12 +231,30 @@
       <span class="path mono">{f.path}</span>
       {#if isPointer(f)}<span class="ptrtag">指针文件 → AGENTS.md</span>{/if}
       {#if f.exists}
-        <span class="meta">{fmtBytes(f.size)}{f.truncated ? " · 预览已截断" : ""}</span>
+        {@const lines = lineCount(f)}
+        <span class="meta">
+          {fmtBytes(f.size)}{lines != null ? ` · ${lines} 行` : ""}{f.truncated
+            ? " · 预览已截断"
+            : ""}
+        </span>
+        {#if lines != null && lines > 200}
+          <span class="linewarn" title="官方指导：指令文件每会话全文注入，单文件建议 < 200 行，越长遵循度越差">
+            ⚠ 超官方建议 200 行
+          </span>
+        {/if}
       {:else}
         <span class="meta">未找到</span>
       {/if}
       <div class="facts">
-        {#if f.exists}<button class="btn" onclick={() => open(f)}>在编辑器打开</button>{/if}
+        {#if f.exists}
+          <button class="btn" onclick={() => copyText(buildPrompt([f]), f.abs_path)}>
+            {copied === f.abs_path ? "✓ 已复制" : "⧉ 修改提示词"}
+          </button>
+          <button class="btn" onclick={() => copyText(f.abs_path, `p:${f.abs_path}`)}>
+            {copied === `p:${f.abs_path}` ? "✓" : "复制路径"}
+          </button>
+          <button class="btn" onclick={() => open(f)}>在编辑器打开</button>
+        {/if}
         {#if removable}<button class="btn" onclick={() => removeCustom(f.path)}>移除</button>{/if}
       </div>
     </div>
@@ -156,9 +275,21 @@
 <div class="ph">
   <h1>指令文件</h1>
   <span class="sub">AGENTS.md / CLAUDE.md · 本机直读</span>
+  <div class="acts">
+    <button
+      class="btn"
+      onclick={() => copyText(buildPrompt(tabFiles), `tab:${tab}`)}
+      disabled={!tabFiles.some((f) => f.exists)}
+    >
+      {copied === `tab:${tab}` ? "✓ 已复制" : "⧉ 本页全部 · 修改提示词"}
+    </button>
+    <button class="btn" onclick={startEditTemplate}>编辑模板</button>
+  </div>
 </div>
 <div class="banner">
-  ⓘ&nbsp;显示的是<b>本机</b>文件（Desktop 直接读取）；其他机器上的指令文件不在此列。只读展示——修改请用「在编辑器打开」。
+  ⓘ&nbsp;显示的是<b>本机</b>文件（Desktop 直接读取）；查看确认要改的内容后，「⧉ 修改提示词」会把文件路径 +
+  注意事项拼成脚手架复制到剪贴板——粘贴到外部 agent（Claude Code / Codex 等）后在「我的需求」处补充具体改法，由外部
+  agent 直接执行。此页本身只读。
 </div>
 
 <div class="tabs">
@@ -213,9 +344,53 @@
   </div>
 {/if}
 
+{#if editingTemplate}
+  <div
+    class="overlay"
+    onclick={(e) => e.target === e.currentTarget && (editingTemplate = false)}
+    role="presentation"
+  >
+    <div class="modal wide">
+      <h3>编辑修改提示词模板</h3>
+      <div class="tplhint">
+        <code>{"{{files}}"}</code> 会替换成当前文件的绝对路径清单，<code>{"{{notes}}"}</code>
+        替换成按文件自动生成的注意事项（托管区块 / 指针文件）。模板保存在本机。
+      </div>
+      <textarea class="tpl mono" rows="16" bind:value={templateDraft}></textarea>
+      <div class="mrow">
+        <button class="btn" onclick={() => (templateDraft = DEFAULT_TEMPLATE)}>恢复默认</button>
+        <button class="btn" onclick={() => (editingTemplate = false)}>取消</button>
+        <button class="btn pri" onclick={saveTemplate}>保存</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .filecard {
     margin-bottom: 12px;
+  }
+
+  .modal.wide {
+    width: 640px;
+  }
+
+  .tplhint {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .tpl {
+    width: 100%;
+    font-size: 12px;
+    line-height: 1.55;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--page);
+    color: var(--ink);
+    resize: vertical;
   }
 
   .fh {
@@ -291,6 +466,16 @@
     border-radius: 99px;
     background: rgba(74, 58, 167, 0.12);
     color: var(--k-slot);
+  }
+
+  .linewarn {
+    font-size: 10.5px;
+    font-weight: 650;
+    padding: 1px 8px;
+    border-radius: 99px;
+    background: rgba(250, 178, 25, 0.14);
+    color: var(--st-warn);
+    cursor: help;
   }
 
   .rootrow {
