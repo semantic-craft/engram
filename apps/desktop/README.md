@@ -61,6 +61,6 @@ the Apple Silicon DMG, then writes a matching `.sha256` file. The credential
 profile stays in Keychain and is never stored in this repository.
 
 The current public build is
-[`desktop-v0.1.1`](https://github.com/semantic-craft/engram/releases/tag/desktop-v0.1.1).
+[`desktop-v0.2.0`](https://github.com/semantic-craft/engram/releases/tag/desktop-v0.2.0).
 It is a workbench for a separately installed, locally running Engram engine;
 install the CLI release and start the daemon before opening the desktop app.
