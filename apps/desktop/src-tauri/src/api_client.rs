@@ -393,6 +393,29 @@ impl ApiClient {
         resp.json().await.map_err(|e| e.to_string())
     }
 
+    /// Session timeline rows for this client's project, newest-first.
+    pub async fn sessions(&self, limit: u32) -> Result<serde_json::Value, String> {
+        self.project_get("sessions", limit).await
+    }
+
+    /// Handoff history in every state for this client's project. Reading
+    /// this never consumes an open handoff.
+    pub async fn handoffs(&self, limit: u32) -> Result<serde_json::Value, String> {
+        self.project_get("handoffs", limit).await
+    }
+
+    async fn project_get(&self, leaf: &str, limit: u32) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "{}/api/v1/workspaces/{}/projects/{}/{}?limit={}",
+            self.base, self.ws, self.proj, leaf, limit
+        );
+        let resp = self.get(&url).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(err_body(resp).await);
+        }
+        resp.json().await.map_err(|e| e.to_string())
+    }
+
     /// Raw `{handoff, briefing, health}` overview for this client's project.
     /// Passed through as JSON: the dashboard renders subsets and the shape
     /// is still evolving server-side.

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { projectOverview, type Overview } from "./api";
+  import { projectOverview, readPage, type Overview } from "./api";
   import { kindColor, kindLabel, relTime } from "./kinds";
 
   let {
@@ -20,10 +20,13 @@
 
   let overview = $state<Overview | null>(null);
   let loading = $state(true);
+  // 核心记忆正文：briefing 只给标题，正文按页懒读。
+  let bodies = $state<Record<string, string>>({});
 
   async function load(p: string) {
     loading = true;
     overview = null;
+    bodies = {};
     try {
       overview = await projectOverview(p);
     } catch (e) {
@@ -35,6 +38,22 @@
 
   $effect(() => {
     load(project);
+  });
+
+  let corePages = $derived(
+    overview ? [...overview.briefing.slots, ...overview.briefing.rules].slice(0, 5) : [],
+  );
+
+  $effect(() => {
+    for (const p of corePages) {
+      if (p.path in bodies) continue;
+      readPage(p.path, project)
+        .then((d) => {
+          const b = d.body.trim();
+          bodies[p.path] = b.length > 220 ? `${b.slice(0, 220)} …` : b;
+        })
+        .catch(() => (bodies[p.path] = ""));
+    }
   });
 
   const healthRows = [
@@ -97,10 +116,10 @@
 
     <div class="card">
       <h3>核心记忆（L3） <button class="more" onclick={onGotoLayers}>分层视图 →</button></h3>
-      {#each [...b.slots, ...b.rules].slice(0, 5) as r (r.path)}
+      {#each corePages as r (r.path)}
         <button class="rulebox rlink" onclick={() => onOpenPage(r.path)}>
           <div class="rp mono">{r.path}</div>
-          {r.title}
+          {bodies[r.path] || r.title}
         </button>
       {:else}
         <div class="hint">还没有 _rules/ 或 _slots/ 页——整理管线沉淀后会出现在这里。</div>
@@ -169,6 +188,10 @@
 
   .rlink:hover {
     border-color: var(--accent-border);
+  }
+
+  .rlink {
+    white-space: pre-wrap;
   }
 
   .hint {
