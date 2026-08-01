@@ -12,6 +12,14 @@ below start from the fork.
 
 ### Added
 
+- Desktop: the instruction-files view can now copy a paste-ready prompt
+  scaffold for external agents (Claude Code / Codex / …) — per file or for
+  the whole tab. The scaffold carries the files' absolute paths plus
+  auto-generated guardrails (never touch the engram managed block; pointer
+  CLAUDE.md routes edits to AGENTS.md) and ends with a "my request" slot
+  the user fills in after pasting. The template is editable and stored
+  locally; a copy-path button ships alongside.
+
 - `GET /api/v1/projects` now includes each project's `repo_path` (the
   on-disk repository root recorded at project creation, `null` when
   unresolved), so local clients such as the desktop app can locate
