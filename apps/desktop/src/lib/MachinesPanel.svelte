@@ -13,9 +13,14 @@
   } from "./api";
 
   let {
+    project,
     onSelect,
     onError,
-  }: { onSelect: (path: string) => void; onError: (msg: string) => void } = $props();
+  }: {
+    project?: string;
+    onSelect: (path: string) => void;
+    onError: (msg: string) => void;
+  } = $props();
 
   let status = $state<Record<string, unknown> | null>(null);
   let health = $state<MemoryHealth | null>(null);
@@ -35,7 +40,7 @@
       status = null;
     }
     try {
-      health = await memoryHealth();
+      health = await memoryHealth(project);
     } catch {
       health = null;
     }
@@ -59,18 +64,18 @@
   const stop = () => op("daemon", daemonStop);
   const embedPreview = () =>
     op("embed", async () => {
-      const r = await runEmbed(false, true);
+      const r = await runEmbed(false, true, project);
       return `embed 预览：待补 ${r.would_embed} 页（${r.provider}/${r.model}/${r.dim}）`;
     });
   const embedRun = () =>
     op("embed", async () => {
-      const r = await runEmbed(false, false);
+      const r = await runEmbed(false, false, project);
       return `embed 完成：新增 ${r.embedded}，跳过 ${r.skipped}，失败 ${r.failed}`;
     });
   const sweepPreview = () =>
-    op("sweep", async () => `sweep 预览：${JSON.stringify(await runSweep(true))}`);
+    op("sweep", async () => `sweep 预览：${JSON.stringify(await runSweep(true, project))}`);
   const sweepRun = () =>
-    op("sweep", async () => `sweep 完成：${JSON.stringify(await runSweep(false))}`);
+    op("sweep", async () => `sweep 完成：${JSON.stringify(await runSweep(false, project))}`);
   const backup = () =>
     op("backup", async () => {
       const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
@@ -106,7 +111,7 @@
 
   <section>
     <div class="sec-head">
-      <h2>Embedding</h2>
+      <h2>Embedding · {project ?? "_global"}</h2>
       <div class="btns">
         <button onclick={embedPreview} disabled={busy !== null}>预览缺失</button>
         <button onclick={embedRun} disabled={busy !== null}>补 embedding</button>
@@ -116,7 +121,7 @@
 
   <section>
     <div class="sec-head">
-      <h2>记忆健康</h2>
+      <h2>记忆健康 · {project ?? "_global"}</h2>
       <div class="btns">
         <button onclick={sweepPreview} disabled={busy !== null}>sweep 预览</button>
         <button onclick={sweepRun} disabled={busy !== null}>执行 sweep</button>

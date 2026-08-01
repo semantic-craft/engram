@@ -10,7 +10,22 @@ below start from the fork.
 
 ## Unreleased
 
+### Added
+
+- `GET /api/v1/projects` now includes each project's `repo_path` (the
+  on-disk repository root recorded at project creation, `null` when
+  unresolved), so local clients such as the desktop app can locate
+  per-project instruction files. Documented in `docs/frontend-api.md`.
+
 ### Fixed
+
+- Path-derived `kind` in the pages listing (`GET
+  /api/v1/workspaces/{ws}/projects/{p}/pages`) now covers the full
+  canonical taxonomy: `_slots/` → `slot`, `concepts/` → `concept`,
+  `procedures/` → `procedure`, `notes/` → `note`, alongside the existing
+  `_rules/`, `decisions/`, and `gotchas/` prefixes. Previously pages under
+  the newly covered prefixes fell through to `fact` when their frontmatter
+  carried no explicit `kind`.
 
 - Stores created by engram 2.0.0 can now be opened by 2.1.0+ builds. V28–V30
   (project-instruction proposals/review/applications) shipped in 2.1.0

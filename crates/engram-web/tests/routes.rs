@@ -413,6 +413,11 @@ async fn api_projects_returns_project_stats() {
         .upsert_page(new_page(ws, proj, "foo.md", "Foo Page", "Hello world"))
         .await
         .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "withrepo", Some("/tmp/example-repo".into()))
+        .await
+        .unwrap();
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
@@ -429,6 +434,22 @@ async fn api_projects_returns_project_stats() {
     assert_eq!(json[0]["workspace_name"], "default");
     assert_eq!(json[0]["project_name"], "scratch");
     assert_eq!(json[0]["page_count"], 1);
+    assert!(
+        json[0]["repo_path"].is_null(),
+        "no repo_path recorded → null: {json}"
+    );
+    let withrepo = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project_name"] == "withrepo")
+        .expect("withrepo project present");
+    assert!(
+        withrepo["repo_path"]
+            .as_str()
+            .is_some_and(|p| p.contains("example-repo")),
+        "repo_path surfaced for clients: {withrepo}"
+    );
 }
 
 #[tokio::test]
@@ -626,7 +647,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
         .unwrap();
 
     // Page WITH an explicit `kind = "rule"` in its frontmatter, sitting at
-    // a path that would otherwise derive `fact`. The explicit kind must win.
+    // a path that would otherwise derive `note`. The explicit kind must win.
     store
         .writer
         .upsert_page(NewPage {
@@ -643,6 +664,35 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
         })
         .await
         .unwrap();
+
+    // One frontmatter-less page per remaining canonical prefix: derivation
+    // must mirror `canonical_kind_for_path`, and unknown prefixes stay `fact`.
+    for (path, title) in [
+        ("procedures/release.md", "Release"),
+        ("concepts/scope.md", "Scope"),
+        ("_slots/current-focus.md", "Focus"),
+        ("_rules/numbering.md", "Numbering"),
+        ("gotchas/locks.md", "Locks"),
+        ("notes/plain.md", "Plain"),
+        ("sessions/abc.md", "Session"),
+    ] {
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                title: title.to_owned(),
+                body: title.to_owned(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+    }
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
@@ -675,6 +725,22 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
         rule["kind"], "rule",
         "explicit frontmatter kind wins over path derivation"
     );
+
+    for (path, want) in [
+        ("procedures/release.md", "procedure"),
+        ("concepts/scope.md", "concept"),
+        ("_slots/current-focus.md", "slot"),
+        ("_rules/numbering.md", "rule"),
+        ("gotchas/locks.md", "gotcha"),
+        ("notes/plain.md", "note"),
+        ("sessions/abc.md", "fact"),
+    ] {
+        let page = pages
+            .iter()
+            .find(|p| p["path"] == path)
+            .unwrap_or_else(|| panic!("{path} present"));
+        assert_eq!(page["kind"], want, "derived kind for {path}");
+    }
 }
 
 #[tokio::test]

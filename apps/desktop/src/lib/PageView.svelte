@@ -3,6 +3,7 @@
 
   let {
     page,
+    project,
     autoEdit = false,
     onSelect,
     onSaved,
@@ -11,6 +12,7 @@
     onError,
   }: {
     page: PageDetail | null;
+    project?: string;
     autoEdit?: boolean;
     onSelect: (path: string) => void;
     onSaved: (path: string) => void;
@@ -48,16 +50,19 @@
     try {
       const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
       const tags = Array.isArray(fm.tags) ? (fm.tags as string[]) : [];
-      await writePage({
-        path: page.path,
-        body: draft,
-        title: page.title || undefined,
-        kind: page.kind,
-        tier: page.tier,
-        tags,
-        pinned: page.pinned ?? false,
-        frontmatter: fm,
-      });
+      await writePage(
+        {
+          path: page.path,
+          body: draft,
+          title: page.title || undefined,
+          kind: page.kind,
+          tier: page.tier,
+          tags,
+          pinned: page.pinned ?? false,
+          frontmatter: fm,
+        },
+        project,
+      );
       editing = false;
       onSaved(page.path);
     } catch (e) {
@@ -70,7 +75,7 @@
   async function confirmDelete() {
     if (!page) return;
     try {
-      await deletePage(page.path);
+      await deletePage(page.path, project);
       onDeleted(page.path);
     } catch (e) {
       onError(`删除失败：${e}`);
