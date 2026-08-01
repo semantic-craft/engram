@@ -1,0 +1,332 @@
+<script lang="ts">
+  import {
+    discoverProjectInstructions,
+    openInEditor,
+    readInstructionFiles,
+    type InstructionFile,
+  } from "./api";
+  import { fmtBytes } from "./kinds";
+
+  let {
+    project,
+    repoPath,
+    onError,
+  }: {
+    project: string;
+    repoPath: string | null;
+    onError: (msg: string) => void;
+  } = $props();
+
+  const GLOBAL_CANDIDATES = ["~/.claude/CLAUDE.md", "~/.codex/AGENTS.md"];
+  const CUSTOM_KEY = "engram.instructions.custom";
+  const rootKey = (p: string) => `engram.instructions.root.${p}`;
+
+  let tab = $state<"global" | "project">("global");
+  let globalFiles = $state<InstructionFile[]>([]);
+  let projectFiles = $state<InstructionFile[]>([]);
+  let customPaths = $state<string[]>(JSON.parse(localStorage.getItem(CUSTOM_KEY) ?? "[]"));
+  let addingPath = $state("");
+  let showAdd = $state(false);
+  let manualRoot = $state("");
+  // repo_path 缺失时用户手动指定的项目根（按项目记住）。
+  let savedRoot = $state<string | null>(null);
+
+  $effect(() => {
+    savedRoot = localStorage.getItem(rootKey(project));
+  });
+
+  let effectiveRoot = $derived(repoPath ?? savedRoot);
+
+  async function loadGlobal() {
+    try {
+      globalFiles = await readInstructionFiles([...GLOBAL_CANDIDATES, ...customPaths]);
+    } catch (e) {
+      onError(`读取全局指令文件失败：${e}`);
+    }
+  }
+
+  async function loadProject(root: string) {
+    try {
+      projectFiles = await discoverProjectInstructions(root);
+    } catch (e) {
+      onError(`读取项目指令文件失败：${e}`);
+      projectFiles = [];
+    }
+  }
+
+  $effect(() => {
+    void customPaths;
+    loadGlobal();
+  });
+
+  $effect(() => {
+    if (effectiveRoot) loadProject(effectiveRoot);
+    else projectFiles = [];
+  });
+
+  function addCustom() {
+    const p = addingPath.trim();
+    if (!p) return;
+    if (!p.startsWith("/") && !p.startsWith("~/")) {
+      onError("自定义路径必须是绝对路径或 ~/ 开头");
+      return;
+    }
+    customPaths = [...customPaths, p];
+    localStorage.setItem(CUSTOM_KEY, JSON.stringify(customPaths));
+    addingPath = "";
+    showAdd = false;
+  }
+
+  function removeCustom(p: string) {
+    customPaths = customPaths.filter((x) => x !== p);
+    localStorage.setItem(CUSTOM_KEY, JSON.stringify(customPaths));
+  }
+
+  function clearRoot() {
+    localStorage.removeItem(rootKey(project));
+    savedRoot = null;
+  }
+
+  function setManualRoot() {
+    const r = manualRoot.trim();
+    if (!r.startsWith("/") && !r.startsWith("~/")) {
+      onError("项目根必须是绝对路径或 ~/ 开头");
+      return;
+    }
+    localStorage.setItem(rootKey(project), r);
+    savedRoot = r;
+    manualRoot = "";
+  }
+
+  function open(f: InstructionFile) {
+    openInEditor(f.abs_path).catch((e) => onError(`打开失败：${e}`));
+  }
+
+  function isPointer(f: InstructionFile): boolean {
+    return f.path === "CLAUDE.md" && (f.content ?? "").trimStart().startsWith("@AGENTS.md");
+  }
+
+  /** 按 engram 托管标记切分内容，托管区块高亮。 */
+  function segments(content: string): { managed: boolean; text: string }[] {
+    const out: { managed: boolean; text: string }[] = [];
+    let rest = content;
+    for (;;) {
+      const s = rest.indexOf("<!-- engram:start -->");
+      if (s < 0) break;
+      const e = rest.indexOf("<!-- engram:end -->", s);
+      if (e < 0) break;
+      if (s > 0) out.push({ managed: false, text: rest.slice(0, s) });
+      out.push({ managed: true, text: rest.slice(s, e + "<!-- engram:end -->".length) });
+      rest = rest.slice(e + "<!-- engram:end -->".length);
+    }
+    if (rest) out.push({ managed: false, text: rest });
+    return out;
+  }
+</script>
+
+{#snippet fileCard(f: InstructionFile, removable: boolean)}
+  <div class="card filecard" class:missing={!f.exists}>
+    <div class="fh">
+      <span class="path mono">{f.path}</span>
+      {#if isPointer(f)}<span class="ptrtag">指针文件 → AGENTS.md</span>{/if}
+      {#if f.exists}
+        <span class="meta">{fmtBytes(f.size)}{f.truncated ? " · 预览已截断" : ""}</span>
+      {:else}
+        <span class="meta">未找到</span>
+      {/if}
+      <div class="facts">
+        {#if f.exists}<button class="btn" onclick={() => open(f)}>在编辑器打开</button>{/if}
+        {#if removable}<button class="btn" onclick={() => removeCustom(f.path)}>移除</button>{/if}
+      </div>
+    </div>
+    {#if f.exists && f.content}
+      <div class="fprev">
+        {#each segments(f.content) as seg, i (i)}
+          {#if seg.managed}
+            <div class="managed"><span class="mtag">engram 托管区块</span><pre>{seg.text}</pre></div>
+          {:else}
+            <pre>{seg.text}</pre>
+          {/if}
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+<div class="ph">
+  <h1>指令文件</h1>
+  <span class="sub">AGENTS.md / CLAUDE.md · 本机直读</span>
+</div>
+<div class="banner">
+  ⓘ&nbsp;显示的是<b>本机</b>文件（Desktop 直接读取）；其他机器上的指令文件不在此列。只读展示——修改请用「在编辑器打开」。
+</div>
+
+<div class="tabs">
+  <button class="tab" class:on={tab === "global"} onclick={() => (tab = "global")}>全局</button>
+  <button class="tab" class:on={tab === "project"} onclick={() => (tab = "project")}>
+    本项目 · {project}
+  </button>
+</div>
+
+{#if tab === "global"}
+  {#each globalFiles as f (f.path)}
+    {@render fileCard(f, customPaths.includes(f.path))}
+  {/each}
+  {#if showAdd}
+    <div class="addrow">
+      <input
+        class="addinput mono"
+        placeholder="~/Projects/CLAUDE.md"
+        bind:value={addingPath}
+        onkeydown={(e) => e.key === "Enter" && addCustom()}
+      />
+      <button class="btn pri" onclick={addCustom}>添加</button>
+      <button class="btn" onclick={() => (showAdd = false)}>取消</button>
+    </div>
+  {:else}
+    <button class="btn" onclick={() => (showAdd = true)}>＋ 添加自定义路径</button>
+  {/if}
+{:else if effectiveRoot}
+  <div class="rootrow">
+    项目根：<b class="mono">{effectiveRoot}</b>
+    <span class="src">{repoPath ? "（来自服务器 repo_path）" : "（手动指定）"}</span>
+    {#if !repoPath}
+      <button class="btn" onclick={clearRoot}>重新指定</button>
+    {/if}
+  </div>
+  {#each projectFiles as f (f.path)}
+    {@render fileCard(f, false)}
+  {/each}
+{:else}
+  <div class="empty">
+    <div class="big">◌</div>
+    服务器未记录此项目的本地路径（repo_path 为空）。手动指定项目根目录：
+    <div class="addrow center">
+      <input
+        class="addinput mono"
+        placeholder="/Users/you/Projects/{project}"
+        bind:value={manualRoot}
+        onkeydown={(e) => e.key === "Enter" && setManualRoot()}
+      />
+      <button class="btn pri" onclick={setManualRoot}>使用此目录</button>
+    </div>
+  </div>
+{/if}
+
+<style>
+  .filecard {
+    margin-bottom: 12px;
+  }
+
+  .fh {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .fh .path {
+    font-weight: 650;
+  }
+
+  .fh .meta {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .facts {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+  }
+
+  .filecard.missing {
+    opacity: 0.55;
+  }
+
+  .fprev {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-top: 10px;
+    font-size: 12px;
+    max-height: 260px;
+    overflow-y: auto;
+    line-height: 1.65;
+  }
+
+  .fprev pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+  }
+
+  .managed {
+    border: 1px solid var(--accent-border);
+    background: var(--managed-bg);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin: 8px 0;
+    position: relative;
+  }
+
+  .managed .mtag {
+    position: absolute;
+    top: -9px;
+    right: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    background: var(--accent);
+    color: #fff;
+    padding: 0 8px;
+    border-radius: 99px;
+  }
+
+  .ptrtag {
+    font-size: 10.5px;
+    font-weight: 650;
+    padding: 1px 8px;
+    border-radius: 99px;
+    background: rgba(74, 58, 167, 0.12);
+    color: var(--k-slot);
+  }
+
+  .rootrow {
+    font-size: 12.5px;
+    color: var(--ink2);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .rootrow .src {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .addrow {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .addrow.center {
+    justify-content: center;
+    margin-top: 14px;
+  }
+
+  .addinput {
+    font: inherit;
+    font-size: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--ink);
+    width: 320px;
+  }
+</style>

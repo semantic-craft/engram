@@ -1,6 +1,7 @@
 mod api_client;
 mod commands;
 mod daemon_manager;
+mod instructions;
 mod types;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -26,6 +27,11 @@ pub fn run() {
             commands::pending_diff,
             commands::pending_approve,
             commands::pending_reject,
+            commands::list_projects_stats,
+            commands::project_overview,
+            commands::read_instruction_files,
+            commands::discover_project_instructions,
+            commands::open_in_editor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

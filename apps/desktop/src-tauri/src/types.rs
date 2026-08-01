@@ -53,6 +53,44 @@ pub struct Hit {
     pub snippet: Option<String>,
     #[serde(default)]
     pub rank: Option<f64>,
+    // Present only on global (cross-project) hits.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// One row of `GET /api/v1/projects`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectSummary {
+    pub workspace_name: String,
+    pub project_name: String,
+    #[serde(default)]
+    pub page_count: u64,
+    #[serde(default)]
+    pub last_updated: Option<String>,
+    /// Repository root on the daemon's machine (shared with this app in
+    /// the single-machine deployment); `None` when never resolved.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+}
+
+/// A local agent-instruction file (CLAUDE.md / AGENTS.md), read directly
+/// from this machine's filesystem — never through the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstructionFile {
+    /// Display path as requested (`~/...` or a root-relative name).
+    pub path: String,
+    pub abs_path: String,
+    pub exists: bool,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub modified_ms: Option<u64>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
