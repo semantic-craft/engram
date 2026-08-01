@@ -25,14 +25,14 @@ authors = ["Xianwei Zhang"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-engram-core = { path = "crates/engram-core", version = "2.1.0" }
-engram-store = { path = "crates/engram-store", version = "2.1.0" }
-engram-wiki = { path = "crates/engram-wiki", version = "2.1.0" }
-engram-mcp = { path = "crates/engram-mcp", version = "2.1.0" }
-engram-hooks = { path = "crates/engram-hooks", version = "2.1.0" }
-engram-llm = { path = "crates/engram-llm", version = "2.1.0" }
-engram-consolidate = { path = "crates/engram-consolidate", version = "2.1.0" }
-engram-web = { path = "crates/engram-web", version = "2.1.0" }
+engram-core = { path = "crates/engram-core", version = "2.2.0" }
+engram-store = { path = "crates/engram-store", version = "2.2.0" }
+engram-wiki = { path = "crates/engram-wiki", version = "2.2.0" }
+engram-mcp = { path = "crates/engram-mcp", version = "2.2.0" }
+engram-hooks = { path = "crates/engram-hooks", version = "2.2.0" }
+engram-llm = { path = "crates/engram-llm", version = "2.2.0" }
+engram-consolidate = { path = "crates/engram-consolidate", version = "2.2.0" }
+engram-web = { path = "crates/engram-web", version = "2.2.0" }
 
 # (Workspace shared deps follow below)
 

@@ -10,39 +10,56 @@ below start from the fork.
 
 ## Unreleased
 
-## 2.2.0 - 2026-08-01
+## Desktop 0.2.0 - 2026-08-01
 
 ### Added
 
-- Desktop: a **会话与交接** (sessions & handoffs) view per project — a
+- The desktop app is now a project-based memory hub with an island-style
+  layout: a project switcher (default workspace), per-project dashboard
+  (pending handoff, counts, health drill-down, core memory, recent
+  pages), an L0–L3 memory-layers view, a kind-grouped knowledge base
+  with distribution bars, a dedicated 全局记忆 area for the `_global`
+  scope, machine-local instruction-file viewing (CLAUDE.md / AGENTS.md
+  with engram managed-block highlighting), and scoped/global semantic
+  search. The default window grew to 1360×880 with a global 1.12 zoom.
+- A **会话与交接** (sessions & handoffs) view per project — a
   day-grouped session timeline (agent, duration, observation count, cwd,
   jump to the summary page; still-open sessions marked live) plus the
   handoff history with open/accepted/expired state. The handoff tab is a
   read-only audit view and never consumes a pending handoff. Against a
   daemon that predates the endpoints it explains that instead of raising
   an error.
-- Desktop: pages can be moved between a project and the `_global` scope
-  from the page view (copy-then-delete, so a failed write never loses the
-  page), the dashboard's core-memory card now shows rule/slot bodies
-  rather than titles alone, and the instruction-files view gained a
+- Pages can be moved between a project and the `_global` scope from the
+  page view (copy-then-delete, so a failed write never loses the page),
+  the dashboard's core-memory card now shows rule/slot bodies rather
+  than titles alone, and the instruction-files view gained a
   **load-chain** panel listing the official precedence order (managed
   policy → user → project → project-local) with each layer marked present
   or unused on this machine.
+- The instruction-files view can copy a paste-ready prompt scaffold for
+  external agents (Claude Code / Codex / …) — per file or for the whole
+  tab. The scaffold carries the files' absolute paths plus auto-generated
+  guardrails (never touch the engram managed block; pointer CLAUDE.md
+  routes edits to AGENTS.md) and ends with a "my request" slot the user
+  fills in after pasting. The template is editable and stored locally; a
+  copy-path button ships alongside.
+
+### Fixed
+
+- macOS desktop release checksum sidecars now record the downloadable DMG
+  filename instead of a repository-relative build path, so users can verify
+  both downloaded assets directly with `shasum -a 256 -c`.
+
+## 2.2.0 - 2026-08-01
+
+### Added
+
 - New read-only endpoints
   `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` and `…/handoffs`
   list a project's session timeline (agent, cwd, start/end, observation
   count, summary-page path) and its full handoff history in every state.
   Reading the handoff list never consumes an open handoff. Documented in
   `docs/frontend-api.md` §4.9.
-
-- Desktop: the instruction-files view can now copy a paste-ready prompt
-  scaffold for external agents (Claude Code / Codex / …) — per file or for
-  the whole tab. The scaffold carries the files' absolute paths plus
-  auto-generated guardrails (never touch the engram managed block; pointer
-  CLAUDE.md routes edits to AGENTS.md) and ends with a "my request" slot
-  the user fills in after pasting. The template is editable and stored
-  locally; a copy-path button ships alongside.
-
 - `GET /api/v1/projects` now includes each project's `repo_path` (the
   on-disk repository root recorded at project creation, `null` when
   unresolved), so local clients such as the desktop app can locate
@@ -71,6 +88,14 @@ below start from the fork.
   store, and a tripwire test fails CI if a future migration is ever numbered
   below the released high-water mark again.
 
+- `initialize` no longer forces every client down to MCP `2024-11-05`. The
+  server hard-pinned the launch revision in `get_info()`, so a Claude Code
+  client asking for `2025-11-25` — or any other agent asking for anything
+  newer — was answered with `2024-11-05` and lost every protocol feature added
+  since. The server now negotiates against the revisions it actually
+  implements (`2024-11-05` through `2026-07-28`) and echoes the client's
+  request, falling back to the SDK default only for unknown versions.
+
 ### Changed
 
 - The MCP server now speaks the current specification. Upgraded the Rust MCP
@@ -87,19 +112,6 @@ below start from the fork.
   request `2025-11-25` instead of `2024-11-05` / `2025-03-26`. Both still use
   the `initialize` handshake, which `2026-07-28` replaced, so `2025-11-25` is
   the highest revision they can claim.
-
-### Fixed
-
-- `initialize` no longer forces every client down to MCP `2024-11-05`. The
-  server hard-pinned the launch revision in `get_info()`, so a Claude Code
-  client asking for `2025-11-25` — or any other agent asking for anything
-  newer — was answered with `2024-11-05` and lost every protocol feature added
-  since. The server now negotiates against the revisions it actually
-  implements (`2024-11-05` through `2026-07-28`) and echoes the client's
-  request, falling back to the SDK default only for unknown versions.
-- macOS desktop release checksum sidecars now record the downloadable DMG
-  filename instead of a repository-relative build path, so users can verify
-  both downloaded assets directly with `shasum -a 256 -c`.
 
 ## Desktop 0.1.1 - 2026-07-29
 
