@@ -105,20 +105,24 @@ GET /api/v1/projects                  # all projects across all workspaces
 GET /api/v1/projects?workspace=NAME   # projects in one workspace
 ```
 
-**Response:** `{ "projects": [ProjectSummary, …] }`
+**Response:** `[ProjectSummary, …]` (bare array)
 
 ```json
-{
-  "projects": [
-    {
-      "workspace_name": "default",
-      "project_name": "engram",
-      "page_count": 138,
-      "last_updated": "2026-05-28T14:02:11.123Z"
-    }
-  ]
-}
+[
+  {
+    "workspace_name": "default",
+    "project_name": "engram",
+    "page_count": 138,
+    "last_updated": "2026-05-28T14:02:11.123Z",
+    "repo_path": "/home/user/projects/engram"
+  }
+]
 ```
+
+`repo_path` is the on-disk repository root recorded at project creation,
+or `null` when no git work-tree root could be resolved. It is a path on
+the **server's** machine; local clients (e.g. the desktop app) use it to
+locate per-project instruction files when they share that filesystem.
 
 ### 4.3 Pages (list)
 

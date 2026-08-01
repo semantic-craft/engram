@@ -457,6 +457,11 @@ pub struct ProjectSummary {
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
     pub last_updated: Option<String>,
+    /// On-disk repository root recorded at project creation, or `None`
+    /// when no git work-tree root could be resolved (see
+    /// `heal_catch_all_repo_paths`). Lets local clients (e.g. the desktop
+    /// app) find per-project instruction files.
+    pub repo_path: Option<String>,
 }
 
 /// One workspace scope with the id + name needed to write its
@@ -3299,7 +3304,8 @@ impl ReaderPool {
                 "SELECT w.name AS workspace_name, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
-                        MAX(pg.updated_at) AS last_updated_us \
+                        MAX(pg.updated_at) AS last_updated_us, \
+                        p.repo_path \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
@@ -3312,11 +3318,18 @@ impl ReaderPool {
                 let project_name: String = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
                 let last_updated_us: Option<i64> = row.get(3)?;
-                Ok((workspace_name, project_name, page_count, last_updated_us))
+                let repo_path: Option<String> = row.get(4)?;
+                Ok((
+                    workspace_name,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                    repo_path,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (workspace_name, project_name, page_count, last_updated_us) = r?;
+                let (workspace_name, project_name, page_count, last_updated_us, repo_path) = r?;
                 let last_updated = last_updated_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
@@ -3326,6 +3339,7 @@ impl ReaderPool {
                     project_name,
                     page_count: page_count.max(0) as u64,
                     last_updated,
+                    repo_path,
                 });
             }
             Ok(out)
@@ -3507,8 +3521,12 @@ impl ReaderPool {
                             json_extract(pg.frontmatter_json, '$.kind'), \
                             CASE \
                                 WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN pg.path LIKE '\\_slots/%' ESCAPE '\\' THEN 'slot' \
                                 WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
                                 WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                WHEN pg.path LIKE 'concepts/%' THEN 'concept' \
+                                WHEN pg.path LIKE 'procedures/%' THEN 'procedure' \
+                                WHEN pg.path LIKE 'notes/%' THEN 'note' \
                                 ELSE 'fact' \
                             END \
                         ) AS kind, \
