@@ -464,6 +464,52 @@ pub struct ProjectSummary {
     pub repo_path: Option<String>,
 }
 
+/// One recorded session with the counts a timeline view needs.
+/// Returned by [`ReaderPool::sessions_for_project`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    /// Session id.
+    pub id: String,
+    /// Agent that ran the session (`claude-code`, `codex`, …).
+    pub agent: String,
+    /// Working directory the session was opened in, when recorded.
+    pub cwd: Option<String>,
+    /// ISO-8601 start timestamp.
+    pub started_at: String,
+    /// ISO-8601 end timestamp; `None` while the session is still open.
+    pub ended_at: Option<String>,
+    /// Observations captured during the session.
+    pub observations: u64,
+    /// Path of the session's summary page, when one was synthesised.
+    pub summary_path: Option<String>,
+}
+
+/// One handoff with the fields a history view needs. The full record
+/// (open questions, next steps, files touched) stays behind
+/// [`ReaderPool::handoff_by_id`].
+/// Returned by [`ReaderPool::handoffs_for_project`].
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffSummary {
+    /// Handoff id.
+    pub id: String,
+    /// Agent that wrote the handoff.
+    pub from_agent: String,
+    /// Optional target-agent hint.
+    pub to_agent: Option<String>,
+    /// Terse summary line.
+    pub summary: String,
+    /// `open` | `accepted` | `expired`.
+    pub state: String,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+    /// Agent that consumed the handoff, when accepted.
+    pub accepted_by: Option<String>,
+    /// ISO-8601 acceptance timestamp, when accepted.
+    pub accepted_at: Option<String>,
+    /// Session the handoff was written from, when it came from one.
+    pub from_session_id: Option<String>,
+}
+
 /// One workspace scope with the id + name needed to write its
 /// self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_workspace_scopes`].
@@ -1194,6 +1240,153 @@ impl ReaderPool {
                 out.push(OpenSession {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     cwd,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Recent sessions for one project, newest-first, with their observation
+    /// counts and summary-page paths. Powers the desktop timeline view.
+    ///
+    /// The per-row observation count is a correlated subquery rather than a
+    /// `GROUP BY` join: `idx_sessions_recent` satisfies the `ORDER BY` +
+    /// `LIMIT`, so the count runs only for the rows actually returned, and
+    /// `idx_observations_session` covers each one.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn sessions_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<SessionSummary>> {
+        let limit = i64::try_from(limit.clamp(1, 500)).unwrap_or(50);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT s.id, s.agent_kind, s.cwd, s.started_at, s.ended_at, \
+                        (SELECT COUNT(*) FROM observations o WHERE o.session_id = s.id), \
+                        pg.path \
+                 FROM sessions s \
+                 LEFT JOIN pages pg ON pg.id = s.summary_page_id \
+                 WHERE s.workspace_id = ?1 AND s.project_id = ?2 \
+                 ORDER BY s.started_at DESC, s.id DESC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let agent: String = row.get(1)?;
+                    let cwd: Option<String> = row.get(2)?;
+                    let started_us: i64 = row.get(3)?;
+                    let ended_us: Option<i64> = row.get(4)?;
+                    let observations: i64 = row.get(5)?;
+                    let summary_path: Option<String> = row.get(6)?;
+                    Ok((
+                        id_bytes,
+                        agent,
+                        cwd,
+                        started_us,
+                        ended_us,
+                        observations,
+                        summary_path,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, agent, cwd, started_us, ended_us, observations, summary_path) = row?;
+                #[allow(clippy::cast_sign_loss)]
+                out.push(SessionSummary {
+                    id: SessionId::from_slice(&id_bytes)?.to_string(),
+                    agent,
+                    cwd,
+                    started_at: iso_timestamp(started_us).unwrap_or_default(),
+                    ended_at: ended_us.and_then(iso_timestamp),
+                    observations: observations.max(0) as u64,
+                    summary_path,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Handoff history for one project, newest-first, in every state.
+    /// [`Self::latest_open_handoff`] stays the accept path; this is the
+    /// read-only audit view.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn handoffs_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<HandoffSummary>> {
+        let limit = i64::try_from(limit.clamp(1, 500)).unwrap_or(50);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, from_agent, to_agent, summary, state, created_at, \
+                        accepted_by, accepted_at, from_session_id \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let from_agent: String = row.get(1)?;
+                    let to_agent: Option<String> = row.get(2)?;
+                    let summary: String = row.get(3)?;
+                    let state: String = row.get(4)?;
+                    let created_us: i64 = row.get(5)?;
+                    let accepted_by: Option<String> = row.get(6)?;
+                    let accepted_us: Option<i64> = row.get(7)?;
+                    let from_session: Option<Vec<u8>> = row.get(8)?;
+                    Ok((
+                        id_bytes,
+                        from_agent,
+                        to_agent,
+                        summary,
+                        state,
+                        created_us,
+                        accepted_by,
+                        accepted_us,
+                        from_session,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (
+                    id_bytes,
+                    from_agent,
+                    to_agent,
+                    summary,
+                    state,
+                    created_us,
+                    accepted_by,
+                    accepted_us,
+                    from_session,
+                ) = row?;
+                out.push(HandoffSummary {
+                    id: HandoffId::from_slice(&id_bytes)?.to_string(),
+                    from_agent,
+                    to_agent,
+                    summary,
+                    state,
+                    created_at: iso_timestamp(created_us).unwrap_or_default(),
+                    accepted_by,
+                    accepted_at: accepted_us.and_then(iso_timestamp),
+                    from_session_id: from_session
+                        .map(|b| SessionId::from_slice(&b).map(|id| id.to_string()))
+                        .transpose()?,
                 });
             }
             Ok(out)
@@ -5196,6 +5389,13 @@ fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Op
         .into_iter()
         .filter(|h| is_handoff_candidate(h, cwd_filter))
         .max_by(prefer_handoff)
+}
+
+/// Microsecond epoch → ISO-8601, or `None` when the value is out of range.
+fn iso_timestamp(micros: i64) -> Option<String> {
+    Timestamp::from_microsecond(micros)
+        .ok()
+        .map(|ts| ts.to_string())
 }
 
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {

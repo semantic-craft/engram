@@ -155,10 +155,39 @@ export const semanticSearch = (
   opts?: { project?: string; global?: boolean },
 ) => invoke<Hit[]>("semantic_search", { query, project: opts?.project, global: opts?.global });
 
+export interface SessionRow {
+  id: string;
+  agent: string;
+  cwd?: string | null;
+  started_at: string;
+  ended_at?: string | null;
+  observations: number;
+  summary_path?: string | null;
+}
+
+export interface HandoffRow {
+  id: string;
+  from_agent: string;
+  to_agent?: string | null;
+  summary: string;
+  state: "open" | "accepted" | "expired";
+  created_at: string;
+  accepted_by?: string | null;
+  accepted_at?: string | null;
+  from_session_id?: string | null;
+}
+
 // ── 项目 / 概览 ──
 export const listProjectsStats = () => invoke<ProjectSummary[]>("list_projects_stats");
 export const projectOverview = (project: string) =>
   invoke<Overview>("project_overview", { project });
+export const listSessions = (project: string, limit?: number) =>
+  invoke<SessionRow[]>("list_sessions", { project, limit });
+export const listHandoffs = (project: string, limit?: number) =>
+  invoke<HandoffRow[]>("list_handoffs", { project, limit });
+/// 跨作用域移动页面（升格到 _global / 移回项目）。
+export const movePage = (path: string, fromProject: string, toProject: string) =>
+  invoke<WritePageResult>("move_page", { path, fromProject, toProject });
 
 // ── 指令文件（本机直读） ──
 export const readInstructionFiles = (paths: string[]) =>

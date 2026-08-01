@@ -2078,3 +2078,194 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
          (would otherwise let stale caches hide attribution flips)"
     );
 }
+
+#[tokio::test]
+async fn api_sessions_lists_timeline_with_counts() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // Older, closed session with a summary page and two observations.
+    let older = engram_core::SessionId::new();
+    store
+        .writer
+        .begin_session(engram_core::NewSession {
+            id: older,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/tmp/scratch".into()),
+        })
+        .await
+        .unwrap();
+    for i in 0..2 {
+        store
+            .writer
+            .insert_observation(engram_core::NewObservation {
+                session_id: older,
+                workspace_id: ws,
+                project_id: proj,
+                kind: engram_core::ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: format!("obs {i}"),
+                body: "body".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+    }
+    let summary_page = store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            proj,
+            "sessions/older.md",
+            "Older session",
+            "summary",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .end_session(older, Some(summary_page))
+        .await
+        .unwrap();
+
+    // Newer, still-open session with no observations.
+    let newer = engram_core::SessionId::new();
+    store
+        .writer
+        .begin_session(engram_core::NewSession {
+            id: newer,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/sessions")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "both sessions listed: {json}");
+
+    // Newest-first: the still-open Codex session leads.
+    assert_eq!(rows[0]["agent"], "codex");
+    assert!(rows[0]["ended_at"].is_null(), "open session has no end");
+    assert_eq!(rows[0]["observations"], 0);
+    assert!(rows[0]["summary_path"].is_null());
+
+    let closed = &rows[1];
+    assert_eq!(closed["agent"], "claude-code");
+    assert_eq!(closed["observations"], 2, "observation count per session");
+    assert_eq!(closed["summary_path"], "sessions/older.md");
+    assert_eq!(closed["cwd"], "/tmp/scratch");
+    assert!(closed["ended_at"].is_string(), "closed session has an end");
+    assert!(closed["started_at"].as_str().unwrap().contains('T'));
+}
+
+#[tokio::test]
+async fn api_handoffs_lists_every_state_newest_first() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let first = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "first handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::Codex,
+            to_agent: Some(AgentKind::ClaudeCode),
+            cwd: None,
+            summary: "second handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        })
+        .await
+        .unwrap();
+    // Consume the first one so the list covers more than the open state.
+    store
+        .writer
+        .accept_handoff(first, AgentKind::Codex, None)
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/handoffs")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "accepted handoffs stay in history: {json}");
+
+    let accepted = rows
+        .iter()
+        .find(|h| h["summary"] == "first handoff")
+        .expect("first handoff present");
+    assert_eq!(accepted["state"], "accepted");
+    assert_eq!(accepted["accepted_by"], "codex");
+    assert!(accepted["accepted_at"].is_string());
+
+    let open = rows
+        .iter()
+        .find(|h| h["summary"] == "second handoff")
+        .expect("second handoff present");
+    assert_eq!(open["state"], "open");
+    assert_eq!(open["from_agent"], "codex");
+    assert_eq!(open["to_agent"], "claude-code");
+    assert!(open["accepted_at"].is_null());
+}

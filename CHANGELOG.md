@@ -12,6 +12,27 @@ below start from the fork.
 
 ### Added
 
+- Desktop: a **会话与交接** (sessions & handoffs) view per project — a
+  day-grouped session timeline (agent, duration, observation count, cwd,
+  jump to the summary page; still-open sessions marked live) plus the
+  handoff history with open/accepted/expired state. The handoff tab is a
+  read-only audit view and never consumes a pending handoff. Against a
+  daemon that predates the endpoints it explains that instead of raising
+  an error.
+- Desktop: pages can be moved between a project and the `_global` scope
+  from the page view (copy-then-delete, so a failed write never loses the
+  page), the dashboard's core-memory card now shows rule/slot bodies
+  rather than titles alone, and the instruction-files view gained a
+  **load-chain** panel listing the official precedence order (managed
+  policy → user → project → project-local) with each layer marked present
+  or unused on this machine.
+- New read-only endpoints
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` and `…/handoffs`
+  list a project's session timeline (agent, cwd, start/end, observation
+  count, summary-page path) and its full handoff history in every state.
+  Reading the handoff list never consumes an open handoff. Documented in
+  `docs/frontend-api.md` §4.9.
+
 - Desktop: the instruction-files view can now copy a paste-ready prompt
   scaffold for external agents (Claude Code / Codex / …) — per file or for
   the whole tab. The scaffold carries the files' absolute paths plus

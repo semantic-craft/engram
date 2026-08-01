@@ -116,6 +116,78 @@ pub async fn list_projects_stats() -> Result<Vec<ProjectSummary>, String> {
     ApiClient::new().list_projects().await
 }
 
+/// Session timeline for one project, newest-first.
+#[tauri::command]
+pub async fn list_sessions(
+    project: String,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    ApiClient::for_project(&project)
+        .sessions(limit.unwrap_or(100))
+        .await
+}
+
+/// Handoff history for one project. Read-only: never consumes an open
+/// handoff, so the next agent session still receives it.
+#[tauri::command]
+pub async fn list_handoffs(
+    project: String,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    ApiClient::for_project(&project)
+        .handoffs(limit.unwrap_or(50))
+        .await
+}
+
+/// Move a page between project scopes (promote to `_global`, or back).
+///
+/// Copy-then-delete: the source is removed only after the destination
+/// write succeeds, so a failed write can never lose the page. A failure
+/// of the delete leaves the page in both scopes and says so — that is
+/// recoverable by hand, a silent half-move would not be.
+#[tauri::command]
+pub async fn move_page(
+    path: String,
+    from_project: String,
+    to_project: String,
+) -> Result<WritePageResult, String> {
+    if from_project.trim() == to_project.trim() {
+        return Err("source and destination projects are the same".into());
+    }
+    let src = ApiClient::for_project(&from_project);
+    let dst = ApiClient::for_project(&to_project);
+
+    let detail = src.read_page(&path).await?;
+    let frontmatter = detail.frontmatter.as_object().cloned().unwrap_or_default();
+    let tags = frontmatter
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let written = dst
+        .write_page(&WritePageArgs {
+            path: detail.path.clone(),
+            body: detail.body,
+            title: Some(detail.title).filter(|t| !t.is_empty()),
+            kind: detail.kind,
+            tier: detail.tier,
+            tags,
+            pinned: detail.pinned,
+            frontmatter: Some(frontmatter),
+        })
+        .await?;
+
+    src.delete_page(&path).await.map_err(|e| {
+        format!("page copied to {to_project} but removing it from {from_project} failed: {e}")
+    })?;
+    Ok(written)
+}
+
 /// `{handoff, briefing, health}` snapshot for one project's dashboard.
 #[tauri::command]
 pub async fn project_overview(project: String) -> Result<serde_json::Value, String> {

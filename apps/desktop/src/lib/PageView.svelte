@@ -1,23 +1,30 @@
 <script lang="ts">
-  import { writePage, deletePage, type PageDetail } from "./api";
+  import { writePage, deletePage, movePage, type PageDetail } from "./api";
+
+  const GLOBAL = "_global";
 
   let {
     page,
     project,
+    homeProject,
     autoEdit = false,
     onSelect,
     onSaved,
     onDeleted,
     onCanceled,
+    onMoved,
     onError,
   }: {
     page: PageDetail | null;
     project?: string;
+    /** 当前选中的项目：从全局记忆里「移回项目」时的目标。 */
+    homeProject?: string;
     autoEdit?: boolean;
     onSelect: (path: string) => void;
     onSaved: (path: string) => void;
     onDeleted: (path: string) => void;
     onCanceled: () => void;
+    onMoved?: (path: string, toProject: string) => void;
     onError: (msg: string) => void;
   } = $props();
 
@@ -25,12 +32,21 @@
   let draft = $state("");
   let saving = $state(false);
   let deleteArmed = $state(false);
+  let moveArmed = $state(false);
+  let moving = $state(false);
+
+  // 全局页 → 移回当前项目；项目页 → 升格到全局记忆。
+  let moveTarget = $derived(project === GLOBAL ? (homeProject ?? "") : GLOBAL);
+  let canMove = $derived(
+    !!project && !!moveTarget && moveTarget !== project && !!page && !editing,
+  );
 
   // Reset editor state whenever a different page object arrives.
   $effect(() => {
     draft = page?.body ?? "";
     editing = autoEdit;
     deleteArmed = false;
+    moveArmed = false;
   });
 
   function startEdit() {
@@ -72,6 +88,20 @@
     }
   }
 
+  async function confirmMove() {
+    if (!page || !project || !moveTarget) return;
+    moving = true;
+    try {
+      await movePage(page.path, project, moveTarget);
+      moveArmed = false;
+      onMoved?.(page.path, moveTarget);
+    } catch (e) {
+      onError(`移动失败：${e}`);
+    } finally {
+      moving = false;
+    }
+  }
+
   async function confirmDelete() {
     if (!page) return;
     try {
@@ -99,6 +129,23 @@
           <button onclick={cancelEdit} disabled={saving}>取消</button>
         {:else}
           <button onclick={startEdit}>编辑</button>
+          {#if canMove}
+            {#if moveArmed}
+              <button class="primary" onclick={confirmMove} disabled={moving}>
+                {moving ? "移动中…" : `确认移到 ${moveTarget}`}
+              </button>
+              <button onclick={() => (moveArmed = false)} disabled={moving}>取消</button>
+            {:else}
+              <button
+                onclick={() => (moveArmed = true)}
+                title={moveTarget === GLOBAL
+                  ? "移到全局记忆后，这一页会并入每个项目的检索结果"
+                  : `从全局记忆移回项目 ${moveTarget}`}
+              >
+                {moveTarget === GLOBAL ? "↑ 移到全局记忆" : `↓ 移回 ${moveTarget}`}
+              </button>
+            {/if}
+          {/if}
           {#if deleteArmed}
             <button class="danger" onclick={confirmDelete}>确认删除</button>
             <button onclick={() => (deleteArmed = false)}>取消</button>
