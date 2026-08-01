@@ -10,6 +10,21 @@ below start from the fork.
 
 ## Unreleased
 
+### Fixed
+
+- Stores created by engram 2.0.0 can now be opened by 2.1.0+ builds. V28–V30
+  (project-instruction proposals/review/applications) shipped in 2.1.0
+  numbered below the already-released V100/V101, so refinery refused to open
+  any store whose history reached 101 without them — failing startup with a
+  misleading "schema is newer than this engram build" error that actually
+  described the opposite direction. Store open now backfills embedded
+  migrations that sit below the store's high-water mark but were never
+  applied, recording them in the migration history exactly as refinery would;
+  genuinely newer stores are still rejected with the accurate
+  `DataSchemaAhead` error. A regression test reproduces the exact 2.0.0
+  store, and a tripwire test fails CI if a future migration is ever numbered
+  below the released high-water mark again.
+
 ### Changed
 
 - The MCP server now speaks the current specification. Upgraded the Rust MCP
