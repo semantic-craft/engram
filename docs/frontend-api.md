@@ -335,7 +335,57 @@ across all projects in the workspace:
 > Note: `last_open_handoff` is **not** consumed by the read API — the
 > handoff stays "open" and can still be accepted by the next agent.
 
-### 4.9 Cross-project graph
+### 4.9 Sessions and handoffs (per project)
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/sessions?limit=50
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?limit=50
+```
+
+Both return bare arrays, newest-first, `limit` clamped to 1..=500.
+
+**Sessions** — one row per recorded session, with its observation count
+and the path of its synthesised summary page when there is one.
+`ended_at` is `null` while a session is still open.
+
+```json
+[
+  {
+    "id": "0199…",
+    "agent": "claude-code",
+    "cwd": "/home/user/projects/engram",
+    "started_at": "2026-08-01T09:12:03.114Z",
+    "ended_at": "2026-08-01T10:04:55.902Z",
+    "observations": 128,
+    "summary_path": "sessions/0199….md"
+  }
+]
+```
+
+**Handoffs** — the full history in every state (`open`, `accepted`,
+`expired`), unlike the overview's `handoff` field which shows only the
+latest open one. Reading this list never consumes a handoff.
+
+```json
+[
+  {
+    "id": "019a…",
+    "from_agent": "claude-code",
+    "to_agent": null,
+    "summary": "Session ended; 2 observations recorded.",
+    "state": "accepted",
+    "created_at": "2026-08-01T01:45:34.552Z",
+    "accepted_by": "codex",
+    "accepted_at": "2026-08-01T09:12:05.001Z",
+    "from_session_id": "0199…"
+  }
+]
+```
+
+Open questions, next steps, and files touched are omitted here; fetch a
+single handoff through the MCP/admin surface when you need them.
+
+### 4.10 Cross-project graph
 
 ```http
 GET /api/v1/graph
@@ -363,7 +413,7 @@ rendering a project-level dependency view in the SPA.
 Global today (no workspace / project filter); narrower query params
 are a follow-up.
 
-### 4.10 Browser tab icon
+### 4.11 Browser tab icon
 
 ```http
 GET /favicon.ico

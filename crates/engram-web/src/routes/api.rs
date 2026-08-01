@@ -57,6 +57,14 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             "/workspaces/{workspace}/projects/{project}/overview",
             axum::routing::get(project_overview_handler),
         )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/sessions",
+            axum::routing::get(sessions_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/handoffs",
+            axum::routing::get(handoffs_handler),
+        )
         .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
 }
@@ -493,6 +501,42 @@ async fn overview_handler(
             health,
         })
         .into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// Session timeline for one project, newest-first.
+async fn sessions_handler(
+    State(state): State<Arc<WebState>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let sessions = state
+        .reader
+        .sessions_for_project(workspace_id, project_id, query.limit.clamp(1, 500))
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(sessions).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// Handoff history for one project in every state, newest-first.
+async fn handoffs_handler(
+    State(state): State<Arc<WebState>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let handoffs = state
+        .reader
+        .handoffs_for_project(workspace_id, project_id, query.limit.clamp(1, 500))
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(handoffs).into_response(),
         LIST_CACHE_MAX_AGE,
     ))
 }

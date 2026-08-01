@@ -12,6 +12,13 @@ below start from the fork.
 
 ### Added
 
+- New read-only endpoints
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` and `…/handoffs`
+  list a project's session timeline (agent, cwd, start/end, observation
+  count, summary-page path) and its full handoff history in every state.
+  Reading the handoff list never consumes an open handoff. Documented in
+  `docs/frontend-api.md` §4.9.
+
 - Desktop: the instruction-files view can now copy a paste-ready prompt
   scaffold for external agents (Claude Code / Codex / …) — per file or for
   the whole tab. The scaffold carries the files' absolute paths plus
