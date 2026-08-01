@@ -70,6 +70,11 @@ body {
   height: 100%;
 }
 
+/* 整体缩放：样式表按 13px 基准写成，桌面端统一放大一档。 */
+html {
+  zoom: 1.12;
+}
+
 body {
   font:
     13px/1.55 system-ui,
