@@ -393,6 +393,29 @@ impl ApiClient {
         resp.json().await.map_err(|e| e.to_string())
     }
 
+    /// Session timeline rows for this client's project, newest-first.
+    pub async fn sessions(&self, limit: u32) -> Result<serde_json::Value, String> {
+        self.project_get("sessions", limit).await
+    }
+
+    /// Handoff history in every state for this client's project. Reading
+    /// this never consumes an open handoff.
+    pub async fn handoffs(&self, limit: u32) -> Result<serde_json::Value, String> {
+        self.project_get("handoffs", limit).await
+    }
+
+    async fn project_get(&self, leaf: &str, limit: u32) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "{}/api/v1/workspaces/{}/projects/{}/{}?limit={}",
+            self.base, self.ws, self.proj, leaf, limit
+        );
+        let resp = self.get(&url).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(err_body(resp).await);
+        }
+        resp.json().await.map_err(|e| e.to_string())
+    }
+
     /// Raw `{handoff, briefing, health}` overview for this client's project.
     /// Passed through as JSON: the dashboard renders subsets and the shape
     /// is still evolving server-side.
@@ -616,6 +639,68 @@ mod tests {
         assert!(c.write_page(&mk("/abs/path.md")).await.is_err());
         assert!(c.delete_page("a/../b.md").await.is_err());
         assert!(c.delete_page("").await.is_err());
+    }
+
+    /// Cross-scope move primitives against a scratch daemon: the page must
+    /// land in the destination project with its frontmatter intact before the
+    /// source copy is removed. Skips silently when ENGRAM_TEST_BASE is unset.
+    #[tokio::test]
+    async fn cross_scope_move_preserves_page_then_removes_source() {
+        let Some(base) = std::env::var("ENGRAM_TEST_BASE").ok() else {
+            eprintln!("skipped: ENGRAM_TEST_BASE not set");
+            return;
+        };
+        let src = ApiClient::with_target(&base, "default", "move-src");
+        let dst = ApiClient::with_target(&base, "default", "move-dst");
+        let path = "notes/move-e2e.md";
+
+        src.write_page(&WritePageArgs {
+            path: path.into(),
+            body: "# Move me\n\noriginal body".into(),
+            title: None,
+            kind: Some("fact".into()),
+            tier: None,
+            tags: vec!["moving".into()],
+            pinned: true,
+            frontmatter: None,
+        })
+        .await
+        .expect("seed source page");
+
+        let detail = src.read_page(path).await.expect("read source");
+        let fm = detail.frontmatter.as_object().cloned().unwrap_or_default();
+        dst.write_page(&WritePageArgs {
+            path: path.into(),
+            body: detail.body.clone(),
+            title: Some(detail.title.clone()).filter(|t| !t.is_empty()),
+            kind: detail.kind.clone(),
+            tier: detail.tier.clone(),
+            tags: vec!["moving".into()],
+            pinned: detail.pinned,
+            frontmatter: Some(fm),
+        })
+        .await
+        .expect("write to destination scope");
+
+        let moved = dst.read_page(path).await.expect("destination has the page");
+        assert!(
+            moved.body.contains("original body"),
+            "body survived: {:?}",
+            moved.body
+        );
+        assert!(moved.pinned, "pinned flag survived the move");
+
+        src.delete_page(path).await.expect("remove source copy");
+        assert!(
+            src.read_page(path).await.is_err(),
+            "source scope must no longer serve the moved page"
+        );
+        assert!(
+            dst.read_page(path).await.is_ok(),
+            "destination copy must survive the source delete"
+        );
+
+        dst.delete_page(path).await.expect("cleanup destination");
     }
 
     /// Scratch-daemon integration: set ENGRAM_TEST_BASE to a daemon with a

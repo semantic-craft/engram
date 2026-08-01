@@ -26,6 +26,7 @@
   import ProjectsOverview from "$lib/ProjectsOverview.svelte";
   import ProjectSwitcher from "$lib/ProjectSwitcher.svelte";
   import SearchResults from "$lib/SearchResults.svelte";
+  import Sessions from "$lib/Sessions.svelte";
 
   type View =
     | "overview"
@@ -34,6 +35,7 @@
     | "dash"
     | "layers"
     | "kb"
+    | "sessions"
     | "page"
     | "instructions"
     | "search"
@@ -187,6 +189,16 @@
     view = prevView;
   }
 
+  /** 移动完成：两侧列表都要刷新，然后在新作用域重新打开这一页。 */
+  async function onPageMoved(path: string, toProject: string) {
+    try {
+      await Promise.all([loadPages(), loadGlobalPages()]);
+      await openPage(path, toProject);
+    } catch (e) {
+      showError(e);
+    }
+  }
+
   function onCanceled() {
     if (creating) {
       page = null;
@@ -234,6 +246,9 @@
       <button class="sbi" class:on={view === "kb"} onclick={() => goto("kb")}>
         知识库
         {#if pages.length}<span class="badge dim">{pages.length}</span>{/if}
+      </button>
+      <button class="sbi" class:on={view === "sessions"} onclick={() => goto("sessions")}>
+        会话与交接
       </button>
       <button class="sbi" class:on={view === "instructions"} onclick={() => goto("instructions")}>
         指令文件
@@ -331,6 +346,8 @@
               newPageOpen = true;
             }}
           />
+        {:else if view === "sessions"}
+          <Sessions {project} onOpenPage={(p) => openPage(p)} onError={showError} />
         {:else if view === "instructions"}
           <Instructions {project} {repoPath} onError={showError} />
         {:else if view === "search"}
@@ -357,11 +374,13 @@
           <PageView
             {page}
             project={pageProject}
+            homeProject={project}
             autoEdit={creating}
             onSelect={(p) => openPage(p, pageProject)}
             {onSaved}
             {onDeleted}
             {onCanceled}
+            onMoved={onPageMoved}
             onError={showError}
           />
         {/if}

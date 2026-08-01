@@ -197,6 +197,48 @@
 
   let tabFiles = $derived(tab === "global" ? globalFiles : projectFiles);
 
+  // 官方加载顺序（code.claude.com/docs/en/memory）：托管策略 → 用户 →
+  // 项目 → 项目本地；靠后的更具体、在上下文中更晚出现。macOS 路径。
+  const CHAIN_LAYERS = [
+    {
+      scope: "托管策略",
+      note: "组织统一下发，个人设置无法排除",
+      paths: ["/Library/Application Support/ClaudeCode/CLAUDE.md"],
+    },
+    { scope: "用户", note: "本机所有项目通用", paths: ["~/.claude/CLAUDE.md"] },
+    { scope: "项目", note: "随仓库共享给团队", paths: ["CLAUDE.md", ".claude/CLAUDE.md"] },
+    { scope: "项目本地", note: "个人私有，应加入 .gitignore", paths: ["CLAUDE.local.md"] },
+  ];
+
+  let chain = $state<InstructionFile[]>([]);
+
+  $effect(() => {
+    const root = effectiveRoot;
+    const wanted = CHAIN_LAYERS.flatMap((l) =>
+      l.paths.map((p) =>
+        p.startsWith("~") || p.startsWith("/") ? p : root ? `${root}/${p}` : null,
+      ),
+    ).filter((p): p is string => p != null);
+    if (wanted.length === 0) {
+      chain = [];
+      return;
+    }
+    readInstructionFiles(wanted)
+      .then((files) => (chain = files))
+      .catch(() => (chain = []));
+  });
+
+  /** 链上某条候选路径的读取结果（未请求时为 undefined）。 */
+  function chainEntry(displayPath: string): InstructionFile | undefined {
+    const abs =
+      displayPath.startsWith("~") || displayPath.startsWith("/")
+        ? displayPath
+        : effectiveRoot
+          ? `${effectiveRoot}/${displayPath}`
+          : null;
+    return abs == null ? undefined : chain.find((f) => f.path === abs);
+  }
+
   function isPointer(f: InstructionFile): boolean {
     return f.path === "CLAUDE.md" && (f.content ?? "").trimStart().startsWith("@AGENTS.md");
   }
@@ -292,6 +334,42 @@
   agent 直接执行。此页本身只读。
 </div>
 
+<details class="card chain">
+  <summary>
+    <b>加载链</b>
+    <span class="csub">
+      按官方加载顺序（托管策略 → 用户 → 项目 → 项目本地）；靠后的更具体，在上下文中更晚出现
+    </span>
+  </summary>
+  {#each CHAIN_LAYERS as layer (layer.scope)}
+    <div class="clayer">
+      <div class="cscope">{layer.scope}<span class="cnote">{layer.note}</span></div>
+      <div class="cpaths">
+        {#each layer.paths as p (p)}
+          {@const f = chainEntry(p)}
+          <div class="cpath" class:absent={!f?.exists}>
+            <span class="dot" style="background:{f?.exists ? 'var(--st-good)' : 'var(--grid)'}"
+            ></span>
+            <span class="mono">{p}</span>
+            {#if f?.exists}
+              <span class="cmeta">{fmtBytes(f.size)}</span>
+              <button class="cbtn" onclick={() => open(f)}>打开</button>
+            {:else if !effectiveRoot && !p.startsWith("~") && !p.startsWith("/")}
+              <span class="cmeta">未知（项目根未确定）</span>
+            {:else}
+              <span class="cmeta">未使用</span>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    </div>
+  {/each}
+  <div class="cfoot">
+    还有两层不在此列：`.claude/rules/*.md`（路径作用域规则，命中文件时才加载）与
+    auto memory 的 `MEMORY.md`（Claude 自己写，仅前 200 行/25 KB 入上下文）。
+  </div>
+</details>
+
 <div class="tabs">
   <button class="tab" class:on={tab === "global"} onclick={() => (tab = "global")}>全局</button>
   <button class="tab" class:on={tab === "project"} onclick={() => (tab = "project")}>
@@ -369,6 +447,102 @@
 <style>
   .filecard {
     margin-bottom: 12px;
+  }
+
+  .chain {
+    margin-bottom: 14px;
+    padding: 10px 16px;
+  }
+
+  .chain summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    list-style: none;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .chain summary::before {
+    content: "›";
+    color: var(--muted);
+    transition: transform 0.15s;
+  }
+
+  .chain[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .csub {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 400;
+  }
+
+  .clayer {
+    display: flex;
+    gap: 14px;
+    padding: 7px 0 7px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cscope {
+    width: 88px;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .cnote {
+    display: block;
+    font-size: 10.5px;
+    font-weight: 400;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+
+  .cpaths {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .cpath {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    padding: 2px 0;
+  }
+
+  .cpath.absent {
+    opacity: 0.45;
+  }
+
+  .cmeta {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .cbtn {
+    font: inherit;
+    font-size: 11px;
+    color: var(--accent);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .cbtn:hover {
+    text-decoration: underline;
+  }
+
+  .cfoot {
+    font-size: 11px;
+    color: var(--muted);
+    padding-top: 8px;
+    line-height: 1.5;
   }
 
   .modal.wide {
