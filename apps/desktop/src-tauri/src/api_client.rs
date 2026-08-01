@@ -1,8 +1,8 @@
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::types::{
-    DaemonStatus, EmbedReport, Hit, MemoryHealth, PageDetail, PageSummary, WritePageArgs,
-    WritePageResult,
+    DaemonStatus, EmbedReport, Hit, MemoryHealth, PageDetail, PageSummary, ProjectSummary,
+    WritePageArgs, WritePageResult,
 };
 
 const BASE: &str = "http://127.0.0.1:49374";
@@ -110,8 +110,14 @@ fn env_config() -> (String, Option<String>) {
 
 impl ApiClient {
     pub fn new() -> Self {
+        Self::for_project(PROJ)
+    }
+
+    /// Client scoped to one project in the default workspace, with the
+    /// deployment's base URL + token from `engram.env`.
+    pub fn for_project(proj: &str) -> Self {
         let (base, token) = env_config();
-        let mut c = Self::with_target(&base, WS, PROJ);
+        let mut c = Self::with_target(&base, WS, proj);
         c.token = token;
         c
     }
@@ -333,6 +339,23 @@ impl ApiClient {
     }
 
     pub async fn semantic_search(&self, query: &str) -> Result<Vec<Hit>, String> {
+        let args = serde_json::json!({
+            "query": query, "project": self.proj, "workspace": self.ws, "limit": 10});
+        self.memory_query(args, "hits").await
+    }
+
+    /// Cross-project search: `memory_query global=true`; hits carry
+    /// workspace + project so the UI can label and jump.
+    pub async fn semantic_search_global(&self, query: &str) -> Result<Vec<Hit>, String> {
+        let args = serde_json::json!({ "query": query, "global": true, "limit": 15 });
+        self.memory_query(args, "global_hits").await
+    }
+
+    async fn memory_query(
+        &self,
+        arguments: serde_json::Value,
+        hits_key: &str,
+    ) -> Result<Vec<Hit>, String> {
         let init = serde_json::json!({
             "jsonrpc":"2.0","id":0,"method":"initialize",
             // Stays on the `initialize` handshake, so the highest revision
@@ -346,8 +369,7 @@ impl ApiClient {
         let _ = self.mcp_post(&notified).await?;
         let call = serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_query","arguments":{
-                "query": query, "project": self.proj, "workspace": self.ws, "limit": 10}}});
+            "params":{"name":"memory_query","arguments": arguments}});
         let resp = self.mcp_call(call).await?;
         if let Some(msg) = resp["error"]["message"].as_str() {
             return Err(format!("memory_query error: {msg}"));
@@ -356,14 +378,29 @@ impl ApiClient {
             .as_str()
             .ok_or("no content in memory_query response")?;
         let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        serde_json::from_value(parsed["hits"].clone()).map_err(|e| e.to_string())
+        serde_json::from_value(parsed[hits_key].clone()).map_err(|e| e.to_string())
     }
 
-    /// Workspace project inventory (name + page_count rows) for the
-    /// pending-queue fan-out. `/admin/pending-writes` is per-project by
-    /// design, so the queue aggregates client-side.
-    pub async fn list_projects(&self) -> Result<Vec<serde_json::Value>, String> {
+    /// Workspace project inventory: stats rows for the project switcher /
+    /// overview grid, and the fan-out list for the pending queue
+    /// (`/admin/pending-writes` is per-project by design).
+    pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>, String> {
         let url = format!("{}/api/v1/projects?workspace={}", self.base, self.ws);
+        let resp = self.get(&url).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(err_body(resp).await);
+        }
+        resp.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Raw `{handoff, briefing, health}` overview for this client's project.
+    /// Passed through as JSON: the dashboard renders subsets and the shape
+    /// is still evolving server-side.
+    pub async fn project_overview(&self, limit: u32) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "{}/api/v1/workspaces/{}/projects/{}/overview?limit={}",
+            self.base, self.ws, self.proj, limit
+        );
         let resp = self.get(&url).send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(err_body(resp).await);
