@@ -1,0 +1,514 @@
+/* Engram Desktop — island 风格全局样式（跟随系统明暗）。
+   组件只用这里的 token 与工具类；组件内 <style> 仅放布局微调。 */
+
+:root {
+  color-scheme: light;
+  --page: #f1f0ec;
+  --surface: #fcfcfb;
+  --card: #f5f4f1;
+  --ink: #0b0b0b;
+  --ink2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.1);
+  --hover: rgba(11, 11, 11, 0.045);
+  --accent: #2a78d6;
+  --accent-weak: rgba(42, 120, 214, 0.1);
+  --accent-border: rgba(42, 120, 214, 0.45);
+  --k-decision: #2a78d6;
+  --k-gotcha: #eb6834;
+  --k-procedure: #1baf7a;
+  --k-rule: #eda100;
+  --k-concept: #e87ba4;
+  --k-session: #008300;
+  --k-slot: #4a3aa7;
+  --k-fact: #898781;
+  --st-good: #0ca30c;
+  --st-warn: #fab219;
+  --st-serious: #ec835a;
+  --st-critical: #d03b3b;
+  --mark: rgba(237, 161, 0, 0.28);
+  --managed-bg: rgba(42, 120, 214, 0.06);
+  --island-shadow: 0 6px 24px rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --card: #232322;
+    --ink: #ffffff;
+    --ink2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.1);
+    --hover: rgba(255, 255, 255, 0.05);
+    --accent: #3987e5;
+    --accent-weak: rgba(57, 135, 229, 0.14);
+    --accent-border: rgba(57, 135, 229, 0.5);
+    --k-decision: #3987e5;
+    --k-gotcha: #d95926;
+    --k-procedure: #199e70;
+    --k-rule: #c98500;
+    --k-concept: #d55181;
+    --k-slot: #9085e9;
+    --mark: rgba(201, 133, 0, 0.35);
+    --managed-bg: rgba(57, 135, 229, 0.09);
+    --island-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font:
+    13px/1.55 system-ui,
+    -apple-system,
+    "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  background: var(--page);
+  color: var(--ink);
+}
+
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+/* ── 按钮 / 徽章 / 彩点 ─────────────────────────── */
+button.btn {
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 13px;
+  border-radius: 9px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink);
+}
+button.btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+button.btn.pri {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.btn.pri:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+button.btn.danger {
+  color: var(--st-critical);
+  border-color: var(--st-critical);
+}
+button.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.kpill {
+  font-size: 10.5px;
+  font-weight: 650;
+  padding: 1px 8px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+
+.projtag {
+  font-size: 10.5px;
+  padding: 0 7px;
+  border-radius: 99px;
+  background: var(--hover);
+  color: var(--muted);
+}
+
+mark {
+  background: var(--mark);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* ── 页头 / 卡片 / 指标 ─────────────────────────── */
+.ph {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.ph h1 {
+  font-size: 17px;
+  font-weight: 700;
+  margin: 0;
+}
+.ph .sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+.ph .acts {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.desc {
+  font-size: 12px;
+  color: var(--ink2);
+  margin: 0 0 16px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.card h3 {
+  font-size: 13px;
+  font-weight: 700;
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card h3 .more {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--accent);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 14px 0;
+}
+.tile {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 14px;
+}
+.tile .v {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.tile .l {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.cols2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.banner {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 12px;
+  color: var(--ink2);
+  background: var(--accent-weak);
+  border: 1px solid var(--accent-border);
+  border-radius: 9px;
+  padding: 9px 13px;
+  margin: 0 0 16px;
+}
+
+.empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 44px 0;
+  font-size: 12.5px;
+}
+.empty .big {
+  font-size: 26px;
+  margin-bottom: 8px;
+}
+
+/* ── chips / 分布条 / 页面行列表 ────────────────── */
+.chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 11px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink2);
+  cursor: pointer;
+}
+.chip:hover {
+  background: var(--hover);
+}
+.chip.on {
+  background: var(--accent-weak);
+  border-color: var(--accent-border);
+  color: var(--ink);
+  font-weight: 600;
+}
+.chip b {
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.dist {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 10px 0 16px;
+}
+.dist .drow {
+  display: grid;
+  grid-template-columns: 110px 1fr 90px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.dist .dl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink2);
+}
+.dist .db {
+  height: 10px;
+  border-radius: 4px;
+  background: var(--grid);
+  overflow: hidden;
+}
+.dist .db i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+}
+.dist .dv {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.plist {
+  display: flex;
+  flex-direction: column;
+}
+.prow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  padding: 8px 10px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: var(--ink);
+  cursor: pointer;
+  border-radius: 0;
+}
+.prow:hover {
+  background: var(--hover);
+}
+.prow .t {
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prow .p {
+  color: var(--muted);
+  font-size: 11.5px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.prow .tm {
+  color: var(--muted);
+  font-size: 11.5px;
+  width: 74px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ── 展开行（健康度等） ─────────────────────────── */
+details.exp summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  padding: 6px 0;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+details.exp summary::before {
+  content: "›";
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+details.exp[open] summary::before {
+  transform: rotate(90deg);
+}
+details.exp summary .n {
+  margin-left: auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+details.exp .exp-body {
+  padding: 2px 0 8px 18px;
+  font-size: 12px;
+  color: var(--ink2);
+}
+details.exp .exp-body button {
+  color: var(--accent);
+  display: block;
+  padding: 2px 0;
+  cursor: pointer;
+  background: none;
+  border: none;
+  font: inherit;
+  text-align: left;
+}
+
+.rulebox {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 12px;
+  margin: 6px 0;
+}
+.rulebox .rp {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+/* ── tabs / segment ─────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin: 12px 0;
+}
+.tab {
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 14px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tab.on {
+  color: var(--ink);
+  font-weight: 650;
+  border-bottom-color: var(--accent);
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.seg button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 13px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.seg button.on {
+  background: var(--accent-weak);
+  color: var(--accent);
+  font-weight: 650;
+}
+
+/* ── 弹窗 ───────────────────────────────────────── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  width: 440px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.modal h3 {
+  margin: 0 0 12px;
+  font-size: 14.5px;
+}
+.modal label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 10px 0 4px;
+}
+.modal input,
+.modal select {
+  width: 100%;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--page);
+  color: var(--ink);
+}
+.modal .mrow {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
