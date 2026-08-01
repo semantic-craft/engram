@@ -1694,7 +1694,9 @@ function toolInputSchema(tool: any): any {
 async function bootstrapMcpBridge(pi: any): Promise<void> {
   try {
     await mcpRpc("initialize", {
-      protocolVersion: "2025-03-26",
+      // Highest revision the `initialize` handshake can claim; 2026-07-28
+      // replaced it with per-request _meta + server/discover.
+      protocolVersion: "2025-11-25",
       capabilities: {},
       clientInfo: { name: "engram-pi-extension", version: "0.0.0" },
     });

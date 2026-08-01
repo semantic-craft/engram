@@ -14,7 +14,17 @@
 > supports stdio servers — not because of session state. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `engram serve --transport http
-> --http-stateful` to restore rmcp's session mode.
+> --http-stateful` to restore rmcp's session mode. That flag applies only
+> to clients negotiating a pre-2026-07-28 protocol version — MCP
+> 2026-07-28 removed protocol-level sessions and the `Mcp-Session-Id`
+> header outright, so those requests are always served statelessly.
+
+> **Protocol versions.** The server negotiates every MCP revision the Rust
+> SDK implements — `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`,
+> and `2026-07-28` — and answers `initialize` with whichever of those the
+> client asked for. 2026-07-28 clients can skip `initialize` entirely and
+> use `server/discover` plus per-request `_meta`. Clients requesting an
+> unknown revision get the SDK's current default (`2025-11-25`).
 
 This page documents how to register engram as an MCP server with
 agent CLIs beyond the README quick start.

@@ -242,7 +242,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // in-process `ActiveProject` pointer, not the transport
             // session — so session mode buys us nothing. `--http-stateful`
             // restores rmcp's session+SSE behaviour for clients that want
-            // it.
+            // it, and only for clients that negotiate a pre-2026-07-28
+            // protocol version: MCP 2026-07-28 removed protocol-level
+            // sessions, so rmcp serves those requests statelessly
+            // regardless of this flag.
             info!(
                 stateful = args.http_stateful,
                 "MCP Streamable HTTP transport mode"
@@ -253,7 +256,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 StreamableHttpServerConfig::default()
                     .with_cancellation_token(cancel.child_token())
                     .with_allowed_hosts(config.allowed_hosts.clone())
-                    .with_stateful_mode(args.http_stateful)
+                    .with_legacy_session_mode(args.http_stateful)
                     .with_json_response(!args.http_stateful),
             );
             // Shared per-cwd project cache: the hook router owns it; the admin

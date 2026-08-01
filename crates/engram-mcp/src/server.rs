@@ -20,7 +20,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -2402,9 +2402,18 @@ impl ServerHandler for EngramServer {
         let mut implementation = Implementation::from_build_env();
         implementation.name = "engram".into();
         implementation.version = env!("CARGO_PKG_VERSION").into();
+        // This is the *fallback* only. rmcp negotiates `initialize` against
+        // `ServerHandler::supported_protocol_versions()` (defaulted to every
+        // revision the SDK implements, currently 2024-11-05 through
+        // 2026-07-28) and echoes whatever the client asked for when it is on
+        // that list; this value is used only when the client requests a
+        // version rmcp does not know. Tracking `LATEST` rather than pinning a
+        // literal keeps that fallback on the SDK's stable default — pinning
+        // 2024-11-05 here previously forced every client down to the launch
+        // revision.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(MEMORY_INSTRUCTIONS.to_string())
     }
 }
@@ -2429,7 +2438,7 @@ impl EngramServer {
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(s)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
 }
 
 fn checkpoint_or_mcp(wiki: &Wiki, message: impl AsRef<str>) -> Result<Option<String>, McpError> {
