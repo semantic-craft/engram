@@ -19,11 +19,32 @@
 
   const GLOBAL_CANDIDATES = ["~/.claude/CLAUDE.md", "~/.codex/AGENTS.md"];
   const CUSTOM_KEY = "engram.instructions.custom";
+  const TEMPLATE_KEY = "engram.instructions.promptTemplate";
   const rootKey = (p: string) => `engram.instructions.root.${p}`;
+
+  // 外部 agent 修改提示词的脚手架：{{files}} / {{notes}} 由当前文件自动填充，
+  // 结尾留「我的需求」空槽，用户粘贴后自行补充，外部 agent 直接执行。
+  const DEFAULT_TEMPLATE = `请修改以下 agent 指令文件。先完整读一遍目标文件再动手，按文末需求直接执行修改。
+
+目标文件：
+{{files}}
+
+注意事项：
+{{notes}}
+- 安全红线与不变式类规则，除非下面明确点名，一律保留。
+- 保持原有结构、语言与风格；最小 diff；不要重排无关段落。
+- 改完后用一句话总结每处改动。
+
+## 我的需求
+（粘贴后在这里补充，例如：删掉关于 X 的过时条目 / 把 Y 规则改成 Z / 合并重复规则……）`;
 
   let tab = $state<"global" | "project">("global");
   let globalFiles = $state<InstructionFile[]>([]);
   let projectFiles = $state<InstructionFile[]>([]);
+  let template = $state(localStorage.getItem(TEMPLATE_KEY) ?? DEFAULT_TEMPLATE);
+  let editingTemplate = $state(false);
+  let templateDraft = $state("");
+  let copied = $state<string | null>(null);
   let customPaths = $state<string[]>(JSON.parse(localStorage.getItem(CUSTOM_KEY) ?? "[]"));
   let addingPath = $state("");
   let showAdd = $state(false);
@@ -102,6 +123,64 @@
     openInEditor(f.abs_path).catch((e) => onError(`打开失败：${e}`));
   }
 
+  function fileLine(f: InstructionFile): string {
+    const tags: string[] = [];
+    if (isPointer(f)) tags.push("指针文件 → AGENTS.md，规则不要写进这里");
+    else if (f.path === "AGENTS.md") tags.push("canonical 指令文件");
+    return `- ${f.abs_path}${tags.length ? `（${tags.join("；")}）` : ""}`;
+  }
+
+  function buildNotes(files: InstructionFile[]): string {
+    const notes: string[] = [];
+    if (files.some((f) => (f.content ?? "").includes("<!-- engram:start -->"))) {
+      notes.push(
+        "- 绝不修改 <!-- engram:start --> … <!-- engram:end --> 托管区块（engram 自动维护，手改会被重写）。",
+      );
+    }
+    if (files.some(isPointer)) {
+      notes.push("- CLAUDE.md 是指针文件（@AGENTS.md），改动一律落在 AGENTS.md。");
+    }
+    return notes.join("\n");
+  }
+
+  function buildPrompt(files: InstructionFile[]): string {
+    const fs = files.filter((f) => f.exists);
+    return template
+      .replace("{{files}}", fs.map(fileLine).join("\n") || "-（无）")
+      .replace("{{notes}}", buildNotes(fs) || "-（该文件无 engram 托管区块，可整体编辑）");
+  }
+
+  async function copyText(text: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // WKWebView 剪贴板兜底
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    copied = key;
+    setTimeout(() => {
+      if (copied === key) copied = null;
+    }, 1600);
+  }
+
+  function startEditTemplate() {
+    templateDraft = template;
+    editingTemplate = true;
+  }
+
+  function saveTemplate() {
+    template = templateDraft;
+    localStorage.setItem(TEMPLATE_KEY, template);
+    editingTemplate = false;
+  }
+
+  let tabFiles = $derived(tab === "global" ? globalFiles : projectFiles);
+
   function isPointer(f: InstructionFile): boolean {
     return f.path === "CLAUDE.md" && (f.content ?? "").trimStart().startsWith("@AGENTS.md");
   }
@@ -135,7 +214,15 @@
         <span class="meta">未找到</span>
       {/if}
       <div class="facts">
-        {#if f.exists}<button class="btn" onclick={() => open(f)}>在编辑器打开</button>{/if}
+        {#if f.exists}
+          <button class="btn" onclick={() => copyText(buildPrompt([f]), f.abs_path)}>
+            {copied === f.abs_path ? "✓ 已复制" : "⧉ 修改提示词"}
+          </button>
+          <button class="btn" onclick={() => copyText(f.abs_path, `p:${f.abs_path}`)}>
+            {copied === `p:${f.abs_path}` ? "✓" : "复制路径"}
+          </button>
+          <button class="btn" onclick={() => open(f)}>在编辑器打开</button>
+        {/if}
         {#if removable}<button class="btn" onclick={() => removeCustom(f.path)}>移除</button>{/if}
       </div>
     </div>
@@ -156,9 +243,21 @@
 <div class="ph">
   <h1>指令文件</h1>
   <span class="sub">AGENTS.md / CLAUDE.md · 本机直读</span>
+  <div class="acts">
+    <button
+      class="btn"
+      onclick={() => copyText(buildPrompt(tabFiles), `tab:${tab}`)}
+      disabled={!tabFiles.some((f) => f.exists)}
+    >
+      {copied === `tab:${tab}` ? "✓ 已复制" : "⧉ 本页全部 · 修改提示词"}
+    </button>
+    <button class="btn" onclick={startEditTemplate}>编辑模板</button>
+  </div>
 </div>
 <div class="banner">
-  ⓘ&nbsp;显示的是<b>本机</b>文件（Desktop 直接读取）；其他机器上的指令文件不在此列。只读展示——修改请用「在编辑器打开」。
+  ⓘ&nbsp;显示的是<b>本机</b>文件（Desktop 直接读取）；查看确认要改的内容后，「⧉ 修改提示词」会把文件路径 +
+  注意事项拼成脚手架复制到剪贴板——粘贴到外部 agent（Claude Code / Codex 等）后在「我的需求」处补充具体改法，由外部
+  agent 直接执行。此页本身只读。
 </div>
 
 <div class="tabs">
@@ -213,9 +312,53 @@
   </div>
 {/if}
 
+{#if editingTemplate}
+  <div
+    class="overlay"
+    onclick={(e) => e.target === e.currentTarget && (editingTemplate = false)}
+    role="presentation"
+  >
+    <div class="modal wide">
+      <h3>编辑修改提示词模板</h3>
+      <div class="tplhint">
+        <code>{"{{files}}"}</code> 会替换成当前文件的绝对路径清单，<code>{"{{notes}}"}</code>
+        替换成按文件自动生成的注意事项（托管区块 / 指针文件）。模板保存在本机。
+      </div>
+      <textarea class="tpl mono" rows="16" bind:value={templateDraft}></textarea>
+      <div class="mrow">
+        <button class="btn" onclick={() => (templateDraft = DEFAULT_TEMPLATE)}>恢复默认</button>
+        <button class="btn" onclick={() => (editingTemplate = false)}>取消</button>
+        <button class="btn pri" onclick={saveTemplate}>保存</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .filecard {
     margin-bottom: 12px;
+  }
+
+  .modal.wide {
+    width: 640px;
+  }
+
+  .tplhint {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .tpl {
+    width: 100%;
+    font-size: 12px;
+    line-height: 1.55;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--page);
+    color: var(--ink);
+    resize: vertical;
   }
 
   .fh {
