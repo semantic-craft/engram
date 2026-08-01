@@ -335,7 +335,10 @@ impl ApiClient {
     pub async fn semantic_search(&self, query: &str) -> Result<Vec<Hit>, String> {
         let init = serde_json::json!({
             "jsonrpc":"2.0","id":0,"method":"initialize",
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},
+            // Stays on the `initialize` handshake, so the highest revision
+            // this can claim is 2025-11-25: MCP 2026-07-28 removed
+            // `initialize` in favour of per-request `_meta` + `server/discover`.
+            "params":{"protocolVersion":"2025-11-25","capabilities":{},
                       "clientInfo":{"name":"engram-desktop","version":"0.1"}}});
         let _ = self.mcp_call(init).await?;
         // Notification: no JSON-RPC response body, so post-and-check-status only.

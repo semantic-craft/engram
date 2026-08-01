@@ -94,7 +94,7 @@ fs2 = "0.4"
 winapi-util = "0.1"
 
 # MCP server SDK.
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Direct dep so tests can use `Router::oneshot` via `ServiceExt`.

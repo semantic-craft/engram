@@ -4,8 +4,8 @@
 //!
 //! The auth middleware injects canonical [`ActorContext`] and [`AuthLevel`]
 //! values into request extensions. Tool handlers receive raw HTTP `Parts` via
-//! rmcp's `Extension<Parts>` extractor (rmcp 1.7+) and read those extensions;
-//! raw actor headers are intentionally not trusted in handlers.
+//! rmcp's `Extension<Parts>` extractor and read those extensions; raw actor
+//! headers are intentionally not trusted in handlers.
 //!
 //! ## Why not `tokio::task_local`
 //!
@@ -14,7 +14,7 @@
 //! `tower.rs:569+619+1183`), which **does not** inherit task-locals from
 //! the outer axum middleware. The Extension extractor is the official
 //! supported path — see
-//! <https://docs.rs/rmcp/1.7/rmcp/transport/streamable_http_server/struct.StreamableHttpService.html#accessing-http-request-data-from-tool-handlers>.
+//! <https://docs.rs/rmcp/latest/rmcp/transport/streamable_http_server/struct.StreamableHttpService.html#accessing-http-request-data-from-tool-handlers>.
 //!
 //! ## Skip-list header
 //!

@@ -10,8 +10,32 @@ below start from the fork.
 
 ## Unreleased
 
+### Changed
+
+- The MCP server now speaks the current specification. Upgraded the Rust MCP
+  SDK from `rmcp` 1.7 to 3.1, which adds MCP `2026-07-28` — the stateless
+  core: no `initialize` handshake, no `Mcp-Session-Id`, protocol version and
+  client capabilities carried in each request's `_meta`, and a `server/discover`
+  RPC advertising the server's supported revisions. Agents that stay on the
+  older lifecycle are unaffected; both paths are served side by side.
+- `serve --transport http --http-stateful` now applies only to clients that
+  negotiate a pre-`2026-07-28` protocol version. MCP `2026-07-28` removed
+  protocol-level sessions, so those requests are always served statelessly
+  regardless of the flag. The flag name and default (stateless) are unchanged.
+- The desktop app's MCP client and the generated Grok/PI extension bridge now
+  request `2025-11-25` instead of `2024-11-05` / `2025-03-26`. Both still use
+  the `initialize` handshake, which `2026-07-28` replaced, so `2025-11-25` is
+  the highest revision they can claim.
+
 ### Fixed
 
+- `initialize` no longer forces every client down to MCP `2024-11-05`. The
+  server hard-pinned the launch revision in `get_info()`, so a Claude Code
+  client asking for `2025-11-25` — or any other agent asking for anything
+  newer — was answered with `2024-11-05` and lost every protocol feature added
+  since. The server now negotiates against the revisions it actually
+  implements (`2024-11-05` through `2026-07-28`) and echoes the client's
+  request, falling back to the SDK default only for unknown versions.
 - macOS desktop release checksum sidecars now record the downloadable DMG
   filename instead of a repository-relative build path, so users can verify
   both downloaded assets directly with `shasum -a 256 -c`.
