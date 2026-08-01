@@ -10,6 +10,8 @@ below start from the fork.
 
 ## Unreleased
 
+## 2.2.0 - 2026-08-01
+
 ### Added
 
 - Desktop: a **会话与交接** (sessions & handoffs) view per project — a
