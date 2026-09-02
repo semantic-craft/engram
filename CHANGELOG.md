@@ -36,7 +36,9 @@ below start from the fork.
   are irreversible: a checkpoint can no longer move one back to `active` or
   `blocked`, reaching a terminal state retires every transfer still `open` or
   `claimed` (resolving any live lease) in the same transaction, and claiming a
-  transfer against finished work fails closed.
+  transfer against finished work fails closed. Upgrading backfills the same
+  invariant: a store that already holds a transfer left live on completed or
+  abandoned work has it retired during migration.
 
 - The SessionStart continuation envelope now renders the *remaining*
   acceptance criteria (from the WorkItem's latest Checkpoint rather than the

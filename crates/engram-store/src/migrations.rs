@@ -383,6 +383,94 @@ mod tests {
         run(&mut conn).expect("V104 must be idempotent on reopen");
     }
 
+    /// A V105 store can already hold transfers left live on work that was
+    /// completed or abandoned before terminal retirement existed. V106 must
+    /// retire them, or an upgraded store starts out with a transfer discovery
+    /// keeps offering while claim, release, and cancel all refuse it.
+    #[test]
+    fn v106_retires_transfers_left_live_on_terminal_work() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("memory.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 105).unwrap();
+
+        let workspace = [0x30_u8; 16];
+        let project = [0x31_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'legacy', 1)",
+            params![workspace],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, 'legacy-project', 1)",
+            params![project, workspace],
+        )
+        .unwrap();
+        // Two WorkItems: one finished, one still active.
+        for (byte, state) in [(0x40_u8, "completed"), (0x41_u8, "active")] {
+            conn.execute(
+                "INSERT INTO work_items \
+                 (id, workspace_id, project_id, objective, acceptance_criteria, state, revision, \
+                  owner_actor, owner_run_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'legacy', '[]', ?4, 1, 'owner', ?1, 1, 1)",
+                params![[byte; 16], workspace, project, state],
+            )
+            .unwrap();
+        }
+        // open + claimed on the finished WorkItem, and one on the active one
+        // that must survive untouched.
+        for (byte, work_item, state) in [
+            (0x50_u8, 0x40_u8, "open"),
+            (0x51_u8, 0x40_u8, "claimed"),
+            (0x52_u8, 0x41_u8, "open"),
+        ] {
+            conn.execute(
+                "INSERT INTO handoffs \
+                 (id, work_item_id, workspace_id, project_id, source_run_id, from_agent, \
+                  source_actor, summary, state, revision, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?1, 'claude-code', 'owner', 'legacy', ?5, 1, 1)",
+                params![[byte; 16], [work_item; 16], workspace, project, state],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO handoff_claims \
+             (id, handoff_id, work_item_id, workspace_id, project_id, handoff_revision, \
+              actor_key, run_id, state, claimed_at, lease_expires_at) \
+             VALUES (?1, ?1, ?2, ?3, ?4, 1, 'receiver', ?1, 'live', 1, 2)",
+            params![[0x51_u8; 16], [0x40_u8; 16], workspace, project],
+        )
+        .unwrap();
+
+        run(&mut conn).expect("V106 must apply after V105");
+
+        let state_of = |id: u8| -> String {
+            conn.query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![[id; 16]],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state_of(0x50), "expired", "open transfer on finished work");
+        assert_eq!(
+            state_of(0x51),
+            "expired",
+            "held transfer on finished work would otherwise strand"
+        );
+        assert_eq!(state_of(0x52), "open", "active work keeps its transfer");
+
+        let live_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoff_claims WHERE state = 'live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_claims, 0, "retired transfers resolve their leases");
+    }
+
     /// The #42 follow-up moves scope and per-observation fields off the shared
     /// artifact identity row so purging one project cannot CASCADE through it
     /// into another project's evidence.

@@ -3,6 +3,9 @@
 -- received, so one WorkItem can cross many agents and Runs while every
 -- earlier transfer stays readable history.
 --
+-- Upgrading also retires any transfer left live on already-terminal work; see
+-- the backfill at the end of this file.
+--
 -- `state` gains `superseded` (an unclaimed predecessor replaced by a
 -- successor) and `cancelled` (source-owner discard). Splitting `cancelled`
 -- out of `expired` keeps the four terminal outcomes - cancellation, claim
@@ -89,3 +92,26 @@ WHEN NEW.workspace_id IS NOT (SELECT workspace_id FROM projects WHERE id = NEW.p
 BEGIN
     SELECT RAISE(ABORT, 'handoffs.workspace_id does not match the project''s workspace');
 END;
+
+-- Backfill the invariant this release starts enforcing at checkpoint time.
+-- A store upgraded from V105 can already hold `open` or `claimed` transfers on
+-- a WorkItem that was completed or abandoned before terminal retirement
+-- existed. Left as they are, those rows land in exactly the dead end the
+-- runtime change closes: once the lease lapses discovery offers the transfer
+-- again, while claiming rejects the terminal WorkItem, releasing rejects the
+-- expired lease, and cancelling rejects the non-`open` state. Retire them and
+-- resolve their leases here so no upgraded store starts out stranded.
+UPDATE handoffs
+   SET state = 'expired', revision = revision + 1
+ WHERE state IN ('open', 'claimed')
+   AND work_item_id IN (
+       SELECT id FROM work_items WHERE state IN ('completed', 'abandoned')
+   );
+
+UPDATE handoff_claims
+   SET state = 'expired',
+       resolved_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+ WHERE state = 'live'
+   AND work_item_id IN (
+       SELECT id FROM work_items WHERE state IN ('completed', 'abandoned')
+   );
