@@ -38,10 +38,15 @@ pub use active_project::{
 };
 pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffState, NewHandoff};
+pub use handoff::{
+    AcceptanceCriterionStatus, CheckpointWrite, CheckpointWriteResult, Handoff, HandoffCancel,
+    HandoffClaim, HandoffClaimResult, HandoffRelease, HandoffReleaseResult, HandoffState,
+    NewHandoff, PublishedHandoff, WorkItem, WorkItemState,
+};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ObservationId, PageId, PagePath,
-    ProjectId, SessionId, UserId, WorkspaceId,
+    AgentKind, AttemptId, AutoImproveProposalId, AutoImproveRunId, BackgroundJobId, CheckpointId,
+    ClaimId, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, UserId, WorkItemId,
+    WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};

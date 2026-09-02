@@ -60,8 +60,9 @@ from hook paths.
    enqueues a `WriteCmd` to the writer actor. `log.md` gets an
    appended `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
-   `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
-   `Handoff` row for the next agent. Auto-commits the wiki. Clients
+   `sessions/<id>.md` summary page (rule-based, no LLM) and creates a stable
+   `WorkItem` plus an open, revisioned `Handoff` for the next agent.
+   Auto-commits the wiki. Clients
    without a true session-end hook (currently Antigravity CLI) should call
    `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `ENGRAM_LLM_PROVIDER` is set, `memory_consolidate` rewrites
@@ -150,7 +151,11 @@ backpressure, or single-writer SQLite actor.
 | `sessions`, `observations` | Hook capture, full audit log. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
-| `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
+| `work_items` | Stable user objectives, acceptance criteria, owner Run/actor, explicit state, and revision. |
+| `handoffs` | Revisioned transfer offers (open / claimed / acknowledged / expired). |
+| `handoff_claims` | Opaque, actor/Run-bound receiver leases and their resolution state. |
+| `checkpoints` | Append-only ordered WorkItem progress and acceptance-criterion status. |
+| `continuity_attempts` | Transactional replay outcomes bound to exact mutation inputs. |
 | `page_embeddings` | Optional vector rows for latest pages, one row per document chunk (`(page_id, chunk_index)` PK; long pages split on markdown boundaries, short pages are a single chunk 0). `(provider, model, dim)` is denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. The vector leg max-pools chunk scores per page. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
@@ -218,7 +223,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (16 tools)
+## MCP tool surface (19 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
@@ -228,9 +233,12 @@ invariants below.
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
-| `memory_handoff_begin` | destructive | Open a handoff for the next agent. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
+| `memory_handoff_begin` | write | Create a WorkItem and open Handoff, or publish a continuation for an exact owned WorkItem. Only new WorkItems use the create-capable scope path. |
+| `memory_handoff_discover` | read-only | Fetch the latest claimable Handoff without consuming or acknowledging it. Expired leases are claimable again. |
+| `memory_handoff_claim` | write | Compare-and-set one exact Handoff revision to `claimed` for an authenticated actor and receiver Run under a bounded lease. Attempt-idempotent. |
+| `memory_handoff_release` | write | Return one exact live Claim to `open`. Attempt-idempotent. |
+| `memory_checkpoint_write` | write | Append ordered WorkItem progress; optionally acknowledge the exact receiving Claim in the same transaction. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
+| `memory_handoff_cancel` | write | Let the source actor and source Run expire an exact open Handoff revision. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
@@ -241,11 +249,11 @@ invariants below.
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
 `memory_install_self_routing`, `memory_read_page`, `memory_delete_page`,
-`memory_handoff_cancel`, and `memory_auto_improve`
+the WorkItem continuity tools, `memory_handoff_cancel`, and `memory_auto_improve`
 post-date the original "narrow on purpose" cut (§10 of
 `design-decisions.md`): briefing/explore separate the structured vs.
 prose halves of "what's going on", `memory_write_page` covers explicit
-durable annotations without abusing single-use handoffs,
+durable annotations without abusing operational WorkItem state,
 `memory_install_self_routing` exists for the meta case where the agent
 must re-write its own routing rules into a project's `CLAUDE.md` /
 `AGENTS.md` and install the companion managed Agent Skills into
@@ -254,9 +262,16 @@ must re-write its own routing rules into a project's `CLAUDE.md` /
 (e.g. opening a decision page end-to-end), `memory_auto_improve` exposes a
 safe default-on learning review through the same approval/write path as
 pending writes, and `memory_delete_page` is the exact-path destructive pair
-needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
-for mistaken handoff creation. The narrow-surface discipline still holds —
-every new tool has to earn its slot — but the v1 count is 16, not 10.
+needed by admission-aware mirrors. WorkItem continuity separates stable user
+work from Runs, revisioned Handoffs, lease Claims, append-only Checkpoints, and
+retry Attempts. SQLite holds this operational coordination state behind the
+single writer actor; Markdown remains the durable knowledge source of truth.
+All reads and transitions use no-create `ScopeResolver` paths, while only a
+new WorkItem publish may create an explicit scope. Authenticated actor identity
+is distinct from agent and Run identity. `memory_handoff_cancel` is the
+source-owner safety valve for mistaken Handoff creation. The narrow-surface
+discipline still holds — every new tool has to earn its slot — but the current
+count is 19, not 10.
 
 The managed Agent Skills are a narrow prompt-packaging exception to the
 otherwise wiki-centered architecture. They are static `SKILL.md` files that

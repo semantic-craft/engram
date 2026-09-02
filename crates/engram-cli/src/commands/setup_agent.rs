@@ -225,7 +225,7 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     }
     println!("# NOTE: Grok ignores SessionStart stdout, so this config captures");
     println!("#       lifecycle events but does not inject handoffs automatically.");
-    println!("#       Recover handoffs via the MCP memory_handoff_accept tool.");
+    println!("#       Recover handoffs via the MCP memory_handoff_discover tool.");
     println!();
     println!("{serialized}");
     Ok(())

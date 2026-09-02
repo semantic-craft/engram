@@ -1,37 +1,82 @@
-//! Cross-agent handoff type.
+//! Recoverable cross-agent task continuity domain.
 //!
-//! A handoff is a typed snapshot of "where we are" — created when one
-//! agent CLI ends a session, accepted when the next one starts in the
-//! same project. Stored explicitly (vs. inferring from the
-//! observations log) because cross-agent continuity is the project's
-//! headline feature and deserves a first-class schema.
+//! Identity is deliberately split across the protocol: a [`WorkItemId`] is a
+//! stable unit of user work, [`SessionId`] identifies one agent Run/Session,
+//! [`HandoffId`] identifies a revisioned transfer offer, [`ClaimId`] is the
+//! opaque lease capability for one receiver, [`CheckpointId`] identifies one
+//! append-only progress fact, [`AttemptId`] makes retryable mutations
+//! replay-safe, and [`BackgroundJobId`] remains reserved for asynchronous
+//! server processing. The Rust newtypes prevent accidental substitution.
+
+#![allow(missing_docs)]
 
 use std::path::PathBuf;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentKind, HandoffId, ProjectId, SessionId, WorkspaceId};
+use crate::AgentKind;
+use crate::ids::{
+    AttemptId, CheckpointId, ClaimId, HandoffId, ProjectId, SessionId, WorkItemId, WorkspaceId,
+};
 
-/// State machine of a single handoff row.
+/// State of the stable unit of user work. Receiving a handoff does not change
+/// this state; only an explicit checkpoint can block, complete, or abandon it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemState {
+    Active,
+    Blocked,
+    Completed,
+    Abandoned,
+}
+
+impl WorkItemState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkItemState {
+    type Err = crate::MemoryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "blocked" => Ok(Self::Blocked),
+            "completed" => Ok(Self::Completed),
+            "abandoned" => Ok(Self::Abandoned),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown work item state: {other}"
+            ))),
+        }
+    }
+}
+
+/// State of a transfer offer. `Acknowledged` means the claimant persisted its
+/// first receiving checkpoint; it says nothing about WorkItem completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffState {
-    /// Created, not yet picked up by the next agent.
     Open,
-    /// Another agent has called `memory_handoff_accept` on it.
-    Accepted,
-    /// Aged out (decay sweep).
+    Claimed,
+    Acknowledged,
     Expired,
 }
 
 impl HandoffState {
-    /// Canonical wire string.
     #[must_use]
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
-            Self::Accepted => "accepted",
+            Self::Claimed => "claimed",
+            Self::Acknowledged => "acknowledged",
             Self::Expired => "expired",
         }
     }
@@ -40,10 +85,11 @@ impl HandoffState {
 impl std::str::FromStr for HandoffState {
     type Err = crate::MemoryError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
             "open" => Ok(Self::Open),
-            "accepted" => Ok(Self::Accepted),
+            "claimed" => Ok(Self::Claimed),
+            "acknowledged" => Ok(Self::Acknowledged),
             "expired" => Ok(Self::Expired),
             other => Err(crate::MemoryError::MalformedRecord(format!(
                 "unknown handoff state: {other}"
@@ -52,65 +98,166 @@ impl std::str::FromStr for HandoffState {
     }
 }
 
-/// Input for inserting a new handoff.
+/// Explicit satisfaction status stored on every checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceCriterionStatus {
+    pub criterion: String,
+    pub satisfied: bool,
+}
+
+/// Stable WorkItem materialized from operational SQLite state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub id: WorkItemId,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub objective: String,
+    pub acceptance_criteria: Vec<String>,
+    pub state: WorkItemState,
+    pub revision: u64,
+    pub owner_actor: String,
+    pub owner_run_id: Option<SessionId>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// Publish input. `work_item_id = None` creates a new WorkItem; `Some` appends
+/// a transfer offer to that exact existing WorkItem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewHandoff {
-    /// Owning workspace.
+    pub work_item_id: Option<WorkItemId>,
     pub workspace_id: WorkspaceId,
-    /// Owning project.
     pub project_id: ProjectId,
-    /// Session this handoff captures (None for manual handoffs).
     pub from_session_id: Option<SessionId>,
-    /// Agent CLI that produced this handoff.
+    pub source_run_id: SessionId,
     pub from_agent: AgentKind,
-    /// Optional explicit target hint (`claude-code`, `codex`, …).
+    pub source_actor: String,
     pub to_agent: Option<AgentKind>,
-    /// Working directory at handoff time. Used to match the next
-    /// session's `memory_handoff_accept` call.
     pub cwd: Option<PathBuf>,
-    /// One-paragraph summary of where we left off.
+    pub objective: String,
+    pub acceptance_criteria: Vec<String>,
     pub summary: String,
-    /// Open questions for the next agent.
     pub open_questions: Vec<String>,
-    /// Suggested next steps.
     pub next_steps: Vec<String>,
-    /// Files touched in the session.
     pub files_touched: Vec<String>,
 }
 
-/// Materialised view of a handoff row.
-#[derive(Debug, Clone, Serialize)]
+/// Materialized transfer offer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handoff {
-    /// Stable identifier.
     pub id: HandoffId,
-    /// Owning workspace.
+    pub work_item_id: WorkItemId,
     pub workspace_id: WorkspaceId,
-    /// Owning project.
     pub project_id: ProjectId,
-    /// Session that produced this handoff, if any.
     pub from_session_id: Option<SessionId>,
-    /// Agent CLI that produced this handoff.
+    pub source_run_id: SessionId,
     pub from_agent: AgentKind,
-    /// Optional target hint.
+    pub source_actor: String,
     pub to_agent: Option<AgentKind>,
-    /// Working directory at handoff time.
     pub cwd: Option<String>,
-    /// Summary.
     pub summary: String,
-    /// Open questions.
     pub open_questions: Vec<String>,
-    /// Next steps.
     pub next_steps: Vec<String>,
-    /// Files touched.
     pub files_touched: Vec<String>,
-    /// State.
     pub state: HandoffState,
-    /// Creation timestamp.
+    pub revision: u64,
     pub created_at: Timestamp,
-    /// Agent CLI that accepted, if any.
-    pub accepted_by: Option<AgentKind>,
-    /// Acceptance timestamp.
-    pub accepted_at: Option<Timestamp>,
-    /// Session that accepted, if any.
-    pub accepted_by_session: Option<SessionId>,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at: Option<Timestamp>,
+    pub acknowledged_by_session: Option<SessionId>,
+}
+
+/// Result of publishing a new transfer offer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedHandoff {
+    pub work_item_id: WorkItemId,
+    pub handoff_id: HandoffId,
+    pub work_item_revision: u64,
+    pub handoff_revision: u64,
+}
+
+/// Claim outcome. The claim id is an opaque capability and must not be copied
+/// into audit-log detail; it is persisted in attempt outcome state so an
+/// identical lost-response retry can receive this exact envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffClaimResult {
+    pub work_item_id: WorkItemId,
+    pub handoff_id: HandoffId,
+    pub claim_id: ClaimId,
+    pub lease_expires_at: Timestamp,
+    pub revision: u64,
+    pub handoff: Handoff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffClaim {
+    pub handoff_id: HandoffId,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub expected_revision: u64,
+    pub run_id: SessionId,
+    pub attempt_id: AttemptId,
+    pub actor_key: String,
+    pub lease_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffReleaseResult {
+    pub work_item_id: WorkItemId,
+    pub handoff_id: HandoffId,
+    pub revision: u64,
+    pub state: HandoffState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffRelease {
+    pub handoff_id: HandoffId,
+    pub claim_id: ClaimId,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub expected_revision: u64,
+    pub run_id: SessionId,
+    pub attempt_id: AttemptId,
+    pub actor_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffCancel {
+    pub handoff_id: HandoffId,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub expected_revision: u64,
+    pub run_id: SessionId,
+    pub actor_key: String,
+}
+
+/// Append-only checkpoint command after public input has been parsed and
+/// sanitized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointWrite {
+    pub work_item_id: WorkItemId,
+    pub workspace_id: WorkspaceId,
+    pub project_id: ProjectId,
+    pub run_id: SessionId,
+    pub expected_work_item_revision: u64,
+    pub handoff_id: Option<HandoffId>,
+    pub claim_id: Option<ClaimId>,
+    pub expected_handoff_revision: Option<u64>,
+    pub summary: String,
+    pub work_item_state: WorkItemState,
+    pub acceptance_criteria: Vec<AcceptanceCriterionStatus>,
+    pub actor_key: String,
+    pub attempt_id: AttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointWriteResult {
+    pub checkpoint_id: CheckpointId,
+    pub work_item_id: WorkItemId,
+    pub sequence: u64,
+    pub work_item_revision: u64,
+    pub work_item_state: WorkItemState,
+    pub handoff_id: Option<HandoffId>,
+    pub handoff_revision: Option<u64>,
+    pub handoff_state: Option<HandoffState>,
 }

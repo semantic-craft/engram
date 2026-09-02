@@ -1,35 +1,34 @@
 ---
 name: engram-handoff
-description: "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording."
+description: "Use this skill for any request whose goal is recoverable task continuity across agents or time: finding or claiming a Handoff, checkpointing or completing a WorkItem, saving next-session context, releasing a claim, or discarding a mistaken Handoff. Trigger by semantic intent rather than exact wording."
 ---
 <!-- engram-managed: routing-skill -->
 
 # engram handoff
 
-Use this skill for single-use cross-session handoffs. Handoffs are for the next agent, not durable project documentation.
+Use WorkItems for stable user work and Handoffs for revisioned transfer offers. A read never consumes a Handoff, acknowledgement happens only with the receiver's first durable checkpoint, and acknowledgement is distinct from WorkItem completion.
 
 ## Tools in this cluster
 
-- `memory_handoff_accept` consumes the pending handoff when the user asks where we left off and no already-fetched handoff block is visible.
-- `memory_handoff_begin` creates a terse next-session handoff only when the user is wrapping up, ending the session, or explicitly asks to save context for the next session.
-- `memory_handoff_cancel` expires a mistaken pending handoff by exact handoff id.
+- `memory_handoff_begin` creates a WorkItem and open Handoff at session end, or publishes another Handoff for an exact existing WorkItem owned by the same authenticated actor and source Run.
+- `memory_handoff_discover` reads the latest claimable Handoff without mutating it. A SessionStart handoff block is this same read-only discovery result.
+- `memory_handoff_claim` claims an exact Handoff revision for the authenticated actor and current Run under a bounded lease.
+- `memory_checkpoint_write` appends ordered WorkItem progress. Include the exact Handoff, Claim, and Handoff revision on the receiver's first checkpoint to acknowledge it transactionally. Record `active`, `blocked`, `completed`, or `abandoned` explicitly.
+- `memory_handoff_release` returns an exact live Claim to `open` when the receiver will not continue. An expired lease is discoverable and claimable by another receiver.
+- `memory_handoff_cancel` lets only the source actor and source Run expire an exact open Handoff at its current revision.
 
-## Single-use handoff behavior
+## Retry and ownership rules
 
-The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use and the tool will normally return null after SessionStart consumed it.
+Every claim, release, and checkpoint uses a fresh caller-supplied Attempt id. If the response is lost, retry the identical request with the same Attempt id to receive the original result. Never reuse that Attempt id with a different actor, scope, target, revision, Run, lease, or checkpoint payload; the server fails such reuse closed.
 
-If no pending handoff block is visible and the user asks where we left off, then use the accept tool. Keep the default current-project scope unless the user explicitly names a sibling workspace and project.
+Keep authenticated actor identity separate from execution-agent and Run identity. Always use the exact identities and revisions returned by discovery or the preceding transition. A live Claim belongs only to its actor and Run. Do not copy opaque Claim ids into notes, logs, or durable wiki pages.
 
-## Creating a handoff
+## Creating and completing work
 
-Create a handoff only at session end or when the user explicitly asks to save context for the next session. Do not use handoffs for status checks, briefings, project notes, or permanent memory. Keep the summary to two or three concise sentences, and put details in open questions and next steps bullets.
+Create a WorkItem only at session end or when the user explicitly asks to save recoverable continuation context. Supply a stable objective and acceptance criteria. Do not use Handoffs for status checks, permanent memory, or routine lifecycle capture.
 
-Lifecycle hooks already capture routine prompts and tool calls, so do not manually write a handoff just to record normal progress.
-
-## Canceling a handoff
-
-Cancel only when the user asks to discard a handoff or you created one by mistake. Use the exact handoff id returned by the begin tool. Cancellation is idempotent from the user's point of view, but it should still target only the known handoff.
+A terminal WorkItem requires an explicit checkpoint with state `completed` or `abandoned`; merely reading, claiming, acknowledging, ending a Run, or expiring a lease never completes it.
 
 ## Scope default
 
-Default to the current project. Pass workspace and project together only when the user names a different project. Never pass scope arguments just because the user says this project, here, we, or our work.
+Default to the current project. Pass workspace and project together only when the user names a different project. Reads and transitions use no-create scope resolution and fail closed on partial or missing explicit scope.

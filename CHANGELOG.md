@@ -10,6 +10,25 @@ below start from the fork.
 
 ## Unreleased
 
+### Added
+
+- Recoverable task continuity now models stable WorkItems separately from
+  Runs/Sessions, revisioned Handoffs, lease-bound Claims, append-only
+  Checkpoints, caller-supplied retry Attempts, and BackgroundJob identities.
+  The MCP surface adds read-only `memory_handoff_discover`, compare-and-set
+  `memory_handoff_claim`, explicit `memory_handoff_release`, and
+  `memory_checkpoint_write`; identical lost-response retries replay the
+  original result while mismatched Attempt reuse fails closed.
+
+### Changed
+
+- Handoff reads no longer consume or acknowledge work. The removed
+  `memory_handoff_accept` contract is replaced by explicit claim and first
+  receiver checkpoint acknowledgement; acknowledgement, Run end, Claim expiry,
+  and Handoff expiry remain distinct from WorkItem completion. Existing
+  open/accepted/expired Handoffs migrate without loss to
+  open/acknowledged/expired histories.
+
 ## Desktop 0.2.0 - 2026-08-01
 
 ### Added

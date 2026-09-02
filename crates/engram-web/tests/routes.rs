@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use engram_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
+use engram_core::{AgentKind, HandoffCancel, NewHandoff, NewPage, PagePath, SessionId, Tier};
 use engram_store::Store;
 use engram_web::{api_router, router};
 use engram_wiki::{Wiki, WritePageRequest};
@@ -38,6 +38,32 @@ fn new_page(
         pinned: false,
         links: Vec::new(),
         author_id: None,
+    }
+}
+
+fn new_handoff(
+    ws: engram_core::WorkspaceId,
+    proj: engram_core::ProjectId,
+    from_agent: AgentKind,
+    to_agent: Option<AgentKind>,
+    summary: &str,
+) -> NewHandoff {
+    NewHandoff {
+        work_item_id: None,
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: None,
+        source_run_id: SessionId::new(),
+        from_agent,
+        source_actor: "test".into(),
+        to_agent,
+        cwd: None,
+        objective: summary.into(),
+        acceptance_criteria: vec![],
+        summary: summary.into(),
+        open_questions: vec![],
+        next_steps: vec![],
+        files_touched: vec![],
     }
 }
 
@@ -1288,17 +1314,16 @@ async fn api_workspace_overview_includes_open_handoff() {
 
     store
         .writer
-        .insert_handoff(NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: None,
-            summary: "handoff_summary_marker".into(),
+        .publish_handoff(NewHandoff {
             open_questions: vec!["open_question_marker".into()],
             next_steps: vec!["next_step_marker".into()],
-            files_touched: vec![],
+            ..new_handoff(
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                None,
+                "handoff_summary_marker",
+            )
         })
         .await
         .unwrap();
@@ -1358,18 +1383,13 @@ async fn api_project_overview_aggregates_handoff_briefing_health() {
 
     store
         .writer
-        .insert_handoff(NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: None,
-            summary: "scratch_handoff_marker".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        })
+        .publish_handoff(new_handoff(
+            ws,
+            proj,
+            AgentKind::ClaudeCode,
+            None,
+            "scratch_handoff_marker",
+        ))
         .await
         .unwrap();
 
@@ -2185,7 +2205,7 @@ async fn api_sessions_lists_timeline_with_counts() {
 }
 
 #[tokio::test]
-async fn api_handoffs_lists_every_state_newest_first() {
+async fn api_handoffs_lists_open_and_expired_history() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -2198,42 +2218,38 @@ async fn api_handoffs_lists_every_state_newest_first() {
         .await
         .unwrap();
 
+    let first_run = SessionId::new();
     let first = store
         .writer
-        .insert_handoff(NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: None,
-            summary: "first handoff".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
+        .publish_handoff(NewHandoff {
+            source_run_id: first_run,
+            ..new_handoff(ws, proj, AgentKind::ClaudeCode, None, "first handoff")
         })
         .await
         .unwrap();
     store
         .writer
-        .insert_handoff(NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::Codex,
-            to_agent: Some(AgentKind::ClaudeCode),
-            cwd: None,
-            summary: "second handoff".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        })
+        .publish_handoff(new_handoff(
+            ws,
+            proj,
+            AgentKind::Codex,
+            Some(AgentKind::ClaudeCode),
+            "second handoff",
+        ))
         .await
         .unwrap();
-    // Consume the first one so the list covers more than the open state.
+    // Cancel the first one so the read-only history covers a terminal
+    // Handoff state without reviving the removed accept-on-read path.
     store
         .writer
-        .accept_handoff(first, AgentKind::Codex, None)
+        .cancel_handoff(HandoffCancel {
+            handoff_id: first.handoff_id,
+            workspace_id: ws,
+            project_id: proj,
+            expected_revision: first.handoff_revision,
+            run_id: first_run,
+            actor_key: "test".into(),
+        })
         .await
         .unwrap();
 
@@ -2250,15 +2266,15 @@ async fn api_handoffs_lists_every_state_newest_first() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 2, "accepted handoffs stay in history: {json}");
+    assert_eq!(rows.len(), 2, "expired handoffs stay in history: {json}");
 
-    let accepted = rows
+    let expired = rows
         .iter()
         .find(|h| h["summary"] == "first handoff")
         .expect("first handoff present");
-    assert_eq!(accepted["state"], "accepted");
-    assert_eq!(accepted["accepted_by"], "codex");
-    assert!(accepted["accepted_at"].is_string());
+    assert_eq!(expired["state"], "expired");
+    assert_eq!(expired["revision"], 2);
+    assert!(expired["acknowledged_at"].is_null());
 
     let open = rows
         .iter()
@@ -2267,5 +2283,5 @@ async fn api_handoffs_lists_every_state_newest_first() {
     assert_eq!(open["state"], "open");
     assert_eq!(open["from_agent"], "codex");
     assert_eq!(open["to_agent"], "claude-code");
-    assert!(open["accepted_at"].is_null());
+    assert!(open["acknowledged_at"].is_null());
 }

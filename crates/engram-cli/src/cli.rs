@@ -904,7 +904,7 @@ pub enum AgentChoice {
     /// integration using Grok-specific hook scripts. NOTE: Grok ignores
     /// hook stdout on `SessionStart`, so
     /// capture works but handoff injection does not — recover the prior
-    /// session's handoff via the MCP `memory_handoff_accept` tool.
+    /// session's handoff via the MCP `memory_handoff_discover` tool.
     Grok,
 }
 

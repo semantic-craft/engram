@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use engram_core::{
-    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId,
-    PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
+    CheckpointWrite, CheckpointWriteResult, HandoffCancel, HandoffClaim, HandoffClaimResult,
+    HandoffRelease, HandoffReleaseResult, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
+    ObservationId, PageId, PagePath, ProjectId, PublishedHandoff, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -90,19 +91,25 @@ pub(crate) enum WriteCmd {
         obs: NewObservation,
         reply: oneshot::Sender<StoreResult<ObservationId>>,
     },
-    InsertHandoff {
+    PublishHandoff {
         handoff: NewHandoff,
-        reply: oneshot::Sender<StoreResult<HandoffId>>,
+        reply: oneshot::Sender<StoreResult<PublishedHandoff>>,
     },
-    AcceptHandoff {
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        reply: oneshot::Sender<StoreResult<()>>,
+    ClaimHandoff {
+        claim: HandoffClaim,
+        reply: oneshot::Sender<StoreResult<HandoffClaimResult>>,
+    },
+    ReleaseHandoff {
+        release: HandoffRelease,
+        reply: oneshot::Sender<StoreResult<HandoffReleaseResult>>,
     },
     CancelHandoff {
-        handoff_id: HandoffId,
-        reply: oneshot::Sender<StoreResult<bool>>,
+        cancel: HandoffCancel,
+        reply: oneshot::Sender<StoreResult<HandoffReleaseResult>>,
+    },
+    WriteCheckpoint {
+        checkpoint: CheckpointWrite,
+        reply: oneshot::Sender<StoreResult<CheckpointWriteResult>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
     /// mash-up pages. Executed in one transaction for atomicity.
@@ -450,49 +457,52 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Insert a new handoff in `open` state.
+    /// Create or continue a WorkItem and publish a new open handoff.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn insert_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
+    pub async fn publish_handoff(&self, handoff: NewHandoff) -> StoreResult<PublishedHandoff> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::InsertHandoff { handoff, reply: tx })
+        self.send(WriteCmd::PublishHandoff { handoff, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Mark a handoff accepted by the given agent / session.
-    ///
-    /// # Errors
-    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn accept_handoff(
-        &self,
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-    ) -> StoreResult<()> {
+    /// Atomically claim an exact handoff revision under a bounded lease.
+    pub async fn claim_handoff(&self, claim: HandoffClaim) -> StoreResult<HandoffClaimResult> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::AcceptHandoff {
-            handoff_id,
-            accepting_agent,
-            accepting_session,
-            reply: tx,
-        })
-        .await?;
+        self.send(WriteCmd::ClaimHandoff { claim, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Mark an open handoff expired so it will no longer be consumed.
-    ///
-    /// Returns `true` when an open handoff was changed, `false` when the id was
-    /// already accepted/expired or missing.
-    ///
-    /// # Errors
-    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn cancel_handoff(&self, handoff_id: HandoffId) -> StoreResult<bool> {
+    /// Release the caller's exact live claim back to open state.
+    pub async fn release_handoff(
+        &self,
+        release: HandoffRelease,
+    ) -> StoreResult<HandoffReleaseResult> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::CancelHandoff {
-            handoff_id,
+        self.send(WriteCmd::ReleaseHandoff { release, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Cancel an exact mistaken open handoff as its source actor.
+    pub async fn cancel_handoff(&self, cancel: HandoffCancel) -> StoreResult<HandoffReleaseResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CancelHandoff { cancel, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Append a WorkItem checkpoint, acknowledging an exact claim when given.
+    pub async fn write_checkpoint(
+        &self,
+        checkpoint: CheckpointWrite,
+    ) -> StoreResult<CheckpointWriteResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::WriteCheckpoint {
+            checkpoint,
             reply: tx,
         })
         .await?;
@@ -1145,27 +1155,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_observation(&mut conn, &obs);
                 send_or_warn(reply, result, "insert_observation");
             }
-            WriteCmd::InsertHandoff { handoff, reply } => {
-                let result = ops::insert_handoff(&mut conn, &handoff);
-                send_or_warn(reply, result, "insert_handoff");
+            WriteCmd::PublishHandoff { handoff, reply } => {
+                let result = ops::publish_handoff(&mut conn, &handoff);
+                send_or_warn(reply, result, "publish_handoff");
             }
-            WriteCmd::AcceptHandoff {
-                handoff_id,
-                accepting_agent,
-                accepting_session,
-                reply,
-            } => {
-                let result = ops::accept_handoff(
-                    &mut conn,
-                    &handoff_id,
-                    accepting_agent,
-                    accepting_session.as_ref(),
-                );
-                send_or_warn(reply, result, "accept_handoff");
+            WriteCmd::ClaimHandoff { claim, reply } => {
+                let result = ops::claim_handoff(&mut conn, &claim);
+                send_or_warn(reply, result, "claim_handoff");
             }
-            WriteCmd::CancelHandoff { handoff_id, reply } => {
-                let result = ops::cancel_handoff(&mut conn, &handoff_id);
+            WriteCmd::ReleaseHandoff { release, reply } => {
+                let result = ops::release_handoff(&mut conn, &release);
+                send_or_warn(reply, result, "release_handoff");
+            }
+            WriteCmd::CancelHandoff { cancel, reply } => {
+                let result = ops::cancel_handoff(&mut conn, &cancel);
                 send_or_warn(reply, result, "cancel_handoff");
+            }
+            WriteCmd::WriteCheckpoint { checkpoint, reply } => {
+                let result = ops::write_checkpoint(&mut conn, &checkpoint);
+                send_or_warn(reply, result, "write_checkpoint");
             }
             WriteCmd::Reorg {
                 workspace_id,

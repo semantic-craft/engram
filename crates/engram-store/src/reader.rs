@@ -13,7 +13,7 @@ use std::sync::Arc;
 use engram_core::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
     Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, User,
-    UserId, WorkspaceId,
+    UserId, WorkItem, WorkItemId, WorkspaceId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -492,20 +492,24 @@ pub struct SessionSummary {
 pub struct HandoffSummary {
     /// Handoff id.
     pub id: String,
+    /// Stable WorkItem id this transfer belongs to.
+    pub work_item_id: String,
+    /// Current compare-and-set revision.
+    pub revision: u64,
     /// Agent that wrote the handoff.
     pub from_agent: String,
     /// Optional target-agent hint.
     pub to_agent: Option<String>,
     /// Terse summary line.
     pub summary: String,
-    /// `open` | `accepted` | `expired`.
+    /// `open` | `claimed` | `acknowledged` | `expired`.
     pub state: String,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
-    /// Agent that consumed the handoff, when accepted.
-    pub accepted_by: Option<String>,
-    /// ISO-8601 acceptance timestamp, when accepted.
-    pub accepted_at: Option<String>,
+    /// Actor that acknowledged the handoff with a checkpoint.
+    pub acknowledged_by: Option<String>,
+    /// ISO-8601 acknowledgement timestamp.
+    pub acknowledged_at: Option<String>,
     /// Session the handoff was written from, when it came from one.
     pub from_session_id: Option<String>,
 }
@@ -1316,8 +1320,8 @@ impl ReaderPool {
     }
 
     /// Handoff history for one project, newest-first, in every state.
-    /// [`Self::latest_open_handoff`] stays the accept path; this is the
-    /// read-only audit view.
+    /// [`Self::latest_claimable_handoff`] stays the continuation path; this is
+    /// the read-only audit view.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -1330,8 +1334,8 @@ impl ReaderPool {
         let limit = i64::try_from(limit.clamp(1, 500)).unwrap_or(50);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, from_agent, to_agent, summary, state, created_at, \
-                        accepted_by, accepted_at, from_session_id \
+                "SELECT id, work_item_id, revision, from_agent, to_agent, summary, state, created_at, \
+                        acknowledged_by, acknowledged_at, from_session_id \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                  ORDER BY created_at DESC, id DESC \
@@ -1341,23 +1345,27 @@ impl ReaderPool {
                 params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
-                    let from_agent: String = row.get(1)?;
-                    let to_agent: Option<String> = row.get(2)?;
-                    let summary: String = row.get(3)?;
-                    let state: String = row.get(4)?;
-                    let created_us: i64 = row.get(5)?;
-                    let accepted_by: Option<String> = row.get(6)?;
-                    let accepted_us: Option<i64> = row.get(7)?;
-                    let from_session: Option<Vec<u8>> = row.get(8)?;
+                    let work_item_bytes: Vec<u8> = row.get(1)?;
+                    let revision: i64 = row.get(2)?;
+                    let from_agent: String = row.get(3)?;
+                    let to_agent: Option<String> = row.get(4)?;
+                    let summary: String = row.get(5)?;
+                    let state: String = row.get(6)?;
+                    let created_us: i64 = row.get(7)?;
+                    let acknowledged_by: Option<String> = row.get(8)?;
+                    let acknowledged_us: Option<i64> = row.get(9)?;
+                    let from_session: Option<Vec<u8>> = row.get(10)?;
                     Ok((
                         id_bytes,
+                        work_item_bytes,
+                        revision,
                         from_agent,
                         to_agent,
                         summary,
                         state,
                         created_us,
-                        accepted_by,
-                        accepted_us,
+                        acknowledged_by,
+                        acknowledged_us,
                         from_session,
                     ))
                 },
@@ -1366,24 +1374,30 @@ impl ReaderPool {
             for row in rows {
                 let (
                     id_bytes,
+                    work_item_bytes,
+                    revision,
                     from_agent,
                     to_agent,
                     summary,
                     state,
                     created_us,
-                    accepted_by,
-                    accepted_us,
+                    acknowledged_by,
+                    acknowledged_us,
                     from_session,
                 ) = row?;
                 out.push(HandoffSummary {
                     id: HandoffId::from_slice(&id_bytes)?.to_string(),
+                    work_item_id: WorkItemId::from_slice(&work_item_bytes)?.to_string(),
+                    revision: u64::try_from(revision).map_err(|_| {
+                        StoreError::MalformedRecord("negative handoff revision".into())
+                    })?,
                     from_agent,
                     to_agent,
                     summary,
                     state,
                     created_at: iso_timestamp(created_us).unwrap_or_default(),
-                    accepted_by,
-                    accepted_at: accepted_us.and_then(iso_timestamp),
+                    acknowledged_by,
+                    acknowledged_at: acknowledged_us.and_then(iso_timestamp),
                     from_session_id: from_session
                         .map(|b| SessionId::from_slice(&b).map(|id| id.to_string()))
                         .transpose()?,
@@ -2294,23 +2308,29 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn latest_open_handoff(
+    pub async fn latest_claimable_handoff(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         cwd_filter: Option<String>,
+        include_claimed: bool,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                        cwd, summary, open_questions, next_steps, files_touched, state, \
-                        created_at, accepted_by, accepted_at, accepted_by_session \
-                 FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
+                "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                        from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                        files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                        acknowledged_by_session \
+                 FROM handoffs h \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND (state = 'open' OR (state = 'claimed' AND \
+                        (?3 = 1 OR EXISTS (SELECT 1 FROM handoff_claims c \
+                                          WHERE c.handoff_id = h.id AND c.state = 'live' \
+                                            AND c.lease_expires_at <= ?4)))) \
                  ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), include_claimed, Timestamp::now().as_microsecond()],
                 row_to_handoff,
             )?;
             let mut selected: Option<Handoff> = None;
@@ -2337,15 +2357,85 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let row = conn
                 .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                    "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                            from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                            files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                            acknowledged_by_session \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
                 )
                 .optional()?;
             row.transpose()
+        })
+        .await
+    }
+
+    /// Look up the stable WorkItem behind a discovered Handoff.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
+    pub async fn work_item_by_id(&self, work_item_id: WorkItemId) -> StoreResult<Option<WorkItem>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, workspace_id, project_id, objective, acceptance_criteria, state, \
+                            revision, owner_actor, owner_run_id, created_at, updated_at \
+                     FROM work_items WHERE id = ?1",
+                    params![work_item_id.as_bytes()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, Option<Vec<u8>>>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                id,
+                workspace,
+                project,
+                objective,
+                criteria,
+                state,
+                revision,
+                owner_actor,
+                owner_run,
+                created_at,
+                updated_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WorkItem {
+                id: WorkItemId::from_slice(&id)?,
+                workspace_id: WorkspaceId::from_slice(&workspace)?,
+                project_id: ProjectId::from_slice(&project)?,
+                objective,
+                acceptance_criteria: serde_json::from_str(&criteria)?,
+                state: state.parse()?,
+                revision: u64::try_from(revision).map_err(|_| {
+                    StoreError::MalformedRecord("negative work item revision".into())
+                })?,
+                owner_actor,
+                owner_run_id: owner_run
+                    .as_deref()
+                    .map(SessionId::from_slice)
+                    .transpose()?,
+                created_at: Timestamp::from_microsecond(created_at)
+                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+                updated_at: Timestamp::from_microsecond(updated_at)
+                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+            }))
         })
         .await
     }
@@ -2727,16 +2817,17 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn latest_open_handoff_for_workspace(
+    pub async fn latest_claimable_handoff_for_workspace(
         &self,
         workspace_id: WorkspaceId,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             let row_opt = conn
                 .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                    "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                            from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                            files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                            acknowledged_by_session \
                      FROM handoffs \
                      WHERE workspace_id = ?1 AND state = 'open' \
                      ORDER BY created_at DESC LIMIT 1",
@@ -5380,7 +5471,7 @@ fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
 
 /// Pick the handoff to deliver from a project's open handoffs.
 ///
-/// See [`ReaderPool::latest_open_handoff`] for the full contract: manual handoffs
+/// See [`ReaderPool::latest_claimable_handoff`] for the full contract: manual handoffs
 /// are project-wide, auto handoffs are filtered by cwd path-boundary, and a
 /// manual handoff always beats an auto one, then most specific cwd, then newest.
 #[cfg(test)]
@@ -5400,27 +5491,34 @@ fn iso_timestamp(micros: i64) -> Option<String> {
 
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
-    let ws_bytes: Vec<u8> = row.get(1)?;
-    let pj_bytes: Vec<u8> = row.get(2)?;
-    let from_session_bytes: Option<Vec<u8>> = row.get(3)?;
-    let from_agent: String = row.get(4)?;
-    let to_agent: Option<String> = row.get(5)?;
-    let cwd: Option<String> = row.get(6)?;
-    let summary: String = row.get(7)?;
-    let open_q_json: String = row.get(8)?;
-    let next_s_json: String = row.get(9)?;
-    let files_json: String = row.get(10)?;
-    let state: String = row.get(11)?;
-    let created_us: i64 = row.get(12)?;
-    let accepted_by: Option<String> = row.get(13)?;
-    let accepted_at_us: Option<i64> = row.get(14)?;
-    let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
+    let work_item_bytes: Vec<u8> = row.get(1)?;
+    let ws_bytes: Vec<u8> = row.get(2)?;
+    let pj_bytes: Vec<u8> = row.get(3)?;
+    let from_session_bytes: Option<Vec<u8>> = row.get(4)?;
+    let source_run_bytes: Vec<u8> = row.get(5)?;
+    let from_agent: String = row.get(6)?;
+    let source_actor: String = row.get(7)?;
+    let to_agent: Option<String> = row.get(8)?;
+    let cwd: Option<String> = row.get(9)?;
+    let summary: String = row.get(10)?;
+    let open_q_json: String = row.get(11)?;
+    let next_s_json: String = row.get(12)?;
+    let files_json: String = row.get(13)?;
+    let state: String = row.get(14)?;
+    let revision: i64 = row.get(15)?;
+    let created_us: i64 = row.get(16)?;
+    let acknowledged_by: Option<String> = row.get(17)?;
+    let acknowledged_at_us: Option<i64> = row.get(18)?;
+    let acknowledged_by_session_bytes: Option<Vec<u8>> = row.get(19)?;
     Ok(materialise_handoff(
         id_bytes,
+        work_item_bytes,
         ws_bytes,
         pj_bytes,
         from_session_bytes,
+        source_run_bytes,
         from_agent,
+        source_actor,
         to_agent,
         cwd,
         summary,
@@ -5428,20 +5526,24 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
         next_s_json,
         files_json,
         state,
+        revision,
         created_us,
-        accepted_by,
-        accepted_at_us,
-        accepted_by_session_bytes,
+        acknowledged_by,
+        acknowledged_at_us,
+        acknowledged_by_session_bytes,
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn materialise_handoff(
     id_bytes: Vec<u8>,
+    work_item_bytes: Vec<u8>,
     ws_bytes: Vec<u8>,
     pj_bytes: Vec<u8>,
     from_session_bytes: Option<Vec<u8>>,
+    source_run_bytes: Vec<u8>,
     from_agent: String,
+    source_actor: String,
     to_agent: Option<String>,
     cwd: Option<String>,
     summary: String,
@@ -5449,10 +5551,11 @@ fn materialise_handoff(
     next_s_json: String,
     files_json: String,
     state: String,
+    revision: i64,
     created_us: i64,
-    accepted_by: Option<String>,
-    accepted_at_us: Option<i64>,
-    accepted_by_session_bytes: Option<Vec<u8>>,
+    acknowledged_by: Option<String>,
+    acknowledged_at_us: Option<i64>,
+    acknowledged_by_session_bytes: Option<Vec<u8>>,
 ) -> StoreResult<Handoff> {
     let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
     let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
@@ -5461,16 +5564,19 @@ fn materialise_handoff(
         .as_deref()
         .map(SessionId::from_slice)
         .transpose()?;
-    let accepted_session = accepted_by_session_bytes
+    let acknowledged_session = acknowledged_by_session_bytes
         .as_deref()
         .map(SessionId::from_slice)
         .transpose()?;
     Ok(Handoff {
         id: HandoffId::from_slice(&id_bytes)?,
+        work_item_id: WorkItemId::from_slice(&work_item_bytes)?,
         workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
         project_id: ProjectId::from_slice(&pj_bytes)?,
         from_session_id: from_session,
+        source_run_id: SessionId::from_slice(&source_run_bytes)?,
         from_agent: parse_agent(&from_agent),
+        source_actor,
         to_agent: to_agent.as_deref().map(parse_agent),
         cwd,
         summary,
@@ -5478,21 +5584,23 @@ fn materialise_handoff(
         next_steps,
         files_touched,
         state: state.parse::<HandoffState>().map_err(StoreError::from)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?,
         created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
             StoreError::Memory(engram_core::MemoryError::MalformedRecord(format!(
                 "bad created_at: {e}"
             )))
         })?,
-        accepted_by: accepted_by.as_deref().map(parse_agent),
-        accepted_at: accepted_at_us
+        acknowledged_by,
+        acknowledged_at: acknowledged_at_us
             .map(jiff::Timestamp::from_microsecond)
             .transpose()
             .map_err(|e| {
                 StoreError::Memory(engram_core::MemoryError::MalformedRecord(format!(
-                    "bad accepted_at: {e}"
+                    "bad acknowledged_at: {e}"
                 )))
             })?,
-        accepted_by_session: accepted_session,
+        acknowledged_by_session: acknowledged_session,
     })
 }
 
@@ -6037,10 +6145,13 @@ mod tests {
     fn handoff(summary: &str, cwd: Option<&str>, manual: bool, t: i64) -> Handoff {
         Handoff {
             id: HandoffId::new(),
+            work_item_id: engram_core::WorkItemId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             from_session_id: if manual { None } else { Some(SessionId::new()) },
+            source_run_id: SessionId::new(),
             from_agent: AgentKind::ClaudeCode,
+            source_actor: "test".into(),
             to_agent: None,
             cwd: cwd.map(str::to_string),
             summary: summary.to_string(),
@@ -6048,10 +6159,11 @@ mod tests {
             next_steps: vec![],
             files_touched: vec![],
             state: HandoffState::Open,
+            revision: 1,
             created_at: jiff::Timestamp::from_microsecond(t).unwrap(),
-            accepted_by: None,
-            accepted_at: None,
-            accepted_by_session: None,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            acknowledged_by_session: None,
         }
     }
 
@@ -6221,7 +6333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_open_handoff_preserves_workspace_project_isolation() {
+    async fn latest_claimable_handoff_preserves_workspace_project_isolation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let ws_a = store.writer.get_or_create_workspace("a").await.unwrap();
@@ -6239,13 +6351,18 @@ mod tests {
 
         store
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws_b,
                 project_id: proj_b,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: None,
+                objective: "wrong workspace".into(),
+                acceptance_criteria: vec![],
                 summary: "wrong workspace".into(),
                 open_questions: vec![],
                 next_steps: vec![],
@@ -6255,13 +6372,18 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws_a,
                 project_id: proj_a,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: None,
+                objective: "right project".into(),
+                acceptance_criteria: vec![],
                 summary: "right project".into(),
                 open_questions: vec![],
                 next_steps: vec![],
@@ -6272,7 +6394,7 @@ mod tests {
 
         let handoff = store
             .reader
-            .latest_open_handoff(ws_a, proj_a, Some("/repo".into()))
+            .latest_claimable_handoff(ws_a, proj_a, Some("/repo".into()), false)
             .await
             .unwrap()
             .unwrap();

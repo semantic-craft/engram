@@ -7,8 +7,8 @@ managed routing snippet + Agent Skills package.
 ## Cross-agent handoff
 
 You normally do not create handoffs by hand. With lifecycle hooks
-installed, session-end capture writes the handoff and the next
-session-start hook fetches it.
+installed, session-end capture writes a WorkItem/Handoff and the next
+session-start hook discovers it without changing state.
 
 ```text
 $ claude
@@ -17,18 +17,26 @@ $ claude
 > /exit
 
 $ codex   # in the same directory, later
-[SessionStart hook fetches the handoff; Codex sees it before your prompt.]
+[SessionStart hook discovers the handoff; Codex sees it before your prompt.]
 > Picking up: you were investigating session cookies as an alternative...
 ```
 
 If an agent has MCP but no lifecycle hook surface, ask it to call
-`memory_handoff_begin` before quitting. The next hooked agent can still
-consume that handoff automatically.
+`memory_handoff_begin` before quitting. The next agent discovers the open
+Handoff, claims its exact revision for the current Run, and acknowledges it
+only by writing the first durable checkpoint. Merely reading or claiming does
+not complete the WorkItem. Claims have bounded leases, so another receiver can
+recover the task if the first disappears.
 
 If an agent creates a handoff by mistake, cancel it immediately with
-`memory_handoff_cancel` and the `handoff_id` returned by
-`memory_handoff_begin`. Cancelling marks the handoff expired, so the next
-session-start hook will not consume stale context.
+`memory_handoff_cancel` with the id, revision, and source Run returned by
+`memory_handoff_begin`. Only that source owner can expire an open Handoff.
+
+Claims, releases, and checkpoints require a fresh caller-supplied `attempt_id`.
+If a response is lost, retry the identical request with the same Attempt id;
+Engram returns the recorded result without extending a lease or duplicating a
+transition. Reusing an Attempt for a changed actor, scope, target, revision,
+Run, lease, or checkpoint payload fails closed.
 
 ## Compaction recovery
 
@@ -50,12 +58,14 @@ at the managed engram Agent Skills that carry detailed tool routing.
 | "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, with bounded raw-observation fallback. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
-| "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
-| "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
-| "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
+| "Where did we leave off?" | Existing handoff block, or `memory_handoff_discover` if no block exists | Reads the latest claimable Handoff without mutation. |
+| "Continue that work" | `memory_handoff_claim`, then `memory_checkpoint_write` | Claims an exact revision and acknowledges receipt with the first durable checkpoint. |
+| "I cannot continue this claim" | `memory_handoff_release` | Reopens the exact live Claim for another receiver. |
+| "Save context for the next session" | `memory_handoff_begin` | Creates or continues a WorkItem and publishes a terse open Handoff. |
+| "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Lets the source owner expire an exact open Handoff revision. |
 | "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `ENGRAM_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Manually reviews the latest completed session by default. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
-| "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
+| "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not operational WorkItem state. |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
 | "How big is the wiki?" / "stats?" | `memory_status`, `memory_briefing` | Counts and recent activity windows; `memory_briefing` is read-only. |

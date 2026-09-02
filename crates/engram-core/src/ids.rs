@@ -83,6 +83,11 @@ id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub WorkItemId, "Identifier for a stable unit of user work.");
+id_newtype!(pub ClaimId, "Opaque identifier for one temporary handoff claim.");
+id_newtype!(pub CheckpointId, "Identifier for one durable WorkItem checkpoint.");
+id_newtype!(pub AttemptId, "Caller-supplied identifier for one retryable continuity mutation.");
+id_newtype!(pub BackgroundJobId, "Identifier for server-side asynchronous processing, never a WorkItem or Run identity.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
@@ -249,13 +254,10 @@ impl AgentKind {
     ///
     /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
     /// "For events like SessionStart or PostToolUse, stdout is ignored"), so
-    /// the native hook must NOT fetch the handoff for it: the fetch is
-    /// **destructive** (the server marks the handoff accepted) and the result
-    /// would be discarded — silently losing the handoff. For such agents the
-    /// handoff stays available on demand via the MCP `memory_handoff_accept`
-    /// tool. Unknown future agents return `false` until we know their
-    /// SessionStart stdout semantics; accepting a handoff is single-use and
-    /// should fail safe.
+    /// the native hook need not perform a read whose rendered result would be
+    /// discarded. Such agents can call the read-only MCP
+    /// `memory_handoff_discover` tool instead. Unknown future agents return
+    /// `false` until their SessionStart stdout semantics are known.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(self, Self::Grok | Self::Other)

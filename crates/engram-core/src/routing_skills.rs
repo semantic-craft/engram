@@ -14,7 +14,7 @@ pub const AGENTS_SKILL_DIR: &str = ".agents";
 pub const SKILLS_DIR: &str = "skills";
 
 const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal is read-only retrieval from engram: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when engram is not named.";
-const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
+const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is recoverable task continuity across agents or time: finding or claiming a Handoff, checkpointing or completing a WorkItem, saving next-session context, releasing a claim, or discarding a mistaken Handoff. Trigger by semantic intent rather than exact wording.";
 const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit durable wiki mutation in engram: saving project knowledge, recording a rule or annotation, updating a permanent note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
 const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any engram knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
 const PROJECT_INSTRUCTION_MAINTENANCE_DESCRIPTION: &str = "Use this skill when asked to inspect, diagnose, propose, review, approve, or locally apply maintenance to a repository's CLAUDE.md, AGENTS.md, or other canonical project instruction file through engram. Trigger for project-instruction stewardship, context-budget cleanup, durable rule placement, or pending instruction proposals; keep proposal storage on the server and repository apply on the local host.";
@@ -97,8 +97,11 @@ mod tests {
         ("memory_status", "engram-retrieval"),
         ("memory_briefing", "engram-retrieval"),
         ("memory_explore", "engram-retrieval"),
-        ("memory_handoff_accept", "engram-handoff"),
         ("memory_handoff_begin", "engram-handoff"),
+        ("memory_handoff_discover", "engram-handoff"),
+        ("memory_handoff_claim", "engram-handoff"),
+        ("memory_handoff_release", "engram-handoff"),
+        ("memory_checkpoint_write", "engram-handoff"),
         ("memory_handoff_cancel", "engram-handoff"),
         ("memory_write_page", "engram-durable-pages"),
         ("memory_delete_page", "engram-durable-pages"),

@@ -2457,7 +2457,7 @@ fn render_grok(
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but handoff injection does not. Recover a prior session's");
-    println!("#       handoff via the MCP `memory_handoff_accept` tool.");
+    println!("#       handoff via the MCP `memory_handoff_discover` tool.");
     println!();
     println!("{serialized}");
     Ok(())

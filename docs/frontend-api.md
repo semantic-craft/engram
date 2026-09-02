@@ -332,8 +332,8 @@ across all projects in the workspace:
 }
 ```
 
-> Note: `last_open_handoff` is **not** consumed by the read API — the
-> handoff stays "open" and can still be accepted by the next agent.
+> Note: `last_open_handoff` is **not** consumed by the read API. Claiming and
+> first-Checkpoint acknowledgement happen only through explicit MCP writes.
 
 ### 4.9 Sessions and handoffs (per project)
 
@@ -362,21 +362,23 @@ and the path of its synthesised summary page when there is one.
 ]
 ```
 
-**Handoffs** — the full history in every state (`open`, `accepted`,
-`expired`), unlike the overview's `handoff` field which shows only the
-latest open one. Reading this list never consumes a handoff.
+**Handoffs** — the full history in every state (`open`, `claimed`,
+`acknowledged`, `expired`), unlike the overview's `handoff` field which shows
+only the latest claimable one. Reading this list never mutates a Handoff.
 
 ```json
 [
   {
     "id": "019a…",
+    "work_item_id": "019b…",
+    "revision": 3,
     "from_agent": "claude-code",
     "to_agent": null,
     "summary": "Session ended; 2 observations recorded.",
-    "state": "accepted",
+    "state": "acknowledged",
     "created_at": "2026-08-01T01:45:34.552Z",
-    "accepted_by": "codex",
-    "accepted_at": "2026-08-01T09:12:05.001Z",
+    "acknowledged_by": "user:receiver",
+    "acknowledged_at": "2026-08-01T09:12:05.001Z",
     "from_session_id": "0199…"
   }
 ]
