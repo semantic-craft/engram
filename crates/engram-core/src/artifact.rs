@@ -412,10 +412,18 @@ fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
     Ok(locator.trim_end_matches(".git").to_string())
 }
 
+/// Whether a normalized locator names a filesystem location rather than a
+/// path inside a repository.
+///
+/// A bare drive prefix counts: [`normalize_locator`] strips trailing
+/// separators, so a Windows checkout root arrives here as `C:` rather than
+/// `C:\\`. Requiring three characters would let that root through as
+/// cross-machine identity, which is exactly what `local_path_hint` is for.
+/// `C:relative` is drive-relative and not a repository path either.
 fn is_absolute_path(value: &str) -> bool {
     value.starts_with('/')
         || value.starts_with('\\')
-        || (value.len() >= 3
+        || (value.len() >= 2
             && value.as_bytes()[1] == b':'
             && value.as_bytes()[0].is_ascii_alphabetic())
 }
@@ -460,6 +468,50 @@ mod tests {
             ..empty_input()
         };
         assert!(input.normalized().is_err());
+    }
+
+    #[test]
+    fn absolute_locators_are_rejected_including_drive_roots() {
+        // `normalize_locator` strips the trailing separator, so a Windows
+        // checkout root reaches the check as `C:`.
+        for locator in [
+            "/",
+            "/tmp/machine-a/engram",
+            "C:\\",
+            "C:/",
+            "C:",
+            "\\\\host\\share",
+        ] {
+            for kind in [ArtifactKind::Worktree, ArtifactKind::File] {
+                let input = ArtifactInput {
+                    kind,
+                    locator: locator.into(),
+                    repository_identity: Some("github.com/semantic-craft/engram".into()),
+                    observed_revision: Some("abc123".into()),
+                    local_path_hint: Some(locator.into()),
+                    ..empty_input()
+                };
+                let error = input
+                    .normalized()
+                    .expect_err(&format!("{kind:?} must reject {locator}"))
+                    .to_string();
+                assert!(
+                    error.contains("local_path_hint") || error.contains("must not be empty"),
+                    "{kind:?} {locator}: {error}"
+                );
+            }
+        }
+
+        // A repository-relative path that merely looks drive-ish is fine.
+        let ok = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt/machine-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("/tmp/machine-a/engram".into()),
+            ..empty_input()
+        };
+        assert!(ok.normalized().is_ok());
     }
 
     #[test]
