@@ -147,7 +147,7 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
 /// Grok Build CLI hook payload for setup-agent script snippets.
 /// Grok shares Claude Code's JSON shape and event vocabulary, but uses
 /// its own script bundle so script fallback keeps `agent=grok` and never
-/// destructively fetches handoffs on SessionStart.
+/// fetches read-only handoff context on SessionStart.
 #[must_use]
 pub(crate) fn build_grok_payload(
     emit_root: &Path,

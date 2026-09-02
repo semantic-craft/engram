@@ -22,7 +22,7 @@ use engram_consolidate::Consolidator;
 use engram_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff,
     NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
-    WorkspaceId,
+    WorkItem, WorkspaceId,
 };
 use engram_store::WriterHandle;
 use engram_wiki::Wiki;
@@ -32,9 +32,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::log;
-use crate::payload::{
-    HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
-};
+use crate::payload::{HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent};
 use crate::synth::synthesize_session_page;
 
 /// Default maximum number of hook events allowed to be processing at once.
@@ -478,9 +476,6 @@ fn parse_hook_query(url: &str) -> HookQuery {
 /// Query params for `GET /handoff`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HandoffQuery {
-    /// Identifier of the agent fetching the handoff. Used to mark the
-    /// handoff as accepted-by; defaults to `Other` if unrecognised.
-    pub agent: Option<String>,
     /// Optional cwd filter. When provided, only handoffs whose stored
     /// cwd matches this string are returned. Note: the cwd string is
     /// not canonicalized; symlinked paths must match byte-for-byte.
@@ -515,19 +510,21 @@ pub struct HandoffQuery {
 /// (or an empty body when no handoff is open) with a 1-second cap on
 /// the server side so the agent never blocks measurably on startup.
 ///
-/// Side effect: when a handoff is found, it is *marked accepted* before
-/// the response is sent. Two agents starting in parallel therefore
-/// race; whichever arrives first wins. That is intentional — handoffs
-/// are 1:1, not broadcast.
+/// This endpoint is read-only. Rendering or losing SessionStart output cannot
+/// consume a continuation; the receiving Run must claim it and persist its
+/// first checkpoint through MCP.
 async fn handle_handoff(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
 ) -> impl IntoResponse {
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| ActorKey {
+            user: actor.user,
+            session_id: actor.session_id,
+        })
         .unwrap_or_default();
-    match fetch_and_accept_handoff(&state, query, actor_user).await {
+    match fetch_handoff_context(&state, query, &actor).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         Err(e) => {
@@ -537,44 +534,32 @@ async fn handle_handoff(
     }
 }
 
-async fn fetch_and_accept_handoff(
+async fn fetch_handoff_context(
     state: &HookState,
     query: HandoffQuery,
-    actor_user: Option<String>,
+    actor: &ActorKey,
 ) -> anyhow::Result<Option<String>> {
-    let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-    // `/handoff` has no session_id in the request — `per_session` mode
-    // therefore falls back to the single slot (graceful degradation),
-    // while `per_actor` keys by `user` alone.
-    let actor_key = engram_core::ActorKey {
-        user: actor_user,
-        session_id: None,
+    let Some((ws, proj)) = resolve_handoff_scope(state, &query, actor).await? else {
+        return Ok(None);
     };
-    let (ws, proj) = resolve_project_ids(
-        state,
-        query.cwd.as_deref(),
-        query.workspace.as_deref(),
-        query.project.as_deref(),
-        ProjectStrategy::parse(query.project_strategy.as_deref()),
-        &actor_key,
-    )
-    .await?;
     let handoff_md = {
         let handoff = state
             .reader
-            .latest_open_handoff(ws, proj, query.cwd)
+            .latest_claimable_handoff(ws, proj, query.cwd, false)
             .await?;
         match handoff {
             Some(h) => {
-                state.writer.accept_handoff(h.id, agent, None).await?;
-                Some(render_handoff_markdown(&h))
+                let work_item = state
+                    .reader
+                    .work_item_by_id(h.work_item_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("handoff {} has no WorkItem", h.id))?;
+                Some(render_handoff_markdown(&h, &work_item))
             }
             None => None,
         }
     };
-    // The brief is additive and non-destructive: unlike the handoff (a
-    // single-use slot consumed above), it is recomposed on every opted-in
-    // session start — exactly what a Claude Code `/clear` needs (#176).
+    // The brief and handoff are both non-destructive and may be rendered again.
     let brief_md = if crate::payload::query_flag_truthy(query.briefing.as_deref()) {
         let budget = query
             .briefing_budget
@@ -596,6 +581,79 @@ async fn fetch_and_accept_handoff(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     })
+}
+
+/// Resolve the read-only SessionStart injection scope without creating or
+/// publishing anything. Cwd-derived lookup mirrors hook capture naming, then
+/// falls back to an existing longest-prefix project for nested directories.
+async fn resolve_handoff_scope(
+    state: &HookState,
+    query: &HandoffQuery,
+    actor: &ActorKey,
+) -> anyhow::Result<Option<(WorkspaceId, ProjectId)>> {
+    let resolver =
+        engram_store::ScopeResolver::new(&state.reader, state.workspace_id, state.project_id)
+            .with_active_project(&state.active_project);
+
+    if query.project.is_none() && query.cwd.is_none() {
+        return resolver
+            .resolve_read_args(query.workspace.as_deref(), None, actor)
+            .await
+            .map(|scope| Some(scope.as_tuple()))
+            .map_err(Into::into);
+    }
+
+    let project = query.project.clone().or_else(|| {
+        let cwd = query.cwd.as_deref()?;
+        let strategy = match ProjectStrategy::parse(query.project_strategy.as_deref()) {
+            ProjectStrategy::Basename => engram_consolidate::ProjectNameStrategy::Basename,
+            ProjectStrategy::RepoRoot => engram_consolidate::ProjectNameStrategy::MainRepoRoot,
+        };
+        engram_consolidate::derive_project_name(std::path::Path::new(cwd), strategy)
+            .map(|(name, _)| name)
+    });
+    let Some(project) = project else {
+        return Ok(Some((state.workspace_id, state.project_id)));
+    };
+    if project == engram_core::GLOBAL_SCOPE_PROJECT {
+        return Ok(Some((state.workspace_id, state.project_id)));
+    }
+    let workspace = query.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE_NAME);
+    match resolver.lookup_existing(workspace, &project).await {
+        Ok(scope) => return Ok(Some(scope.as_tuple())),
+        Err(
+            engram_store::ScopeResolutionError::WorkspaceNotFound { .. }
+            | engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. },
+        ) if query.project.is_none() => {}
+        Err(
+            engram_store::ScopeResolutionError::WorkspaceNotFound { .. }
+            | engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. },
+        ) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    let workspace_id = if query.workspace.is_none() {
+        state.workspace_id
+    } else {
+        let Some(id) = state.reader.find_workspace(workspace.to_string()).await? else {
+            return Ok(None);
+        };
+        id
+    };
+    let project_id = if let Some(cwd) = query.cwd.as_deref() {
+        state
+            .reader
+            .find_project_by_cwd_prefix(
+                workspace_id,
+                normalize_project_path_key(cwd),
+                state.home_dir.as_deref(),
+            )
+            .await?
+            .map(|(id, _)| id)
+    } else {
+        None
+    };
+    Ok(project_id.map(|project_id| (workspace_id, project_id)))
 }
 
 /// Default char budget for the session-start brief (~1k tokens at the
@@ -697,7 +755,7 @@ fn render_session_brief(
     Some(buf)
 }
 
-fn render_handoff_markdown(h: &Handoff) -> String {
+fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
     // Layout goal: TUI-renderable + agent-friendly. The previous
     // shape put a paragraph-long `## Summary` first, which made the
     // hook output look like a wall of text in Codex's "completed"
@@ -705,15 +763,28 @@ fn render_handoff_markdown(h: &Handoff) -> String {
     // "where did we leave off" questions. The new layout leads
     // with the actionable bullets (open questions, next steps) and
     // pushes the prose summary to the bottom; the agent-facing
-    // footer explicitly tells the model how to interpret a follow-up
-    // memory_handoff_accept = null.
+    // footer explicitly tells the model that discovery did not claim work.
     let mut buf = String::with_capacity(512);
     buf.push_str("> 📥 **engram: pending handoff from previous session**\n");
     buf.push_str(&format!(
-        "> from `{from}` · created {ts}\n",
+        "> WorkItem `{work_item}` · Handoff `{handoff}` · revision `{revision}`\n\
+         > from `{from}` · created {ts}\n",
+        work_item = h.work_item_id,
+        handoff = h.id,
+        revision = h.revision,
         from = h.from_agent.as_str(),
         ts = h.created_at,
     ));
+
+    buf.push_str("\n**Objective**\n");
+    buf.push_str(work_item.objective.trim());
+    buf.push('\n');
+    if !work_item.acceptance_criteria.is_empty() {
+        buf.push_str("\n**Acceptance criteria**\n");
+        for criterion in &work_item.acceptance_criteria {
+            buf.push_str(&format!("- [ ] {criterion}\n"));
+        }
+    }
 
     if !h.open_questions.is_empty() {
         buf.push_str("\n**Open questions**\n");
@@ -740,21 +811,13 @@ fn render_handoff_markdown(h: &Handoff) -> String {
     buf.push_str(h.summary.trim());
     buf.push('\n');
 
-    // Agent-facing reading instructions. This block is the
-    // load-bearing UX fix — without it, agents call
-    // memory_handoff_accept again, get `null` (single-use
-    // already consumed by this hook), and conclude "no handoff"
-    // *despite this content being right in their context*.
     buf.push_str(
         "\n---\n\
-         _**To the receiving agent:** this content IS the pending \
-         handoff — already consumed by the SessionStart hook. A \
-         subsequent `memory_handoff_accept` call will return \
-         `{ \"handoff\": null }` (single-use). When the user asks \
-         \"where did we leave off?\" or \"any pending handoff?\", \
-         answer from THIS content; do NOT re-call the tool. Call \
-         `memory_query` / `memory_recent` only for additional \
-         context beyond what's listed here._\n",
+         _**To the receiving agent:** rendering this envelope did not claim or \
+         acknowledge it. Call `memory_handoff_claim` with the exact Handoff id, \
+         revision, Run/Session id, and a fresh Attempt id before continuing. \
+         Persist `memory_checkpoint_write` to acknowledge it; release the claim \
+         if you cannot proceed._\n",
     );
     buf
 }
@@ -1313,11 +1376,14 @@ async fn process(
             ws,
             proj,
             env.agent,
+            actor_user
+                .as_deref()
+                .map_or_else(|| "anonymous".to_string(), |user| format!("user:{user}")),
             session_id,
             env.cwd.clone(),
             &observations,
         );
-        let handoff_id = state.writer.insert_handoff(handoff).await?;
+        let published = state.writer.publish_handoff(handoff).await?;
         // Opt-in (ENGRAM_CONSOLIDATE_ON_SESSION_END): additionally run LLM
         // consolidation so the session's knowledge is compiled into topical
         // pages, not just the heuristic session record. The heuristic page
@@ -1354,7 +1420,8 @@ async fn process(
         info!(
             session = %session_id,
             page = %new_page.path,
-            handoff = %handoff_id,
+            handoff = %published.handoff_id,
+            work_item = %published.work_item_id,
             "session ended; summary page + open handoff created",
         );
     }
@@ -1383,6 +1450,7 @@ fn build_auto_handoff(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     from_agent: AgentKind,
+    source_actor: String,
     session_id: SessionId,
     cwd: Option<String>,
     observations: &[engram_core::Observation],
@@ -1451,12 +1519,17 @@ fn build_auto_handoff(
         )]
     };
     NewHandoff {
+        work_item_id: None,
         workspace_id,
         project_id,
         from_session_id: Some(session_id),
+        source_run_id: session_id,
         from_agent,
+        source_actor,
         to_agent: None,
         cwd: cwd.map(std::path::PathBuf::from),
+        objective: summary.clone(),
+        acceptance_criteria: Vec::new(),
         summary,
         open_questions,
         next_steps,
@@ -3498,7 +3571,7 @@ mod tests {
                 },
                 serde_json::json!({ "session_id": sid }),
             );
-            process(&state, env, None).await.unwrap();
+            process(&state, env, Some("alice".into())).await.unwrap();
         }
 
         let pages = state
@@ -3513,6 +3586,13 @@ mod tests {
             "SessionEnd must write a heuristic sessions/<id>.md page regardless of the flag; got {:?}",
             pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
         );
+        let handoff = state
+            .reader
+            .latest_claimable_handoff(state.workspace_id, state.project_id, None, false)
+            .await
+            .unwrap()
+            .expect("SessionEnd must publish a handoff");
+        assert_eq!(handoff.source_actor, "user:alice");
     }
 
     #[tokio::test]
@@ -3688,7 +3768,7 @@ mod tests {
         assert!(
             state
                 .reader
-                .latest_open_handoff(state.workspace_id, target, None)
+                .latest_claimable_handoff(state.workspace_id, target, None, false)
                 .await
                 .unwrap()
                 .is_none(),
@@ -3746,7 +3826,7 @@ mod tests {
         assert!(
             state
                 .reader
-                .latest_open_handoff(state.workspace_id, target, None)
+                .latest_claimable_handoff(state.workspace_id, target, None, false)
                 .await
                 .unwrap()
                 .is_none(),
@@ -3850,7 +3930,7 @@ mod tests {
         assert!(
             state
                 .reader
-                .latest_open_handoff(state.workspace_id, state.project_id, None)
+                .latest_claimable_handoff(state.workspace_id, state.project_id, None, false,)
                 .await
                 .unwrap()
                 .is_some(),
@@ -4041,13 +4121,18 @@ mod tests {
         .unwrap();
         state
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "handoff summary".into(),
+                acceptance_criteria: Vec::new(),
                 summary: "handoff summary".to_string(),
                 open_questions: Vec::new(),
                 next_steps: vec!["continue".to_string()],
@@ -4056,10 +4141,9 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_and_accept_handoff(
+        let rendered = fetch_handoff_context(
             &state,
             HandoffQuery {
-                agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
                 project: None,
@@ -4067,7 +4151,7 @@ mod tests {
                 briefing: None,
                 briefing_budget: None,
             },
-            None,
+            &ActorKey::default(),
         )
         .await
         .unwrap();
@@ -4132,7 +4216,6 @@ mod tests {
             .unwrap();
 
         let query = |briefing: Option<&str>| HandoffQuery {
-            agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
             project: None,
@@ -4142,7 +4225,7 @@ mod tests {
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
-        let rendered = fetch_and_accept_handoff(&state, query(Some("false")), None)
+        let rendered = fetch_handoff_context(&state, query(Some("false")), &ActorKey::default())
             .await
             .unwrap();
         assert!(
@@ -4151,7 +4234,7 @@ mod tests {
         );
 
         // Truthy opt-in, no pending handoff: brief alone (the /clear case).
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+        let rendered = fetch_handoff_context(&state, query(Some("true")), &ActorKey::default())
             .await
             .unwrap()
             .expect("brief must be injected without a pending handoff");
@@ -4167,13 +4250,18 @@ mod tests {
         // Truthy opt-in with a pending handoff: handoff first, brief after.
         state
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "resume the auth refactor".into(),
+                acceptance_criteria: Vec::new(),
                 summary: "resume the auth refactor".to_string(),
                 open_questions: Vec::new(),
                 next_steps: Vec::new(),
@@ -4181,7 +4269,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None)
+        let rendered = fetch_handoff_context(&state, query(Some("true")), &ActorKey::default())
             .await
             .unwrap()
             .expect("handoff + brief must both be injected");
@@ -4274,13 +4362,18 @@ mod tests {
         .unwrap();
         state
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "handoff summary".into(),
+                acceptance_criteria: Vec::new(),
                 summary: "handoff summary".to_string(),
                 open_questions: Vec::new(),
                 next_steps: vec!["resume plain repo".to_string()],
@@ -4289,10 +4382,9 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_and_accept_handoff(
+        let rendered = fetch_handoff_context(
             &state,
             HandoffQuery {
-                agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
                 project: None,
@@ -4300,7 +4392,7 @@ mod tests {
                 briefing: None,
                 briefing_budget: None,
             },
-            None,
+            &ActorKey::default(),
         )
         .await
         .unwrap();
@@ -4310,6 +4402,97 @@ mod tests {
                 .as_deref()
                 .is_some_and(|s| s.contains("resume plain repo")),
             "no-marker handoff lookup must still resolve basename(cwd)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_fetch_is_no_create_and_uses_actor_scoped_active_project() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.active_project = ActiveProject::with_mode(engram_core::ActiveProjectMode::PerActor);
+        let alice_project = state
+            .writer
+            .get_or_create_project(state.workspace_id, "alice-project", None)
+            .await
+            .unwrap();
+        let bob_project = state
+            .writer
+            .get_or_create_project(state.workspace_id, "bob-project", None)
+            .await
+            .unwrap();
+        let alice = ActorKey {
+            user: Some("alice".into()),
+            session_id: None,
+        };
+        let bob = ActorKey {
+            user: Some("bob".into()),
+            session_id: None,
+        };
+        state
+            .active_project
+            .set_for(&alice, state.workspace_id, alice_project);
+        state
+            .active_project
+            .set_for(&bob, state.workspace_id, bob_project);
+        for (project_id, actor, summary) in [
+            (alice_project, "user:alice", "alice continuation"),
+            (bob_project, "user:bob", "bob continuation"),
+        ] {
+            state
+                .writer
+                .publish_handoff(NewHandoff {
+                    work_item_id: None,
+                    workspace_id: state.workspace_id,
+                    project_id,
+                    from_session_id: None,
+                    source_run_id: SessionId::new(),
+                    from_agent: AgentKind::Codex,
+                    source_actor: actor.into(),
+                    to_agent: None,
+                    cwd: None,
+                    objective: summary.into(),
+                    acceptance_criteria: vec![],
+                    summary: summary.into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let query = HandoffQuery::default();
+        let alice_context = fetch_handoff_context(&state, query.clone(), &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        let bob_context = fetch_handoff_context(&state, query, &bob)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(alice_context.contains("alice continuation"));
+        assert!(!alice_context.contains("bob continuation"));
+        assert!(bob_context.contains("bob continuation"));
+
+        let missing = fetch_handoff_context(
+            &state,
+            HandoffQuery {
+                cwd: Some("/tmp/never-created".into()),
+                ..HandoffQuery::default()
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+        assert!(missing.is_none());
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "never-created".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "read-only handoff fetch must not create a cwd-derived project"
         );
     }
 

@@ -58,6 +58,9 @@ Skills. When a task matches an installed engram Agent Skill, load and
 follow that skill before calling engram tools. The skills cover memory
 retrieval, handoffs, durable pages, learning maintenance,
 project-instruction maintenance, and routing install or refresh work.
+Memory retrieval uses caller-budgeted context packages with stable,
+revisioned references; load the retrieval skill for the exact package and
+full-evidence workflow.
 
 ### When you write a project rule, write it here
 

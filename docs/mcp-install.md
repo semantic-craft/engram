@@ -40,13 +40,13 @@ SessionStart stdout, so engram does not auto-inject handoffs for Grok.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via engram's MCP tools
-(`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
+(`memory_query`, `memory_recent`, `memory_handoff_discover`, etc.), but
 they do not auto-capture session events into engram's `/hook`
 endpoint. The trade-off:
 
 | | What you get | What you don't get |
 |---|---|---|
-| **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
+| **MCP only** | LLM can query the wiki, discover/claim/checkpoint Handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries or SessionStart discovery |
 | **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting | - |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
@@ -207,8 +207,8 @@ Aliases: `copilot`, `github-copilot`.
 - Lifecycle hooks aren't possible until VS Code Copilot adds an agent
   hook surface. Until then, the auto-handoff flow that other agents
   enjoy (SessionStart auto-fetches a "where you left off" block) does
-  not run here — ask the agent to call `memory_handoff_accept`
-  manually if you want it.
+  not run here — ask the agent to call read-only `memory_handoff_discover`,
+  then claim the returned exact revision before continuing.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
   <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
@@ -518,9 +518,10 @@ same: ask the model to list its available MCP tools, or to call
 You: List the MCP tools you can call. Use one of them to check
      engram's status.
 
-Model (any client): I can call: memory_query, memory_recent,
-     memory_status, memory_briefing, memory_explore,
-     memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
+  Model (any client): I can call: memory_query, memory_recent,
+     memory_context_read, memory_status, memory_briefing, memory_explore,
+     memory_handoff_begin, memory_handoff_discover, memory_handoff_claim,
+     memory_handoff_release, memory_checkpoint_write, memory_handoff_cancel,
      memory_consolidate, memory_auto_improve, memory_write_page, memory_read_page, memory_delete_page,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
@@ -562,7 +563,7 @@ that *starts* the next one - to play nicely with engram:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `engram finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the read-only Handoff discovery via `/handoff`, OR (b) the model proactively calls `memory_handoff_discover`; the receiver then explicitly claims and checkpoints it. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

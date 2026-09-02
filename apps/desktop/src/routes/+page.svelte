@@ -297,7 +297,7 @@
             title="全局记忆"
             scopeLabel="default / _global"
             pages={globalPages}
-            banner="这里的页面作为 global_scope_hits 自动并入每个项目的 memory_query 结果——只放跨项目长期有效的偏好与红线，不放项目细节。"
+            banner="这里匹配的页面会在预算内自动并入每个项目的 memory_query ContextPackage——只放跨项目长期有效的偏好与红线，不放项目细节。"
             bind:kindFilter={globalFilter}
             onOpen={(p) => openPage(p, GLOBAL)}
             onNew={() => {

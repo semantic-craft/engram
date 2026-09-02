@@ -153,21 +153,32 @@ paths and must not mutate the active agent context mid-turn.
 A first-class typed protocol, shared state:
 
 ```rust
-struct Handoff {
-    from_agent: String,   // "claude-code", "codex"
-    to_agent: Option<String>,
-    project_id: ProjectId,
-    cwd: PathBuf,
-    summary: String,
-    open_questions: Vec<String>,
-    files_touched: Vec<PathBuf>,
-    next_steps: Vec<String>,
-    model: String,
-    created_at: DateTime,
-}
+WorkItem       stable user objective + acceptance criteria + explicit state
+Run / Session execution identity, separate from authenticated actor identity
+Handoff        revisioned transfer offer for one WorkItem
+Claim          opaque receiver capability with a bounded lease
+Checkpoint     append-only ordered progress; may acknowledge one Claim
+Attempt        caller identity for replay-safe claim/release/checkpoint retries
 ```
 
-MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is stored with no cwd and so is project-wide, and is preferred over the auto SessionEnd handoff (then the most specific cwd, then the most recent) so an explicit "where we left off" baton is never shadowed by the heuristic one.
+`memory_handoff_begin` creates a WorkItem plus open Handoff, or publishes a
+continuation for an exact existing WorkItem owned by the same authenticated
+actor and source Run. SessionStart and `memory_handoff_discover` are read-only.
+The receiver uses compare-and-set `memory_handoff_claim`; its first
+`memory_checkpoint_write` acknowledges the Claim and Handoff transactionally.
+Acknowledgement is not completion: only an explicit checkpoint state can block,
+complete, or abandon the WorkItem. `memory_handoff_release` reopens a live Claim,
+and expired leases are claimable by another receiver. Claim, release, and
+checkpoint Attempts bind actor, scope, exact identities, expected revisions,
+Run, and canonical request digest so a lost-response retry returns the original
+result while changed reuse fails closed. Claim secrets and checkpoint payloads
+are excluded from audit detail.
+
+The cwd is matched by path-boundary: a Handoff left in `/repo` is discovered by
+a session in `/repo/api`, but never `/repo-other`. Manual project-wide Handoffs
+remain preferred over auto SessionEnd Handoffs, then the most specific cwd, then
+the most recent. SQLite is the operational coordination source of truth behind
+the single writer actor; Markdown remains the durable knowledge source of truth.
 
 agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
 
@@ -177,14 +188,18 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 
 | Tool | Purpose | Annotation |
 |---|---|---|
-| `memory_query` | Search + retrieve, FTS5 + optional hybrid RRF | read-only |
+| `memory_query` | Existing hybrid retrieval plus caller-budgeted ContextPackage assembly | read-only |
+| `memory_context_read` | Resolve an exact revisioned ContextRef to full evidence | read-only |
 | `memory_recent` | Most-recently-updated `is_latest=1` pages for the project | read-only |
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
 | `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |
 | `memory_explore` | LLM-composed prose digest over `memory_briefing`; degrades to JSON without a provider | read-only |
-| `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
-| `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
-| `memory_handoff_cancel` | Mark an exact mistakenly-created open handoff expired | destructive |
+| `memory_handoff_begin` | Create or continue a WorkItem and publish an open Handoff | write |
+| `memory_handoff_discover` | Read a claimable Handoff without mutation | read-only |
+| `memory_handoff_claim` | Claim an exact revision under a bounded lease | write |
+| `memory_handoff_release` | Reopen an exact live Claim | write |
+| `memory_checkpoint_write` | Append progress and optionally acknowledge the receiving Claim | write |
+| `memory_handoff_cancel` | Source-owner cancellation of an exact open revision | write |
 | `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
 | `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
@@ -198,6 +213,15 @@ Tool param aliases stay narrow: shipped aliases cover `query|q|search` and
 `limit|n|top_k`; project and cwd parameters use canonical names unless the
 code adds a concrete alias.
 
+Context assembly is deliberately downstream of candidate generation. FTS,
+optional vector search, link-neighbour expansion, and their RRF scores remain
+the only ranking stack. The assembler owns breadth-before-depth selection,
+three representation tiers, SHA-256 equivalence deduplication, per-kind
+quotas, already-used ContextRefs, deterministic ordering, and UTF-8-byte budget
+accounting. The only shipped ContextKinds are backed by current query sources:
+wiki pages, session pages, and raw observations. Provider enrichment may alter
+derived candidate material, but cannot write canonical markdown.
+
 Managed engram Agent Skills are prompt packaging for this tool-routing
 guidance only. They are installed as ordinary `SKILL.md` files so agents can
 progressively load detailed instructions, but engram does not store durable
@@ -210,7 +234,7 @@ state remains server-side, repository authority remains local, and Git stage,
 commit, push, and merge are outside the workflow.
 
 Project-instruction semantic assistance deliberately remains an authenticated
-CLI/admin bridge rather than a seventeenth MCP tool. Its provider is advisory:
+CLI/admin bridge rather than an MCP repository-write tool. Its provider is advisory:
 the server supplies bounded authoritative evidence, requires exact citations,
 and accepts at most one pending proposal. It has no repository handle. The
 single writer actor persists review data only, and the human approval hash path

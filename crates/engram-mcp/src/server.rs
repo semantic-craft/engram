@@ -1,6 +1,6 @@
 //! [`EngramServer`] — the MCP server skeleton + tool router.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -9,8 +9,11 @@ use engram_consolidate::{
     run_auto_improve_review, run_lint, run_sweep,
 };
 use engram_core::{
-    ActiveProject, AgentKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    AcceptanceCriterionStatus, ActiveProject, AgentKind, AttemptId, AuthLevel, Capability,
+    CheckpointWrite, ClaimId, ContextAssembler, ContextAssemblyRequest, ContextCandidate,
+    ContextKind, ContextProvenance, ContextQuota, ContextRef, ContextRepresentations,
+    HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff, PageId, PagePath,
+    ProjectId, SessionId, Tier, WorkItemId, WorkItemState, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider};
 use engram_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
@@ -24,6 +27,7 @@ use rmcp::model::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const HANDOFF_SUMMARY_MAX_CHARS: usize = 3_000;
 const HANDOFF_ITEM_MAX_CHARS: usize = 1_500;
@@ -153,8 +157,8 @@ we decide in the other-app project?'). Phrases like 'this project', \
 'here', 'we', 'our work', 'where did we leave off' all mean the \
 *current* project — call the tool with no scoping args. If the user \
 asks about a handoff and the SessionStart auto-fetched block is already \
-in your context, answer from it; do NOT re-call the tool to look for it \
-in another project.\n\
+in your context, treat it as a read-only discovery result. Claim the exact \
+Handoff before continuing it.\n\
 \n\
 This default assumes the MCP client can identify the current agent \
 session. Static MCP clients in parallel sessions for the same user \
@@ -173,10 +177,15 @@ the conversation calls for them:\n\
   to propose architecture (always check first). Defaults to the \
   current project; pass `scopes` to search named sibling projects, \
   or `global=true` to search EVERY project at once when you don't \
-  know where the knowledge lives. Default-scoped calls also return \
-  `global_scope_hits` — standing user/team preferences from the \
-  reserved `_global` scope; treat them as context that applies to \
-  every project.\n\
+  know where the knowledge lives. Always supply `context_budget`, \
+  measured in conservative UTF-8-byte units. The result is an ordered \
+  ContextPackage plus a content-free assembly trace; use ContextRefs \
+  to identify exact selected revisions. Default-scoped calls include \
+  matching standing user/team preferences from the reserved `_global` \
+  scope in the same assembled package.\n\
+- `memory_context_read` — when a selected ContextRef needs its exact \
+  full-evidence body. The reference resolves its encoded existing \
+  scope, kind, identity, and revision and fails closed on a mismatch.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is engram healthy' or \
@@ -190,26 +199,34 @@ the conversation calls for them:\n\
   line, 'stale' (>30d) → full catchup. Accepts an optional `focus` \
   arg. Use over memory_briefing when the user asks open-ended \
   questions like 'catch me up' or 'what's important right now'.\n\
-- `memory_handoff_accept` — when the user asks 'where did we leave \
-  off'. The SessionStart hook auto-fetches + consumes the handoff \
-  before you see your first prompt; if a block starting with \
-  '📥 engram: pending handoff' is anywhere in your context, \
-  THAT is the handoff — answer from it directly, don't re-call \
-  this tool (it'll return null because handoffs are single-use). Pass \
-  `workspace` + `project` together only when the user names a handoff \
-  in a sibling workspace/project.\n\
 - `memory_handoff_begin` — ONLY when the user is wrapping up / ending \
   the current session and you want to ensure the next agent has context \
-  (the SessionEnd hook also auto-captures this). DO NOT use this to \
+  (the SessionEnd hook also auto-captures this). Supply the source `run_id`; \
+  omit `work_item_id` and supply an objective to create a WorkItem, or pass \
+  the exact owned WorkItem id to continue it. DO NOT use this to \
   summarize work mid-session, check project status, or answer a request \
   for a briefing. Keep the summary terse (2-3 sentences); put detail \
   in open_questions + next_steps bullets. Pass `workspace` + `project` \
   together only when leaving a handoff for a named sibling \
   workspace/project.\n\
+- `memory_handoff_discover` — when the user asks where work left off and \
+  no SessionStart block is visible. This read is non-destructive: it never \
+  consumes or acknowledges a Handoff.\n\
+- `memory_handoff_claim` — before acting as receiver, claim the exact \
+  Handoff revision with the current Run and a fresh caller-supplied \
+  `attempt_id`. Identical retries replay the original result; a changed \
+  request must use a new Attempt.\n\
+- `memory_checkpoint_write` — append durable progress for the exact \
+  WorkItem. The first receiver checkpoint supplies its live Claim and \
+  acknowledges the Handoff transactionally. Record `active`, `blocked`, \
+  `completed`, or `abandoned` explicitly; acknowledgement is not completion.\n\
+- `memory_handoff_release` — return a live Claim to `open` when the \
+  receiver will not continue. Supply a fresh Attempt; expired leases become \
+  claimable without a manual release.\n\
 - `memory_handoff_cancel` — when you realize you mistakenly called \
   `memory_handoff_begin`, or the user explicitly asks to discard a \
-  pending handoff. Requires the exact `handoff_id` from the begin call \
-  and marks it expired so the next session will not consume it.\n\
+  pending handoff. Requires its exact `handoff_id`, current revision, and source Run; \
+  only the source owner can expire an open Handoff.\n\
 - `memory_consolidate` — when the user asks to compile session \
   observations into wiki pages. Also runs on PreCompact, and at \
   session end only when ENGRAM_CONSOLIDATE_ON_SESSION_END is set.\n\
@@ -268,17 +285,18 @@ search EVERY project in EVERY workspace at once when you don't know \
 where the knowledge lives — each hit then carries its workspace + \
 project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
-it' after one project misses. Note also that `memory_query` returns \
-SNIPPETS, not full page bodies — an empty or short snippet does NOT \
-mean the page is empty (a large page can match outside the snippet \
-window); to read the whole page use `memory_read_page` (by `path`, \
-or a `query` for the top hit's body; add `workspace` + `project` \
-together only for a named sibling workspace/project).\n\
+it' after one project misses. Query entries are budgeted brief, \
+overview, or full-evidence representations, not an unbounded flat \
+ranking. Use `memory_context_read` with an entry's ContextRef for its \
+exact full evidence, or `memory_read_page` for path/query-oriented wiki \
+navigation.\n\
 \n\
 **Use retrieved memory as operating guidance, not trivia.** When \
-`memory_query` or `memory_recent` returns `_rules/`, `gotchas/`, \
-`procedures/`, or `decisions/` pages relevant to the task, read the \
-full page with `memory_read_page` before acting. Treat `_rules/` as \
+`memory_query` selects `_rules/`, `gotchas/`, `procedures/`, or \
+`decisions/` entries relevant to the task, resolve the selected \
+ContextRef with `memory_context_read` before acting. For \
+`memory_recent` results or path/query-oriented wiki navigation, read \
+the full page with `memory_read_page`. Treat `_rules/` as \
 constraints, `gotchas/` as preflight warnings, `procedures/` as \
 checklists, and `decisions/` as settled architecture unless the user \
 explicitly asks to revisit them. Before non-trivial coding, debugging, \
@@ -361,6 +379,16 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Maximum UTF-8 bytes of selected context content. Candidate generation
+    /// may inspect more data, but the returned package never exceeds this
+    /// deterministic budget.
+    context_budget: usize,
+    /// Optional per-kind entry ceilings. Omitted values use Engram defaults.
+    #[serde(default)]
+    context_quotas: Option<ContextQuotaArgs>,
+    /// Exact ContextRefs already present in the caller's active context.
+    #[serde(default)]
+    already_used_context: Vec<engram_core::ContextRef>,
     /// Project to search. Omit to target the project you're currently
     /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.** Only needed when
     /// one shared server fields several projects at once.
@@ -378,13 +406,25 @@ struct QueryArgs {
     /// Search EVERY project in every workspace in one call (cross-project
     /// global search). Use when you don't know which project holds the
     /// knowledge — e.g. shared infra/ops notes. When true, omit
-    /// `project`/`workspace`/`scopes`; results are returned in
-    /// `global_hits` (`hits` stays empty), each annotated with its
-    /// workspace + project so you can tell where it came from. Uses the
+    /// `project`/`workspace`/`scopes`; candidates from every existing
+    /// scope enter the same assembled ContextPackage. Uses the
     /// same hybrid FTS + vector retrieval as scoped queries when an
     /// embedder is configured.
     #[serde(default)]
     global: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ContextQuotaArgs {
+    /// Maximum normal wiki pages (default 6).
+    #[serde(default)]
+    wiki_page: Option<usize>,
+    /// Maximum session-summary pages (default 3).
+    #[serde(default)]
+    session_page: Option<usize>,
+    /// Maximum raw observations (default 3).
+    #[serde(default)]
+    observation: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -419,22 +459,12 @@ struct QueryResponse<T: Serialize> {
     hits: Vec<T>,
 }
 
-#[derive(Debug, Serialize)]
-struct MemoryQueryResponse {
-    hits: Vec<engram_store::PageHit>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    raw_hits: Vec<engram_store::ObservationHit>,
-    /// Populated only by a `global=true` query: cross-project hits, each
-    /// carrying its workspace + project name.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    global_hits: Vec<engram_store::PageHitWithMeta>,
-    /// Standing user/team context from the reserved `_global` preferences
-    /// scope, unioned into default-scoped queries alongside the current
-    /// project's `hits` (issue #154). Empty when the scope doesn't exist or
-    /// the query was explicitly scoped (`workspace`/`project`/`scopes`/
-    /// `global=true`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    global_scope_hits: Vec<engram_store::PageHit>,
+#[derive(Debug)]
+struct PageCandidateHit {
+    id: PageId,
+    rank: f64,
+    snippet: String,
+    provenance: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,6 +570,17 @@ struct AutoImproveArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffBeginArgs {
+    /// Existing WorkItem to continue. Omit to create a new WorkItem.
+    #[serde(default)]
+    work_item_id: Option<String>,
+    /// Source Run/Session identity.
+    run_id: String,
+    /// Stable objective. Required when creating a WorkItem.
+    #[serde(default)]
+    objective: Option<String>,
+    /// WorkItem acceptance criteria, fixed when the WorkItem is created.
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
     /// Short prose summary of where the session left off.
     summary: String,
     /// Questions the next agent should resolve.
@@ -552,7 +593,7 @@ struct HandoffBeginArgs {
     #[serde(default)]
     files_touched: Vec<String>,
     /// Working directory at the time of handoff. Used to match the
-    /// next agent's `memory_handoff_accept` call.
+    /// next agent's discovery routing.
     #[serde(default)]
     cwd: Option<String>,
     /// Project to scope the handoff to. Omit to target the project you're
@@ -572,14 +613,18 @@ struct HandoffBeginArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct HandoffAcceptArgs {
+struct HandoffDiscoverArgs {
     /// Restrict the search to handoffs created for a specific cwd.
     /// **Omit unless the user explicitly asks about a handoff from a
     /// *different* directory** — by default this scopes to the current
     /// project (the SessionStart hook usually pre-fetches it into context).
     #[serde(default)]
     cwd: Option<String>,
-    /// Project to accept a handoff from. Omit to target the project you're
+    /// Include a live claimed handoff in the read-only response. The default
+    /// returns only handoffs that can currently be claimed.
+    #[serde(default)]
+    include_claimed: bool,
+    /// Project to discover a handoff from. Omit to target the project you're
     /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
@@ -592,16 +637,75 @@ struct HandoffAcceptArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct HandoffClaimArgs {
+    handoff_id: String,
+    expected_revision: u64,
+    run_id: String,
+    attempt_id: String,
+    #[serde(default)]
+    lease_seconds: Option<u64>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct HandoffReleaseArgs {
+    handoff_id: String,
+    claim_id: String,
+    expected_revision: u64,
+    run_id: String,
+    attempt_id: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffCancelArgs {
     /// Exact handoff id returned by `memory_handoff_begin`. Required so this
     /// tool only discards a handoff the agent can identify.
     handoff_id: String,
+    /// Current Handoff revision; stale cancellation fails closed.
+    expected_revision: u64,
+    /// Source Run/Session that published the Handoff.
+    run_id: String,
     /// Project to cancel within. Omit to target the current project. **Omit
     /// unless the user explicitly names a different project.**
     #[serde(default)]
     project: Option<String>,
     /// Workspace to cancel within, together with `project`. Omit for the
     /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AcceptanceCriterionArg {
+    criterion: String,
+    satisfied: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CheckpointWriteArgs {
+    work_item_id: String,
+    run_id: String,
+    attempt_id: String,
+    expected_work_item_revision: u64,
+    #[serde(default)]
+    handoff_id: Option<String>,
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default)]
+    expected_handoff_revision: Option<u64>,
+    summary: String,
+    work_item_state: String,
+    #[serde(default)]
+    acceptance_criteria: Vec<AcceptanceCriterionArg>,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -661,6 +765,12 @@ struct ReadPageArgs {
     /// a shared server).
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ReadContextArgs {
+    /// Stable ContextRef returned by `memory_query`.
+    context_ref: ContextRef,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -848,6 +958,43 @@ impl EngramServer {
         engram_core::ActorKey { user, session_id }
     }
 
+    fn authorize_parts(
+        parts: &axum::http::request::Parts,
+        capability: Capability,
+    ) -> Result<(), McpError> {
+        let level = parts
+            .extensions
+            .get::<AuthLevel>()
+            .copied()
+            .unwrap_or(AuthLevel::Anonymous);
+        level
+            .authorize(capability, false)
+            .map_err(|error| McpError::internal_error(error.message(), None))
+    }
+
+    /// Stable ownership key derived from authenticated identity, deliberately
+    /// separate from execution-agent and Run/Session identity.
+    fn continuity_actor(parts: &axum::http::request::Parts) -> String {
+        let actor = crate::actor::actor_from_parts(parts);
+        if let Some(user) = actor.user {
+            return format!("user:{user}");
+        }
+        if let Some(sub) = actor.sub {
+            return format!("sub:{sub}");
+        }
+        if let Some(client) = actor.client {
+            return format!("client:{client}");
+        }
+        "anonymous".to_string()
+    }
+
+    fn execution_agent(parts: &axum::http::request::Parts) -> AgentKind {
+        crate::actor::actor_from_parts(parts)
+            .agent
+            .as_deref()
+            .map_or(AgentKind::Other, AgentKind::from_wire)
+    }
+
     /// Resolve which `(workspace_id, project_id)` a read tool should
     /// query. Precedence (matches the documented resolution chain):
     ///   1. an explicit `project` name argument in the active workspace
@@ -1029,6 +1176,48 @@ impl EngramServer {
             .await
     }
 
+    async fn assemble_query_context(
+        &self,
+        page_hits: Vec<PageCandidateHit>,
+        observation_hits: Vec<engram_store::ObservationHit>,
+        budget: usize,
+        quotas: Option<ContextQuotaArgs>,
+        already_used: Vec<ContextRef>,
+    ) -> Result<engram_core::ContextAssemblyResult, McpError> {
+        let page_sources = self
+            .reader
+            .context_pages_by_ids(page_hits.iter().map(|hit| hit.id).collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let observation_sources = self
+            .reader
+            .context_observations_by_ids(observation_hits.iter().map(|hit| hit.id).collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let pages_by_id: HashMap<_, _> = page_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let observations_by_id: HashMap<_, _> = observation_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let candidates = build_context_candidates(
+            page_hits,
+            observation_hits,
+            &pages_by_id,
+            &observations_by_id,
+        )?;
+        Ok(ContextAssembler.assemble(
+            candidates,
+            ContextAssemblyRequest {
+                budget,
+                quotas: context_quotas(quotas),
+                already_used: already_used.into_iter().collect::<BTreeSet<_>>(),
+            },
+        ))
+    }
+
     /// Override the retention-sweep parameters (typically populated
     /// from the user's config.toml `[decay]` table).
     #[must_use]
@@ -1090,12 +1279,15 @@ impl EngramServer {
         designs, BEFORE answering 'why does X work this way', and \
         whenever the user references prior work you don't recognise. \
         FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
-        Returns up to `limit` pages with HTML-marked snippets and a rank \
-        score (lower rank = better match). Only latest page versions. \
-        If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches. Default-scoped calls also return \
-        `global_scope_hits`: standing user/team preferences from the \
-        reserved `_global` scope that apply across projects. Set \
+        Candidate generation is unchanged; the shared Context Assembler \
+        then returns broad brief coverage before overview/full-evidence \
+        upgrades within the required `context_budget` (UTF-8 bytes). The \
+        response contains stable ContextRefs, source revisions, tiers, \
+        provenance, truncation state, consumption, omissions, and a \
+        content-free assembly trace. Use `memory_context_read` for exact \
+        full evidence. If compiled wiki search misses, bounded raw \
+        observations become candidates. Default-scoped calls also assemble \
+        standing user/team preferences from the reserved `_global` scope. Set \
         `global=true` to search EVERY \
         project at once (cross-project) when you don't know which project \
         holds the knowledge — each hit then carries its workspace + \
@@ -1128,12 +1320,25 @@ impl EngramServer {
                 .search_global(&args.query, query_vec.as_deref(), limit)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            return ok_json(&MemoryQueryResponse {
-                hits: Vec::new(),
-                raw_hits: Vec::new(),
-                global_hits,
-                global_scope_hits: Vec::new(),
-            });
+            let page_hits = global_hits
+                .into_iter()
+                .map(|hit| PageCandidateHit {
+                    id: hit.id,
+                    rank: hit.rank,
+                    snippet: hit.snippet,
+                    provenance: hit.provenance,
+                })
+                .collect();
+            let assembled = self
+                .assemble_query_context(
+                    page_hits,
+                    Vec::new(),
+                    args.context_budget,
+                    args.context_quotas,
+                    args.already_used_context,
+                )
+                .await?;
+            return ok_json(&assembled);
         }
         if !args.scopes.is_empty()
             && (args
@@ -1256,13 +1461,34 @@ impl EngramServer {
         } else {
             Vec::new()
         };
-        let response = MemoryQueryResponse {
-            hits,
-            raw_hits,
-            global_hits: Vec::new(),
-            global_scope_hits,
-        };
-        ok_json(&response)
+        let mut page_hits: Vec<PageCandidateHit> = hits
+            .into_iter()
+            .map(|hit| PageCandidateHit {
+                id: hit.id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                provenance: hit.provenance,
+            })
+            .collect();
+        page_hits.extend(global_scope_hits.into_iter().map(|mut hit| {
+            hit.provenance.push("global_scope".to_string());
+            PageCandidateHit {
+                id: hit.id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                provenance: hit.provenance,
+            }
+        }));
+        let assembled = self
+            .assemble_query_context(
+                page_hits,
+                raw_hits,
+                args.context_budget,
+                args.context_quotas,
+                args.already_used_context,
+            )
+            .await?;
+        ok_json(&assembled)
     }
 
     /// Return the N most-recently-updated pages.
@@ -1819,6 +2045,32 @@ impl EngramServer {
         }))
     }
 
+    /// Resolve exact full evidence from a stable ContextRef.
+    #[tool(
+        description = "Resolve the exact full-evidence body for a stable ContextRef returned by `memory_query`. The reference carries its context kind, workspace/project scope, stable source identity, and exact revision without exposing an absolute storage path. Reads resolve only an existing encoded scope and fail closed if the source, revision, kind, or scope does not match. Returns the exact revision and full evidence; it never mutates wiki pages."
+    )]
+    async fn memory_context_read(
+        &self,
+        Parameters(args): Parameters<ReadContextArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalRead)?;
+        let reference = args.context_ref;
+        let scope = engram_store::lookup_existing_scope(
+            &self.reader,
+            reference.workspace(),
+            reference.project(),
+        )
+        .await
+        .map_err(Self::scope_error)?;
+        match reference.kind() {
+            ContextKind::WikiPage | ContextKind::SessionPage => {
+                self.resolve_page_context(reference, scope).await
+            }
+            ContextKind::Observation => self.resolve_observation_context(reference, scope).await,
+        }
+    }
+
     /// Fetch the full body of a single wiki page.
     #[tool(description = "Fetch the FULL body of a wiki page for the current \
         project by default. Pass `workspace` + `project` together only when \
@@ -1993,28 +2245,19 @@ impl EngramServer {
         }))
     }
 
-    /// Create a handoff snapshot for the next agent CLI.
-    #[tool(description = "Record a cross-agent handoff snapshot for the \
-        NEXT agent that opens this project (e.g. Codex picking up after \
-        Claude Code). Use this ONLY when ending/wrapping up the current \
-        session or when the user explicitly says to save context for the next \
-        session. DO NOT use this to check project status, get a briefing, or \
-        summarize work mid-session. The next session's SessionStart hook automatically \
-        consumes the handoff and prepends its content to the agent's \
-        context — no manual fetch needed. \
-        \
-        Write style: keep `summary` to 2-3 SHORT sentences (what just \
-        happened + what state the project's in). Put actionable detail \
-        in `open_questions` and `next_steps` as bullet-sized strings — \
-        the next agent reads those first; long prose summaries make the \
-        TUI rendering ugly. `files_touched` is a hint, not exhaustive. \
-        \
-        Use `cwd` to scope the handoff to a specific working directory.")]
+    /// Publish a revisioned handoff for a new or existing WorkItem.
+    #[tool(description = "Publish a handoff for recoverable cross-agent task \
+        continuity. Omit `work_item_id` to create a WorkItem, supplying its \
+        stable `objective` and acceptance criteria. Supply `work_item_id` to \
+        continue that exact non-terminal WorkItem; ownership by authenticated \
+        actor and source Run is enforced. Returns WorkItem/Handoff identities \
+        and revisions. Publishing does not claim or acknowledge the handoff.")]
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalWrite)?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         // Handoffs bypass `Wiki::write_page` (they live in their own
         // table), so scrub the agent-supplied free-text here. We don't
@@ -2022,18 +2265,29 @@ impl EngramServer {
         // path-pattern regexes already cover when applicable, but we
         // pass each entry through anyway as defence-in-depth.
         let s = &self.sanitizer;
-        // Mirror memory_write_page: a handoff is a write, so resolve through the
-        // create-if-missing write path and honour an explicit workspace. Using
-        // the project-only `effective_ids_with_actor` here dropped the
-        // workspace arg, so a cross-workspace handoff landed in whatever project
-        // the contaminable active-project slot pointed at (the scope-bleed bug).
-        let (ws, proj) = self
-            .write_target_ids_with_actor(
+        let work_item_id = args
+            .work_item_id
+            .as_deref()
+            .map(WorkItemId::from_str)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(format!("invalid work_item_id: {e}"), None))?;
+        let source_run_id = SessionId::from_str(&args.run_id)
+            .map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))?;
+        let (ws, proj) = if work_item_id.is_some() {
+            self.effective_ids_for_read_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
             )
-            .await?;
+            .await?
+        } else {
+            self.write_target_ids_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?
+        };
         let open_questions = cap_handoff_list(
             args.open_questions.iter().map(|q| s.scrub(q)),
             HANDOFF_ITEM_MAX_CHARS,
@@ -2055,13 +2309,31 @@ impl EngramServer {
             "handoff file",
             "handoff files_touched",
         );
+        let acceptance_criteria = cap_handoff_list(
+            args.acceptance_criteria
+                .iter()
+                .map(|criterion| s.scrub(criterion)),
+            HANDOFF_ITEM_MAX_CHARS,
+            HANDOFF_TEXT_LIST_MAX_CHARS,
+            "acceptance criterion",
+            "handoff acceptance criteria",
+        );
         let handoff = NewHandoff {
+            work_item_id,
             workspace_id: ws,
             project_id: proj,
             from_session_id: None,
-            from_agent: AgentKind::Other,
+            source_run_id,
+            from_agent: Self::execution_agent(&parts),
+            source_actor: Self::continuity_actor(&parts),
             to_agent: None,
             cwd: args.cwd.map(std::path::PathBuf::from),
+            objective: cap_text_with_marker(
+                &s.scrub(args.objective.as_deref().unwrap_or("")),
+                HANDOFF_SUMMARY_MAX_CHARS,
+                "work item objective",
+            ),
+            acceptance_criteria,
             summary: cap_text_with_marker(
                 &s.scrub(&args.summary),
                 HANDOFF_SUMMARY_MAX_CHARS,
@@ -2071,38 +2343,26 @@ impl EngramServer {
             next_steps,
             files_touched,
         };
-        let id = self
+        let published = self
             .writer
-            .insert_handoff(handoff)
+            .publish_handoff(handoff)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({ "handoff_id": id.to_string() }))
+        ok_json(&published)
     }
 
-    /// Fetch the latest open handoff for this project (optionally filtered
-    /// by cwd) and mark it accepted.
-    #[tool(description = "Fetch the latest OPEN cross-agent handoff and \
-        mark it accepted. \
-        \
-        IMPORTANT: handoffs are SINGLE-USE. The SessionStart hook \
-        automatically consumes the handoff at session-start and prepends \
-        the content to your context — when you see a block starting with \
-        '📥 engram: pending handoff from previous session' anywhere \
-        in your context, that IS the handoff. \
-        \
-        A subsequent call to this tool will return `{ \"handoff\": null }` \
-        because the hook already consumed it. Do NOT interpret null as \
-        'no handoff exists' — check your context for the prepended block \
-        first, and answer the user from there. Call this tool only when \
-        you BOTH don't see a prepended block AND the user explicitly asks \
-        for a handoff (e.g. a hook script ran with no stdout capture). \
-        \
-        Returns the same JSON shape memory_handoff_begin accepted.")]
-    async fn memory_handoff_accept(
+    /// Discover a handoff without changing continuity state.
+    #[tool(description = "Read the latest claimable handoff for this project \
+        without consuming, claiming, acknowledging, or otherwise mutating it. \
+        Expired leases become discoverable again. Set `include_claimed` only \
+        for inspection of a live claim. Returns exact WorkItem/Handoff ids and \
+        the current revision required by `memory_handoff_claim`.")]
+    async fn memory_handoff_discover(
         &self,
-        Parameters(args): Parameters<HandoffAcceptArgs>,
+        Parameters(args): Parameters<HandoffDiscoverArgs>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalRead)?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
@@ -2113,19 +2373,189 @@ impl EngramServer {
             .await?;
         let handoff = self
             .reader
-            .latest_open_handoff(ws, proj, args.cwd)
+            .latest_claimable_handoff(ws, proj, args.cwd, args.include_claimed)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match handoff {
-            None => ok_json(&serde_json::json!({ "handoff": null })),
-            Some(h) => {
-                self.writer
-                    .accept_handoff(h.id, AgentKind::Other, None)
+            Some(handoff) => {
+                let work_item = self
+                    .reader
+                    .work_item_by_id(handoff.work_item_id)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                ok_json(&serde_json::json!({ "handoff": h }))
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        McpError::internal_error("discovered handoff has no WorkItem", None)
+                    })?;
+                ok_json(&serde_json::json!({
+                    "handoff": handoff,
+                    "work_item": work_item,
+                }))
             }
+            None => ok_json(&serde_json::json!({
+                "handoff": null,
+                "work_item": null,
+            })),
         }
+    }
+
+    /// Claim a handoff using optimistic concurrency and a bounded lease.
+    #[tool(description = "Claim one exact Handoff with its current revision, \
+        authenticated actor, receiver Run, caller-supplied Attempt, and bounded \
+        lease. Concurrent or stale claims fail closed. Retrying an identical \
+        Attempt returns the original claim and lease without extending it.")]
+    async fn memory_handoff_claim(
+        &self,
+        Parameters(args): Parameters<HandoffClaimArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalWrite)?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (workspace_id, project_id) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        let claim = HandoffClaim {
+            handoff_id: HandoffId::from_str(&args.handoff_id)
+                .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?,
+            workspace_id,
+            project_id,
+            expected_revision: args.expected_revision,
+            run_id: SessionId::from_str(&args.run_id)
+                .map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))?,
+            attempt_id: AttemptId::from_str(&args.attempt_id)
+                .map_err(|e| McpError::invalid_params(format!("invalid attempt_id: {e}"), None))?,
+            actor_key: Self::continuity_actor(&parts),
+            lease_seconds: args.lease_seconds.unwrap_or(300).clamp(1, 3_600),
+        };
+        let claimed = self
+            .writer
+            .claim_handoff(claim)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&claimed)
+    }
+
+    /// Release a live claim back to the open state.
+    #[tool(description = "Release one exact live claim using Handoff/Claim ids, \
+        current revision, authenticated actor, receiver Run, and caller-supplied \
+        Attempt. Retrying an identical Attempt returns the original result \
+        without another revision or audit transition.")]
+    async fn memory_handoff_release(
+        &self,
+        Parameters(args): Parameters<HandoffReleaseArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalWrite)?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (workspace_id, project_id) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        let released = self
+            .writer
+            .release_handoff(HandoffRelease {
+                handoff_id: HandoffId::from_str(&args.handoff_id).map_err(|e| {
+                    McpError::invalid_params(format!("invalid handoff_id: {e}"), None)
+                })?,
+                claim_id: ClaimId::from_str(&args.claim_id).map_err(|e| {
+                    McpError::invalid_params(format!("invalid claim_id: {e}"), None)
+                })?,
+                workspace_id,
+                project_id,
+                expected_revision: args.expected_revision,
+                run_id: SessionId::from_str(&args.run_id)
+                    .map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))?,
+                attempt_id: AttemptId::from_str(&args.attempt_id).map_err(|e| {
+                    McpError::invalid_params(format!("invalid attempt_id: {e}"), None)
+                })?,
+                actor_key: Self::continuity_actor(&parts),
+            })
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&released)
+    }
+
+    /// Append progress and optionally acknowledge the receiving claim.
+    #[tool(description = "Append one checkpoint to an exact WorkItem using \
+        optimistic WorkItem revision and a caller-supplied Attempt. Supply the \
+        Handoff/Claim/revision triple on the first receiving checkpoint to \
+        acknowledge that Handoff transactionally. A checkpoint explicitly \
+        records WorkItem state and every acceptance criterion's satisfaction; \
+        acknowledgment is distinct from completion.")]
+    async fn memory_checkpoint_write(
+        &self,
+        Parameters(args): Parameters<CheckpointWriteArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalWrite)?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (workspace_id, project_id) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        let s = &self.sanitizer;
+        let acceptance_criteria = args
+            .acceptance_criteria
+            .into_iter()
+            .map(|criterion| AcceptanceCriterionStatus {
+                criterion: cap_text_with_marker(
+                    &s.scrub(&criterion.criterion),
+                    HANDOFF_ITEM_MAX_CHARS,
+                    "acceptance criterion",
+                ),
+                satisfied: criterion.satisfied,
+            })
+            .collect();
+        let checkpoint = CheckpointWrite {
+            work_item_id: WorkItemId::from_str(&args.work_item_id).map_err(|e| {
+                McpError::invalid_params(format!("invalid work_item_id: {e}"), None)
+            })?,
+            workspace_id,
+            project_id,
+            run_id: SessionId::from_str(&args.run_id)
+                .map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))?,
+            expected_work_item_revision: args.expected_work_item_revision,
+            handoff_id: args
+                .handoff_id
+                .as_deref()
+                .map(HandoffId::from_str)
+                .transpose()
+                .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?,
+            claim_id: args
+                .claim_id
+                .as_deref()
+                .map(ClaimId::from_str)
+                .transpose()
+                .map_err(|e| McpError::invalid_params(format!("invalid claim_id: {e}"), None))?,
+            expected_handoff_revision: args.expected_handoff_revision,
+            summary: cap_text_with_marker(
+                &s.scrub(&args.summary),
+                HANDOFF_SUMMARY_MAX_CHARS,
+                "checkpoint summary",
+            ),
+            work_item_state: WorkItemState::from_str(&args.work_item_state).map_err(|e| {
+                McpError::invalid_params(format!("invalid work_item_state: {e}"), None)
+            })?,
+            acceptance_criteria,
+            actor_key: Self::continuity_actor(&parts),
+            attempt_id: AttemptId::from_str(&args.attempt_id)
+                .map_err(|e| McpError::invalid_params(format!("invalid attempt_id: {e}"), None))?,
+        };
+        let result = self
+            .writer
+            .write_checkpoint(checkpoint)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&result)
     }
 
     /// Cancel a mistaken open handoff by exact id.
@@ -2134,7 +2564,7 @@ impl EngramServer {
         when you realize you called `memory_handoff_begin` by mistake or the \
         user explicitly asks to discard a pending handoff. This is a cleanup \
         tool, not a status/briefing tool. It marks the handoff expired so the \
-        next SessionStart hook will not consume it. Omit project/workspace \
+        next SessionStart hook will not discover it. Omit project/workspace \
         unless the user names a different project; when provided, workspace \
         and project must be supplied together.")]
     async fn memory_handoff_cancel(
@@ -2142,6 +2572,7 @@ impl EngramServer {
         Parameters(args): Parameters<HandoffCancelArgs>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalWrite)?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let handoff_id = HandoffId::from_str(&args.handoff_id)
             .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
@@ -2152,35 +2583,20 @@ impl EngramServer {
                 &aps_actor,
             )
             .await?;
-        let handoff = self
-            .reader
-            .handoff_by_id(handoff_id)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .ok_or_else(|| McpError::internal_error("handoff not found", None))?;
-        if handoff.workspace_id != ws || handoff.project_id != proj {
-            return Err(McpError::internal_error(
-                "handoff does not belong to the resolved project",
-                None,
-            ));
-        }
-        if handoff.state != HandoffState::Open {
-            return ok_json(&serde_json::json!({
-                "handoff_id": handoff_id.to_string(),
-                "cancelled": false,
-                "state": handoff.state.as_str(),
-            }));
-        }
         let cancelled = self
             .writer
-            .cancel_handoff(handoff_id)
+            .cancel_handoff(HandoffCancel {
+                handoff_id,
+                workspace_id: ws,
+                project_id: proj,
+                expected_revision: args.expected_revision,
+                run_id: SessionId::from_str(&args.run_id)
+                    .map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))?,
+                actor_key: Self::continuity_actor(&parts),
+            })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({
-            "handoff_id": handoff_id.to_string(),
-            "cancelled": cancelled,
-            "state": if cancelled { "expired" } else { "open" },
-        }))
+        ok_json(&cancelled)
     }
 
     /// Report aggregate counts (pages, sessions, observations).
@@ -2433,12 +2849,269 @@ impl EngramServer {
             }
         });
     }
+
+    async fn resolve_page_context(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<CallToolResult, McpError> {
+        let revision = reference.page_revision().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain a page revision", None)
+        })?;
+        let path = reference.page_path().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain a page path", None)
+        })?;
+        let source = self
+            .reader
+            .context_pages_by_ids(vec![revision])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .find(|source| {
+                source.workspace_id == scope.workspace_id
+                    && source.project_id == scope.project_id
+                    && source.path == *path
+            })
+            .ok_or_else(|| missing_context("page"))?;
+        let kind = if source.path.as_str().starts_with("sessions/") {
+            ContextKind::SessionPage
+        } else {
+            ContextKind::WikiPage
+        };
+        if kind != reference.kind() {
+            return Err(McpError::invalid_params(
+                "ContextRef kind does not match its page source",
+                None,
+            ));
+        }
+        context_evidence(reference, kind, source.id, &source.title, &source.body)
+    }
+
+    async fn resolve_observation_context(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = reference.observation_id().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain an observation id", None)
+        })?;
+        let source = self
+            .reader
+            .context_observations_by_ids(vec![identity])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .find(|source| {
+                source.workspace_id == scope.workspace_id && source.project_id == scope.project_id
+            })
+            .ok_or_else(|| missing_context("observation"))?;
+        context_evidence(
+            reference,
+            ContextKind::Observation,
+            source.id,
+            &source.title,
+            &source.body,
+        )
+    }
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
+}
+
+fn missing_context(kind: &str) -> McpError {
+    McpError::invalid_params(
+        format!("ContextRef {kind} source, revision, or scope does not exist"),
+        None,
+    )
+}
+
+fn context_evidence(
+    reference: ContextRef,
+    kind: ContextKind,
+    source_revision: impl ToString,
+    title: &str,
+    body: &str,
+) -> Result<CallToolResult, McpError> {
+    ok_json(&serde_json::json!({
+        "context_ref": reference,
+        "kind": kind,
+        "source_revision": source_revision.to_string(),
+        "full_evidence": format!("# {title}\n\n{body}"),
+    }))
+}
+
+fn clean_search_snippet(snippet: &str) -> String {
+    snippet
+        .replace("<mark>", "")
+        .replace("</mark>", "")
+        .trim()
+        .to_string()
+}
+
+fn truncate_utf8_bytes(value: &str, maximum: usize) -> &str {
+    let mut end = maximum.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn make_brief(title: &str, snippet: &str) -> String {
+    if snippet.is_empty() {
+        return title.to_string();
+    }
+    format!("{title} — {}", truncate_utf8_bytes(snippet, 160))
+}
+
+fn make_overview(title: &str, snippet: &str) -> String {
+    if snippet.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{snippet}")
+    }
+}
+
+struct ContextCandidateParts<'a> {
+    context_ref: ContextRef,
+    title: &'a str,
+    snippet: &'a str,
+    score: f64,
+    deduplication_key: String,
+    retrieval_sources: Vec<String>,
+    selection_reason: &'a str,
+    body: &'a str,
+}
+
+fn context_candidate(parts: ContextCandidateParts<'_>) -> ContextCandidate {
+    let clean_snippet = clean_search_snippet(parts.snippet);
+    ContextCandidate {
+        provenance: parts
+            .retrieval_sources
+            .into_iter()
+            .map(|source| ContextProvenance {
+                source,
+                context_ref: parts.context_ref.clone(),
+            })
+            .collect(),
+        context_ref: parts.context_ref,
+        title: parts.title.to_string(),
+        score: parts.score,
+        deduplication_key: parts.deduplication_key,
+        selection_reason: parts.selection_reason.to_string(),
+        representations: ContextRepresentations {
+            brief: make_brief(parts.title, &clean_snippet),
+            overview: make_overview(parts.title, &clean_snippet),
+            full_evidence: format!("# {}\n\n{}", parts.title, parts.body),
+        },
+    }
+}
+
+fn page_context_candidate(
+    hit: PageCandidateHit,
+    source: &engram_store::PageContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    let context_ref = ContextRef::page(
+        source.workspace_name.clone(),
+        source.project_name.clone(),
+        source.path.clone(),
+        source.id,
+    )?;
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: &hit.snippet,
+        score: hit.rank,
+        deduplication_key: format!("sha256:{}", source.body_sha256),
+        retrieval_sources: hit.provenance,
+        selection_reason: "existing_hybrid_retrieval_rank",
+        body: &source.body,
+    }))
+}
+
+fn observation_context_candidate(
+    hit: engram_store::ObservationHit,
+    source: &engram_store::ObservationContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    let context_ref = ContextRef::observation(
+        source.workspace_name.clone(),
+        source.project_name.clone(),
+        source.id,
+    )?;
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: &hit.snippet,
+        score: hit.rank,
+        deduplication_key: format!("sha256:{:x}", Sha256::digest(source.body.as_bytes())),
+        retrieval_sources: hit.provenance,
+        selection_reason: "raw_observation_fallback_rank",
+        body: &source.body,
+    }))
+}
+
+fn build_context_candidates(
+    page_hits: Vec<PageCandidateHit>,
+    observation_hits: Vec<engram_store::ObservationHit>,
+    pages_by_id: &HashMap<PageId, engram_store::PageContextSource>,
+    observations_by_id: &HashMap<
+        engram_core::ObservationId,
+        engram_store::ObservationContextSource,
+    >,
+) -> Result<Vec<ContextCandidate>, McpError> {
+    let mut candidates = Vec::with_capacity(page_hits.len() + observation_hits.len());
+    for hit in page_hits {
+        let source = pages_by_id.get(&hit.id).ok_or_else(|| {
+            McpError::internal_error(
+                format!("retrieval candidate page revision {} is missing", hit.id),
+                None,
+            )
+        })?;
+        candidates.push(
+            page_context_candidate(hit, source)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        );
+    }
+    for hit in observation_hits {
+        let source = observations_by_id.get(&hit.id).ok_or_else(|| {
+            McpError::internal_error(
+                format!(
+                    "retrieval candidate observation revision {} is missing",
+                    hit.id
+                ),
+                None,
+            )
+        })?;
+        candidates.push(
+            observation_context_candidate(hit, source)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        );
+    }
+    Ok(candidates)
+}
+
+fn context_quotas(quotas: Option<ContextQuotaArgs>) -> Vec<ContextQuota> {
+    let quotas = quotas.unwrap_or(ContextQuotaArgs {
+        wiki_page: None,
+        session_page: None,
+        observation: None,
+    });
+    vec![
+        ContextQuota {
+            kind: ContextKind::WikiPage,
+            maximum: quotas.wiki_page.unwrap_or(6),
+        },
+        ContextQuota {
+            kind: ContextKind::SessionPage,
+            maximum: quotas.session_page.unwrap_or(3),
+        },
+        ContextQuota {
+            kind: ContextKind::Observation,
+            maximum: quotas.observation.unwrap_or(3),
+        },
+    ]
 }
 
 fn checkpoint_or_mcp(wiki: &Wiki, message: impl AsRef<str>) -> Result<Option<String>, McpError> {
@@ -2666,12 +3339,16 @@ mod tests {
 
     const MCP_TOOL_NAMES: &[&str] = &[
         "memory_query",
+        "memory_context_read",
         "memory_recent",
         "memory_status",
         "memory_briefing",
         "memory_explore",
-        "memory_handoff_accept",
         "memory_handoff_begin",
+        "memory_handoff_discover",
+        "memory_handoff_claim",
+        "memory_handoff_release",
+        "memory_checkpoint_write",
         "memory_handoff_cancel",
         "memory_consolidate",
         "memory_auto_improve",
@@ -2685,12 +3362,16 @@ mod tests {
 
     const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
         "memory_query",
+        "memory_context_read",
         "memory_recent",
         "memory_status",
         "memory_briefing",
         "memory_explore",
-        "memory_handoff_accept",
         "memory_handoff_begin",
+        "memory_handoff_discover",
+        "memory_handoff_claim",
+        "memory_handoff_release",
+        "memory_checkpoint_write",
         "memory_handoff_cancel",
         "memory_consolidate",
         "memory_auto_improve",
@@ -2873,14 +3554,22 @@ mod tests {
                 prompt.contains("memory_handoff_cancel") && prompt.contains("handoff_id"),
                 "{label} must expose exact-id cleanup for mistaken handoffs"
             );
+            assert!(
+                prompt.contains("memory_handoff_discover")
+                    && prompt.contains("memory_handoff_claim")
+                    && prompt.contains("memory_checkpoint_write")
+                    && lower.contains("acknowledgement")
+                    && lower.contains("completion"),
+                "{label} must teach the recoverable claim/checkpoint lifecycle"
+            );
         });
     }
     #[test]
     fn prompts_teach_cross_project_search_strategy() {
         // Regression: a single-project miss must not read as "never recorded".
         // Both surfaces must point the agent at `scopes` **and** at
-        // `global=true` (the two broadening modes), warn that query returns
-        // snippets (not full page bodies), and NOT contain the contradictory
+        // `global=true` (the two broadening modes), teach the budgeted package
+        // and ContextRef full-evidence path, and NOT contain the contradictory
         // legacy "no global mode" phrasing that briefly shipped in #56.
         // (Learned the hard way when cluster-access info lived in a sibling
         // `infra` project.)
@@ -2898,8 +3587,16 @@ mod tests {
                 "{label} must mention knowledge can live in a sibling project"
             );
             assert!(
-                prompt.contains("snippet") || prompt.contains("SNIPPET"),
-                "{label} must warn that query returns snippets, not full bodies"
+                prompt.contains("context_budget"),
+                "{label} must require a query budget"
+            );
+            assert!(
+                prompt.contains("ContextRef"),
+                "{label} must teach stable context references"
+            );
+            assert!(
+                prompt.contains("memory_context_read"),
+                "{label} must teach full-evidence lookup"
             );
             // Guard against the contradiction: standalone prose must not say
             // a global mode doesn't exist when the bullet/table-row above it
@@ -2994,6 +3691,22 @@ mod tests {
                     && lower.contains("auth")
                     && lower.contains("migration"),
                 "{label} must make proactive retrieval the default for risky work"
+            );
+            assert!(
+                lower.contains("memory_context_read")
+                    && lower.contains("selected")
+                    && lower.contains("contextref"),
+                "{label} must resolve selected query entries by exact ContextRef"
+            );
+            assert!(
+                lower.contains("memory_recent")
+                    && lower.contains("memory_read_page")
+                    && lower.contains("path/query"),
+                "{label} must reserve memory_read_page for recent/path navigation"
+            );
+            assert!(
+                !prompt.contains("`memory_query` or `memory_recent` returns"),
+                "{label} must not collapse exact refs and path navigation into one read path"
             );
         });
     }
@@ -3154,7 +3867,9 @@ mod tests {
     fn prompts_teach_cross_workspace_handoff_scope() {
         assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
-                prompt.contains("memory_handoff_begin") && prompt.contains("memory_handoff_accept"),
+                prompt.contains("memory_handoff_begin")
+                    && prompt.contains("memory_handoff_discover")
+                    && prompt.contains("memory_handoff_claim"),
                 "{label} must include handoff lifecycle tools"
             );
             assert!(
@@ -3472,6 +4187,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "karpathy".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3485,7 +4203,156 @@ mod tests {
             Some(t) => t.text.clone(),
             None => panic!("expected text content"),
         };
-        assert!(text.contains("foo.md"), "expected hit; got {text}");
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            response.get("package").is_some(),
+            "memory_query must return an assembled context package: {text}"
+        );
+        assert!(
+            response.get("trace").is_some(),
+            "memory_query must return an assembly trace: {text}"
+        );
+        let entry = &response["package"]["entries"][0];
+        assert_eq!(entry["kind"], "wiki_page");
+        assert!(entry["detail_tier"].as_str().is_some());
+        assert!(entry["context_ref"].as_str().is_some());
+        assert!(entry["source_revision"].as_str().is_some());
+        assert!(entry["provenance"].as_array().is_some());
+        assert!(
+            response["package"]["estimated_consumption"].as_u64()
+                <= response["package"]["budget"].as_u64()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_small_budget_ref_resolves_exact_full_evidence_and_scope() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    context_budget: 12,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let response = call_tool_json(result);
+        assert!(
+            response["package"]["estimated_consumption"]
+                .as_u64()
+                .unwrap()
+                <= 12
+        );
+        assert_eq!(response["package"]["entries"][0]["truncation"], "truncated");
+        let reference: ContextRef =
+            serde_json::from_value(response["package"]["entries"][0]["context_ref"].clone())
+                .unwrap();
+        let source_revision = reference.source_revision();
+
+        let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+        let same_named_project = store
+            .writer
+            .get_or_create_project(other_workspace, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: other_workspace,
+                project_id: same_named_project,
+                path: reference.page_path().unwrap().clone(),
+                title: "Foreign".into(),
+                body: "must never replace exact referenced evidence".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        server
+            .active_project
+            .set(other_workspace, same_named_project);
+
+        for auth_level in [AuthLevel::Root, AuthLevel::User, AuthLevel::Anonymous] {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(auth_level);
+            let evidence = server
+                .memory_context_read(
+                    Parameters(ReadContextArgs {
+                        context_ref: reference.clone(),
+                    }),
+                    rmcp::handler::server::tool::Extension(parts),
+                )
+                .await
+                .unwrap();
+            let evidence = call_tool_json(evidence);
+            assert_eq!(evidence["source_revision"], source_revision);
+            assert!(
+                evidence["full_evidence"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Karpathy says compile")
+            );
+        }
+
+        let cross_workspace = ContextRef::page(
+            "other",
+            "scratch",
+            reference.page_path().unwrap().clone(),
+            reference.page_revision().unwrap(),
+        )
+        .unwrap();
+        let error = server
+            .memory_context_read(
+                Parameters(ReadContextArgs {
+                    context_ref: cross_workspace,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("same-named cross-workspace pages must not satisfy an exact revision");
+        assert!(error.to_string().contains("does not exist"), "{error}");
+
+        let wrong_scope = ContextRef::page(
+            reference.workspace(),
+            "missing-project",
+            reference.page_path().unwrap().clone(),
+            reference.page_revision().unwrap(),
+        )
+        .unwrap();
+        let error = server
+            .memory_context_read(
+                Parameters(ReadContextArgs {
+                    context_ref: wrong_scope,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("ContextRef reads must not create or fall back from a missing scope");
+        assert!(error.to_string().contains("not found"), "{error}");
+
+        for (workspace, project) in [("", "scratch"), ("default", "")] {
+            assert!(
+                ContextRef::page(
+                    workspace,
+                    project,
+                    reference.page_path().unwrap().clone(),
+                    reference.page_revision().unwrap(),
+                )
+                .is_err(),
+                "ContextRef makes partial scope structurally invalid"
+            );
+        }
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -3516,6 +4383,9 @@ mod tests {
         let query = |workspace: Option<&str>, project: Option<&str>| QueryArgs {
             query: "karpathy".into(),
             limit: Some(5),
+            context_budget: 4_096,
+            context_quotas: None,
+            already_used_context: Vec::new(),
             project: project.map(str::to_string),
             scopes: Vec::new(),
             workspace: workspace.map(str::to_string),
@@ -3530,15 +4400,24 @@ mod tests {
             .await
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        let entries = response["package"]["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Foo"))
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Style"))
+        }));
         assert!(
-            text.text.contains("foo.md"),
-            "current-project hit must remain: {}",
-            text.text
-        );
-        assert!(
-            text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
-            "default query must union the reserved global scope: {}",
-            text.text
+            entries.iter().any(
+                |entry| entry["provenance"].as_array().is_some_and(|sources| sources
+                    .iter()
+                    .any(|source| source["source"] == "global_scope"))
+            )
         );
 
         let result = server
@@ -3550,8 +4429,8 @@ mod tests {
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
         assert!(
-            !text.text.contains("preferences/style.md"),
-            "explicitly scoped queries must not union the global scope: {}",
+            !text.text.contains("Style"),
+            "explicit scope must skip global context: {}",
             text.text
         );
     }
@@ -3566,6 +4445,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "karpathy".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3576,11 +4458,9 @@ mod tests {
             .await
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
-        assert!(
-            !text.text.contains("global_scope_hits"),
-            "no reserved scope -> field elided: {}",
-            text.text
-        );
+        let response: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(response["trace"]["candidate_count"], 1);
+        assert!(!text.text.contains("global_scope"));
         assert_eq!(
             engram_store::lookup_global_scope(&store.reader)
                 .await
@@ -3651,7 +4531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_query_returns_raw_hits_when_pages_miss() {
+    async fn memory_query_packages_observation_fallback_when_pages_miss() {
         let (_tmp, store, server, ws, proj) = setup_server().await;
         let session_id = SessionId::new();
         store
@@ -3686,6 +4566,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "quokka".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3699,15 +4582,9 @@ mod tests {
             Some(t) => t.text.clone(),
             None => panic!("expected text content"),
         };
-        assert!(
-            text.contains("\"hits\": []"),
-            "expected no page hits; got {text}"
-        );
-        assert!(
-            text.contains("raw_hits"),
-            "expected raw fallback; got {text}"
-        );
-        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["package"]["entries"][0]["kind"], "observation");
+        assert!(text.contains("quokka"), "expected raw evidence; got {text}");
     }
 
     #[tokio::test]
@@ -3745,6 +4622,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "workspace_specific_token".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: Some("unit-testing".into()),
                     scopes: Vec::new(),
                     workspace: Some("practice".into()),
@@ -3760,7 +4640,10 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap();
-        assert!(text.contains("patterns.md"), "expected hit; got {text}");
+        assert!(
+            text.contains("Testing Patterns"),
+            "expected hit; got {text}"
+        );
     }
 
     #[tokio::test]
@@ -3949,6 +4832,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "multi_scope_token".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: vec![
                         MemoryScopeArg {
@@ -3973,12 +4859,18 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap();
-        assert!(text.contains("product.md"), "expected product hit: {text}");
         assert!(
-            text.contains("patterns.md"),
+            text.contains("Product Rules"),
+            "expected product hit: {text}"
+        );
+        assert!(
+            text.contains("Testing Patterns"),
             "expected practice hit: {text}"
         );
-        assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+        assert!(
+            !text.contains("must not be returned"),
+            "unexpected hidden hit: {text}"
+        );
     }
 
     #[tokio::test]
@@ -4027,6 +4919,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "global_token".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -4050,7 +4945,7 @@ mod tests {
             text.contains("infra"),
             "hit must carry project name: {text}"
         );
-        assert!(text.contains("global_hits"), "global hits field: {text}");
+        assert!(text.contains("package"), "assembled package field: {text}");
     }
 
     /// Regression for the `global=true` retrieval gap (#10): the global
@@ -4113,6 +5008,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "qzxvw frobnicate".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -4129,8 +5027,8 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(
-            text.contains("notes/cjk.md"),
-            "vector stream must surface the page in global_hits: {text}"
+            text.contains("CJK note") && text.contains("\"source\": \"vector\""),
+            "vector stream must surface the page in the package: {text}"
         );
     }
 
@@ -4142,6 +5040,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "x".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: Some("product".into()),
                     scopes: Vec::new(),
                     workspace: None,
@@ -5042,6 +5943,10 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    work_item_id: None,
+                    run_id: SessionId::new().to_string(),
+                    objective: Some("fix omp CHECK".into()),
+                    acceptance_criteria: vec![],
                     summary: "fix omp CHECK".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -5078,158 +5983,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handoff_begin_then_accept_round_trips() {
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        let begin = server
-            .memory_handoff_begin(
-                Parameters(HandoffBeginArgs {
-                    summary: "left mid-refactor of writer actor".into(),
-                    open_questions: vec!["what max channel size?".into()],
-                    next_steps: vec!["finish supersession path".into()],
-                    files_touched: vec!["crates/engram-store/src/writer.rs".into()],
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let begin_text = begin
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(begin_text.contains("handoff_id"));
-
-        // Accepting with matching cwd returns the handoff.
-        let accept = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let accept_text = accept
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(accept_text.contains("left mid-refactor"));
-        assert!(accept_text.contains("what max channel size?"));
-
-        // Second accept returns null (handoff is now accepted).
-        let again = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let again_text = again
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(again_text.contains("\"handoff\": null"));
-    }
-
-    #[tokio::test]
-    async fn handoff_begin_caps_manual_text_after_scrub() {
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        server
-            .memory_handoff_begin(
-                Parameters(HandoffBeginArgs {
-                    summary: "s".repeat(HANDOFF_SUMMARY_MAX_CHARS + 20),
-                    open_questions: vec!["q".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
-                    next_steps: vec!["n".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
-                    files_touched: vec!["f".repeat(HANDOFF_FILE_MAX_CHARS + 20)],
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-
-        let accept = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let text = accept
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(text.contains("handoff summary truncated"));
-        assert!(text.contains("handoff item truncated"));
-        assert!(text.contains("handoff file truncated"));
-    }
-
-    #[tokio::test]
-    async fn handoff_begin_caps_manual_lists_in_aggregate() {
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        let open_questions = (0..100)
-            .map(|idx| format!("question-{idx}: {}", "q".repeat(400)))
-            .collect();
-        server
-            .memory_handoff_begin(
-                Parameters(HandoffBeginArgs {
-                    summary: "contains sk-testsecret12345678901234567890 before cap".into(),
-                    open_questions,
-                    next_steps: vec![],
-                    files_touched: vec![],
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-
-        let accept = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let text = accept
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(text.contains("handoff open_questions truncated"));
-        assert!(!text.contains("sk-testsecret"));
-    }
-
     #[test]
     fn handoff_list_cap_keeps_marker_inside_total_budget() {
         let items = (0..10).map(|idx| format!("item-{idx}: {}", "x".repeat(80)));
@@ -5241,191 +5994,6 @@ mod tests {
             .saturating_add(capped.len().saturating_sub(1));
         assert!(rendered_len <= 220);
         assert!(capped.iter().any(|item| item.contains("list truncated")));
-    }
-
-    #[tokio::test]
-    async fn handoff_begin_accept_honour_explicit_workspace() {
-        // Regression for the scope-bleed facet: memory_handoff_begin/accept used
-        // to ignore `workspace` (project-only resolution), so a cross-workspace
-        // handoff landed in whatever project the contaminable active-project
-        // slot pointed at instead of the named (workspace, project). Begin into
-        // an explicit sibling workspace, then prove it's there — and NOT in the
-        // current (default) project.
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        server
-            .memory_handoff_begin(
-                Parameters(HandoffBeginArgs {
-                    summary: "cross-workspace handoff".into(),
-                    open_questions: vec![],
-                    next_steps: vec![],
-                    files_touched: vec![],
-                    cwd: None,
-                    project: Some("sibling-app".into()),
-                    workspace: Some("djalmajr".into()),
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-
-        // The current (default) project must NOT see it.
-        let in_default = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: None,
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let in_default_text = in_default
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(
-            in_default_text.contains("\"handoff\": null"),
-            "cross-workspace handoff must not bleed into the current project"
-        );
-
-        // The explicit (workspace, project) does see it.
-        let in_sibling = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: None,
-                    project: Some("sibling-app".into()),
-                    workspace: Some("djalmajr".into()),
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let in_sibling_text = in_sibling
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(
-            in_sibling_text.contains("cross-workspace handoff"),
-            "handoff must be retrievable from its explicit (workspace, project)"
-        );
-    }
-
-    #[tokio::test]
-    async fn handoff_cancel_expires_open_handoff_and_clears_briefing_count() {
-        let (_tmp, store, server, _ws, _pj) = setup_server().await;
-        let begin = server
-            .memory_handoff_begin(
-                Parameters(HandoffBeginArgs {
-                    summary: "accidental status summary".into(),
-                    open_questions: vec![],
-                    next_steps: vec![],
-                    files_touched: vec![],
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let begin_text = begin
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        let begin_json: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
-        let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
-
-        let before = server
-            .memory_briefing(
-                Parameters(BriefingArgs {
-                    recent_pages_limit: Some(5),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let before_text = before
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(before_text.contains("\"pending_handoff_count\": 1"));
-
-        let cancel = server
-            .memory_handoff_cancel(
-                Parameters(HandoffCancelArgs {
-                    handoff_id: handoff_id.clone(),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let cancel_text = cancel
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(cancel_text.contains("\"cancelled\": true"));
-        assert!(cancel_text.contains("\"state\": \"expired\""));
-
-        let after = server
-            .memory_briefing(
-                Parameters(BriefingArgs {
-                    recent_pages_limit: Some(5),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let after_text = after
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(after_text.contains("\"pending_handoff_count\": 0"));
-
-        let accept = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: Some("/tmp/aim".into()),
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let accept_text = accept
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(accept_text.contains("\"handoff\": null"));
-
-        let stored = store
-            .reader
-            .handoff_by_id(HandoffId::from_str(&handoff_id).unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.state, HandoffState::Expired);
     }
 
     // ----------------------------------------------------------------
@@ -5635,36 +6203,6 @@ mod tests {
         );
     }
 
-    /// `memory_handoff_accept` with no pending handoff returns a
-    /// happy-path `{"handoff": null}` payload (NOT an error). This
-    /// is the documented contract — the agent can call accept on
-    /// every session-start without worrying about empty-queue errors.
-    #[tokio::test]
-    async fn memory_handoff_accept_when_none_pending_returns_null() {
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        let result = server
-            .memory_handoff_accept(
-                Parameters(HandoffAcceptArgs {
-                    cwd: None,
-                    project: None,
-                    workspace: None,
-                }),
-                rmcp::handler::server::tool::Extension(test_parts_default()),
-            )
-            .await
-            .expect("empty-queue must be Ok, not Err");
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(
-            text.contains("\"handoff\": null"),
-            "expected handoff=null in: {text}",
-        );
-    }
-
     /// `memory_query` clamps `limit` into [1, 100]. Anyone sending
     /// limit=10000 (DoS attempt or accidental overflow) gets the
     /// max instead of an unbounded scan.
@@ -5679,6 +6217,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "Karpathy".into(),
                     limit: Some(99_999),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -5710,6 +6251,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "\"unbalanced".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,

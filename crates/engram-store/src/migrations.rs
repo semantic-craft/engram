@@ -242,6 +242,99 @@ mod tests {
         run(&mut conn).expect("store must stay openable after backfill");
     }
 
+    /// V102 must preserve every legacy Handoff while replacing the
+    /// accepted-on-read model with an explicit WorkItem/Handoff history.
+    #[test]
+    fn v102_migrates_legacy_handoffs_once_without_data_loss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("memory.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 101).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+
+        let workspace = [0x10_u8; 16];
+        let project = [0x20_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'legacy', 1)",
+            params![workspace],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, 'legacy-project', 1)",
+            params![project, workspace],
+        )
+        .unwrap();
+        for (byte, state, accepted_by, accepted_at) in [
+            (1_u8, "open", None, None),
+            (2_u8, "accepted", Some("codex"), Some(3_i64)),
+            (3_u8, "expired", None, None),
+        ] {
+            let id = [byte; 16];
+            conn.execute(
+                "INSERT INTO handoffs \
+                 (id, workspace_id, project_id, from_agent, summary, state, created_at, \
+                  accepted_by, accepted_at) \
+                 VALUES (?1, ?2, ?3, 'claude-code', ?4, ?5, 2, ?6, ?7)",
+                params![
+                    id,
+                    workspace,
+                    project,
+                    format!("legacy-{state}"),
+                    state,
+                    accepted_by,
+                    accepted_at,
+                ],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).expect("V102 migration must succeed");
+        type MigratedHandoffRow = (Vec<u8>, Vec<u8>, String, String, Option<String>);
+        let rows: Vec<MigratedHandoffRow> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT h.id, h.work_item_id, w.objective, h.state, h.acknowledged_by \
+                     FROM handoffs h JOIN work_items w ON w.id = h.work_item_id \
+                     ORDER BY h.id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|(handoff, work_item, ..)| handoff == work_item)
+        );
+        assert_eq!(rows[0].2, "legacy-open");
+        assert_eq!(rows[0].3, "open");
+        assert_eq!(rows[1].3, "acknowledged");
+        assert_eq!(rows[1].4.as_deref(), Some("codex"));
+        assert_eq!(rows[2].3, "expired");
+
+        run(&mut conn).expect("V102 migration must be idempotent on reopen");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 102",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+    }
+
     /// Tripwire for the incident class itself: every embedded migration
     /// numbered below the released high-water mark must be part of a shipped
     /// release. A new migration slotted into a historical gap (the V28

@@ -271,7 +271,11 @@ fn mcp_query_request(token: &str, session_id: &str) -> Request<Body> {
         "method": "tools/call",
         "params": {
             "name": "memory_query",
-            "arguments": { "query": "multistream", "limit": 20 }
+            "arguments": {
+                "query": "multistream",
+                "limit": 20,
+                "context_budget": 20_000
+            }
         }
     });
     Request::builder()
@@ -423,7 +427,11 @@ async fn anonymous_request_does_not_inherit_user_slot() {
                         "method": "tools/call",
                         "params": {
                             "name": "memory_query",
-                            "arguments": { "query": "multistream", "limit": 20 }
+                            "arguments": {
+                                "query": "multistream",
+                                "limit": 20,
+                                "context_budget": 20_000
+                            }
                         }
                     })
                     .to_string(),

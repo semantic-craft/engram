@@ -32,15 +32,19 @@ match the intent to the tool. They do not need to name the tool.
 
 | User says / situation | Tool |
 |---|---|
-| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (current project; `scopes` for named siblings; `global=true` to search every project) |
+| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (always pass `context_budget`; current project by default; `scopes` for named siblings; `global=true` to search every project) |
+| "read the exact evidence selected by memory_query" | `memory_context_read` (pass the selected `context_ref`; resolves that exact existing scope and revision) |
 | "what's been going on" / "show recent activity" (light) | `memory_recent` |
 | "is engram healthy?" / "how big is the wiki?" | `memory_status` |
 | "give me the stats" / structured snapshot for the agent to consume | `memory_briefing` (read-only; never creates handoffs) |
 | "catch me up" / "I've been away" / "what's important right now?" / open-ended exploration | `memory_explore` |
-| "where did we leave off?" — and you see a `📥 engram: pending handoff` block in your context | already done — answer from that block; do NOT re-call `memory_handoff_accept` |
-| "where did we leave off?" — and no such block is visible | `memory_handoff_accept` (rare; the SessionStart hook usually got there first; pass `workspace` + `project` together only for a named sibling workspace/project) |
-| "save context for the next session" / wrapping up / ending this session | `memory_handoff_begin` (session-end only; do **not** use for status/briefing; single-use handoff; terse summary; put detail in `open_questions` + `next_steps` bullets; pass `workspace` + `project` together only for a named sibling workspace/project) |
-| "discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` (requires exact `handoff_id` from `memory_handoff_begin`; marks it expired before the next session sees it) |
+| "where did we leave off?" — and you see a `📥 engram: pending handoff` block in your context | already discovered — answer from that block; before continuing, claim its exact revision with `memory_handoff_claim` |
+| "where did we leave off?" — and no such block is visible | `memory_handoff_discover` (read-only; pass `workspace` + `project` together only for a named sibling workspace/project) |
+| "save context for the next session" / wrapping up / ending this session | `memory_handoff_begin` (session-end only; create or continue a WorkItem; terse summary; put detail in `open_questions` + `next_steps`) |
+| start receiving work | `memory_handoff_claim` (exact Handoff revision, current Run, fresh Attempt; identical retries replay) |
+| save durable task progress / acknowledge receipt | `memory_checkpoint_write` (first receiver checkpoint acknowledges; record WorkItem state and criterion status explicitly) |
+| stop receiving claimed work | `memory_handoff_release` (returns an exact live Claim to open; expired leases are recoverable) |
+| "discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` (source-only exact-id/revision/Run cancellation; distinct from claimant release) |
 | "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `ENGRAM_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
 | "what did we learn from this session?" / "what memory should we add?" / explicit wrap-up learning review | `memory_auto_improve` (manual learning review for a completed session; omit `session_id` for latest completed session; the server also schedules background review for newly completed sessions in every project when configured) |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes; put the title as a `# H1` on the first line of `body` and omit the `title` arg — engram derives it from the H1) |
@@ -64,16 +68,16 @@ project** — shared `infra`, `ops`, or a related app. Don't conclude
 - **Know which projects to check?** Re-run with explicit `scopes`, e.g.
   `scopes: [{ "workspace": "default", "project": "infra" }]`.
 - **Don't know where it lives?** Pass `global=true` to search every
-  project in every workspace at once. Each hit is annotated with its
+  project in every workspace at once. Each selected entry is annotated with its
   workspace + project so you can tell where it came from. `global=true`
   cannot be combined with `scopes`/`project`/`workspace`.
 
-`memory_query` returns **snippets, not full page bodies** — an empty or
-short snippet does **not** mean the page is empty (a large page can
-match outside the snippet window). To read the whole page, use
-`memory_read_page` (by `path`, or pass a `query` to fetch the top hit's
-full body; add `workspace` + `project` together only when the user names
-a sibling workspace/project).
+`memory_query` requires `context_budget` in conservative UTF-8-byte units and
+returns an ordered ContextPackage plus a content-free assembly trace. Entries
+contain budgeted brief, overview, or full-evidence representations and stable
+ContextRefs. Use `memory_context_read` to resolve a selected ref's exact
+existing scope and revision, or `memory_read_page` for path/query-oriented wiki
+navigation.
 
 ### Use Retrieved Memory As Operating Guidance
 
@@ -81,7 +85,8 @@ When `memory_query` or `memory_recent` returns `_rules/`, `gotchas/`,
 `procedures/`, or `decisions/` pages that match the current task, treat
 them as actionable context, not trivia:
 
-- Read full pages with `memory_read_page` when the snippet looks relevant.
+- Resolve selected package entries exactly with `memory_context_read`; use
+  `memory_read_page` only for path/query-oriented wiki navigation.
 - Apply `_rules/` as constraints.
 - Check `gotchas/` as preflight warnings before editing the same subsystem.
 - Follow `procedures/` as checklists for releases, PR reviews, deploys,
@@ -167,7 +172,7 @@ Use the single-context domain-document layout. See `docs/agents/domain.md`.
 engram is a self-contained Rust binary providing long-term memory for AI
 coding agents over MCP and lifecycle hooks. Markdown-in-git is the wiki source
 of truth; SQLite is the derived index for search, sessions, observations,
-handoffs, users, audit, and embeddings. Capture is automatic through hooks;
+WorkItems, Handoffs, Claims, Checkpoints, Attempts, users, audit, and embeddings. Capture is automatic through hooks;
 durable retrieval follows the Karpathy-style LLM Wiki pattern.
 
 ## Stack And Layout

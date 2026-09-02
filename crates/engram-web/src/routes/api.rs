@@ -444,7 +444,7 @@ async fn overview_handler(
 
     let handoff = match state
         .reader
-        .latest_open_handoff_for_workspace(workspace_id)
+        .latest_claimable_handoff_for_workspace(workspace_id)
         .await
         .map_err(internal_error)?
     {
@@ -551,7 +551,7 @@ async fn project_overview_handler(
 
     let handoff = state
         .reader
-        .latest_open_handoff(workspace_id, project_id, None)
+        .latest_claimable_handoff(workspace_id, project_id, None, false)
         .await
         .map_err(internal_error)?
         .map(|h| ApiHandoff {

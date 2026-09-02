@@ -18,7 +18,8 @@ starting the next.
 | Env prefix | `AI_MEMORY_*` | `ENGRAM_*` |
 | Data dir (macOS) | `~/Library/Application Support/ai-memory` | `…/engram` |
 | launchd label | `com.semantic-craft.ai-memory` | `com.semantic-craft.engram` |
-| MCP tool names | `memory_query`, `memory_write_page`, … | **unchanged** |
+| MCP tool names | `memory_query`, `memory_write_page`, … | Existing names remain; `memory_context_read` is added |
+| Query response | Flat ranked hits | `memory_query` requires `context_budget` and returns a ContextPackage + trace |
 | Wiki markdown + SQLite | — | **unchanged, moved as-is** |
 | Port | `127.0.0.1:49374` | **unchanged** |
 

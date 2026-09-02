@@ -10,6 +10,41 @@ below start from the fork.
 
 ## Unreleased
 
+### Added
+
+- Recoverable task continuity now models stable WorkItems separately from
+  Runs/Sessions, revisioned Handoffs, lease-bound Claims, append-only
+  Checkpoints, caller-supplied retry Attempts, and BackgroundJob identities.
+  The MCP surface adds read-only `memory_handoff_discover`, compare-and-set
+  `memory_handoff_claim`, explicit `memory_handoff_release`, and
+  `memory_checkpoint_write`; identical lost-response retries replay the
+  original result while mismatched Attempt reuse fails closed.
+
+- `memory_context_read` resolves an exact ContextRef from `memory_query` to its
+  full evidence through existing-scope, fail-closed reads. ContextRefs support
+  the currently shipped wiki-page, session-page, and observation sources and
+  never contain absolute storage paths.
+
+### Changed
+
+- Handoff reads no longer consume or acknowledge work. The removed
+  `memory_handoff_accept` contract is replaced by explicit claim and first
+  receiver checkpoint acknowledgement; acknowledgement, Run end, Claim expiry,
+  and Handoff expiry remain distinct from WorkItem completion. Existing
+  open/accepted/expired Handoffs migrate without loss to
+  open/acknowledged/expired histories.
+
+- `memory_query` now requires a caller-supplied `context_budget` and returns a
+  deterministic `ContextPackage` plus assembly trace instead of flat page and
+  observation hit lists. Existing FTS, optional vector, and link-neighbour RRF
+  remain candidate generation; the shared assembler deduplicates equivalent
+  content, applies per-kind quotas, gives eligible candidates brief coverage
+  before overview/full-evidence upgrades, and reports UTF-8-byte consumption,
+  truncation, omissions, provenance, and stable revisioned ContextRefs without
+  requiring an LLM provider. The desktop semantic-search client now supplies
+  explicit budgets and maps navigable page entries from the package instead of
+  parsing the removed flat hit arrays.
+
 ## Desktop 0.2.0 - 2026-08-01
 
 ### Added

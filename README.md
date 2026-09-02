@@ -35,7 +35,7 @@ changelog up to the fork point is preserved verbatim in
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
-| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/engram.json`, Grok-specific hook bundle, native `--agent grok`). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
+| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/engram.json`, Grok-specific hook bundle, native `--agent grok`). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via read-only MCP `memory_handoff_discover`. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
@@ -47,7 +47,9 @@ gives them a shared, persistent wiki: every prompt, tool call, and
 decision is captured automatically; when a session ends, the relevant
 pages get rewritten as a coherent narrative; when the next agent
 starts (Claude Code, Codex, OpenCode, …) it sees a handoff with
-"where you left off" already prepended.
+  "where you left off" already prepended. That read is non-destructive: the
+  receiver explicitly claims the Handoff and acknowledges it with its first
+  durable WorkItem checkpoint.
 
 The wiki is plain markdown in a git repo - `grep`-able, openable in
 Obsidian, backed up with `rsync`. No vector database to babysit, no
@@ -59,9 +61,10 @@ priors are at the [bottom](#influences-and-prior-art).
 
 - **Zero-friction capture.** Lifecycle hooks fire-and-forget every
   prompt + tool call + session boundary. You never type `write_note`.
-- **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
-  in the same directory hours later - the next agent sees a
-  "where you left off" block before its first prompt.
+- **Recoverable cross-agent work.** A stable WorkItem survives Run and agent
+  boundaries. Revisioned Handoffs use optimistic claims with bounded leases;
+  lost receivers can be replaced, retries are Attempt-idempotent, and only an
+  explicit checkpoint completes or abandons the WorkItem.
 - **Per-project isolation by construction.** Each project lives at
   `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
   Workspace defaults to `"default"`. Project is derived from `$cwd`:
@@ -113,11 +116,13 @@ priors are at the [bottom](#influences-and-prior-art).
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
-  `memory_handoff_accept` when resuming from a handoff.
+  `memory_handoff_discover`, then claim the exact revision before resuming.
 - **"What did we decide about X six weeks ago?"** Type
-  `memory_query X` from the agent (or `engram search X` from a
-  terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
-  the hit is a coherent decision page, not a raw chat log.
+  `memory_query` with the question and a context budget from the agent (or
+  `engram search X` from a terminal). Existing FTS/vector/link retrieval feeds
+  a deterministic package of broad briefs and selectively deeper evidence;
+  its stable ContextRefs can be passed to `memory_context_read` for exact full
+  evidence even when no LLM provider is configured.
 - **"Remember this permanently."** When something is worth keeping
   beyond auto-captured session logs - a decision, a convention, a
   gotcha - tell the agent "save a permanent note that we standardised
@@ -128,14 +133,14 @@ priors are at the [bottom](#influences-and-prior-art).
   exempts it from the decay sweep; the H1 on the first line of
   `--body` becomes the page title (omit `--title` — it's still
   accepted, but LLM callers trip over JSON-escaping their way through
-  it, see issue #67). Unlike a handoff (single-use) or an
+  it, see issue #67). Unlike an operational WorkItem/Handoff or an
   auto-synthesised session page (rewritten on consolidation), a
   write-page note is yours: it shows up in `memory_query`, renders in
   `/web`, and stays until you change it. For standing preferences that
   apply to *every* project (tech choices, code style, durable personal
   rules), pass `scope: "global"` — the page lands in the reserved
-  `_global` scope and default `memory_query` calls union it into every
-  project's results as `global_scope_hits`.
+  `_global` scope and default `memory_query` calls assemble matching global
+  preferences into every project's budgeted package.
 - **"This new project has months of history before engram."**
   `cd /path/to/my-project && engram bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and

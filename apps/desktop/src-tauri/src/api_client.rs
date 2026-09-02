@@ -76,6 +76,63 @@ async fn err_body(resp: reqwest::Response) -> String {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct MemoryQueryEntry {
+    page_path: Option<String>,
+    title: String,
+    content: String,
+    score: f64,
+    workspace: String,
+    project: String,
+}
+
+fn parse_memory_query_hits(
+    response: &serde_json::Value,
+    include_scope: bool,
+) -> Result<Vec<Hit>, String> {
+    let entries = response
+        .pointer("/package/entries")
+        .ok_or("memory_query response has no package.entries")?
+        .clone();
+    let entries: Vec<MemoryQueryEntry> =
+        serde_json::from_value(entries).map_err(|error| error.to_string())?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.page_path?;
+            Some(Hit {
+                path,
+                title: entry.title,
+                snippet: Some(entry.content),
+                rank: Some(entry.score),
+                workspace: include_scope.then_some(entry.workspace),
+                project: include_scope.then_some(entry.project),
+            })
+        })
+        .collect())
+}
+
+fn scoped_search_args(query: &str, workspace: &str, project: &str) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "project": project,
+        "workspace": workspace,
+        "limit": 10,
+        "context_budget": 16_384,
+        "context_quotas": { "wiki_page": 10, "session_page": 10, "observation": 0 }
+    })
+}
+
+fn global_search_args(query: &str) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "global": true,
+        "limit": 15,
+        "context_budget": 24_576,
+        "context_quotas": { "wiki_page": 15, "session_page": 15, "observation": 0 }
+    })
+}
+
 pub struct ApiClient {
     http: reqwest::Client,
     base: String,
@@ -339,22 +396,21 @@ impl ApiClient {
     }
 
     pub async fn semantic_search(&self, query: &str) -> Result<Vec<Hit>, String> {
-        let args = serde_json::json!({
-            "query": query, "project": self.proj, "workspace": self.ws, "limit": 10});
-        self.memory_query(args, "hits").await
+        let args = scoped_search_args(query, &self.ws, &self.proj);
+        self.memory_query(args, false).await
     }
 
     /// Cross-project search: `memory_query global=true`; hits carry
     /// workspace + project so the UI can label and jump.
     pub async fn semantic_search_global(&self, query: &str) -> Result<Vec<Hit>, String> {
-        let args = serde_json::json!({ "query": query, "global": true, "limit": 15 });
-        self.memory_query(args, "global_hits").await
+        let args = global_search_args(query);
+        self.memory_query(args, true).await
     }
 
     async fn memory_query(
         &self,
         arguments: serde_json::Value,
-        hits_key: &str,
+        include_scope: bool,
     ) -> Result<Vec<Hit>, String> {
         let init = serde_json::json!({
             "jsonrpc":"2.0","id":0,"method":"initialize",
@@ -378,7 +434,7 @@ impl ApiClient {
             .as_str()
             .ok_or("no content in memory_query response")?;
         let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        serde_json::from_value(parsed[hits_key].clone()).map_err(|e| e.to_string())
+        parse_memory_query_hits(&parsed, include_scope)
     }
 
     /// Workspace project inventory: stats rows for the project switcher /
@@ -563,6 +619,38 @@ mod tests {
         );
         assert_eq!(encode_path("a#b/c?.md"), "a%23b/c%3F.md");
         assert_eq!(encode_path("decisions/foo.md"), "decisions/foo.md");
+    }
+
+    #[test]
+    fn memory_query_package_maps_to_navigable_desktop_hits() {
+        let response = serde_json::json!({
+            "package": { "entries": [{
+                "page_path": "notes/context.md",
+                "title": "Context",
+                "content": "selected overview",
+                "score": -0.5,
+                "workspace": "default",
+                "project": "engram"
+            }, {
+                "page_path": null,
+                "title": "Raw observation",
+                "content": "not navigable",
+                "score": 1.0,
+                "workspace": "default",
+                "project": "engram"
+            }]}
+        });
+        let hits = parse_memory_query_hits(&response, true).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "notes/context.md");
+        assert_eq!(hits[0].snippet.as_deref(), Some("selected overview"));
+        assert_eq!(hits[0].project.as_deref(), Some("engram"));
+        let scoped = scoped_search_args("needle", "default", "engram");
+        let global = global_search_args("needle");
+        assert_eq!(scoped["context_budget"], 16_384);
+        assert_eq!(scoped["context_quotas"]["observation"], 0);
+        assert_eq!(global["context_budget"], 24_576);
+        assert_eq!(global["global"], true);
     }
 
     #[tokio::test]

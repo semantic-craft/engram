@@ -48,10 +48,11 @@ pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
     DerivedIndexStatus, EmbeddingTripleCount, HandoffSummary, HealthDetail, HealthPage,
-    ObservationHit, OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta,
-    PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow,
-    SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding, StoredPageBody,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ObservationContextSource, ObservationHit, OpenSession, PageAuthor, PageContextSource, PageHit,
+    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
+    ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition, SessionSummary,
+    StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,

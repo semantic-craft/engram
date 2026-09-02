@@ -7,8 +7,11 @@
 use std::collections::BTreeSet;
 
 use engram_core::{
-    AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
-    ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AttemptId, CheckpointId, CheckpointWrite, CheckpointWriteResult, ClaimId, Handoff,
+    HandoffCancel, HandoffClaim, HandoffClaimResult, HandoffId, HandoffRelease,
+    HandoffReleaseResult, HandoffState, LinkTarget, NewHandoff, NewObservation, NewPage,
+    NewSession, ObservationId, ObservationKind, PageId, PagePath, ProjectId, PublishedHandoff,
+    SessionId, WorkItemId, WorkItemState, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -50,6 +53,29 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
+
+type WorkItemOwnershipRow = (Vec<u8>, Vec<u8>, String, i64, String, Option<Vec<u8>>);
+type WorkItemCheckpointRow = (
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i64,
+    String,
+    Option<Vec<u8>>,
+    String,
+);
+type ContinuityAttemptRow = (
+    String,
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<i64>,
+    Vec<u8>,
+    String,
+);
 
 /// One embedding upsert requested by a backfill or embed command.
 #[derive(Debug)]
@@ -985,10 +1011,95 @@ pub fn hard_delete_decayed_pages(
     Ok(n)
 }
 
-/// Insert a new handoff in state=open.
-pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
-    let id = HandoffId::new();
+/// Create or continue a WorkItem and publish one open Handoff transactionally.
+pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<PublishedHandoff> {
     let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let (work_item_id, work_item_revision) = if let Some(id) = h.work_item_id {
+        let current: Option<WorkItemOwnershipRow> = tx
+            .query_row(
+                "SELECT workspace_id, project_id, state, revision, owner_actor, owner_run_id \
+                 FROM work_items WHERE id = ?1",
+                params![id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((ws, project, state, revision, owner_actor, owner_run)) = current else {
+            return Err(StoreError::NotFound(format!("work item {id}")));
+        };
+        if ws.as_slice() != h.workspace_id.as_bytes()
+            || project.as_slice() != h.project_id.as_bytes()
+        {
+            return Err(StoreError::InvalidState(
+                "work item does not belong to the resolved scope".into(),
+            ));
+        }
+        if matches!(state.as_str(), "completed" | "abandoned") {
+            return Err(StoreError::InvalidState(format!(
+                "cannot publish from terminal work item state {state}"
+            )));
+        }
+        let owner_run_matches = owner_run
+            .as_deref()
+            .is_some_and(|bytes| bytes == h.source_run_id.as_bytes());
+        if owner_actor != h.source_actor || !owner_run_matches {
+            return Err(StoreError::InvalidState(
+                "only the current WorkItem owner Run may publish a continuation".into(),
+            ));
+        }
+        let next = revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidState("work item revision overflow".into()))?;
+        let changed = tx.execute(
+            "UPDATE work_items SET revision = ?1, updated_at = ?2 WHERE id = ?3 AND revision = ?4",
+            params![next, now, id.as_bytes(), revision],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "work item publish compare-and-set conflict".into(),
+            ));
+        }
+        (
+            id,
+            u64::try_from(next)
+                .map_err(|_| StoreError::MalformedRecord("negative work item revision".into()))?,
+        )
+    } else {
+        if h.objective.trim().is_empty() {
+            return Err(StoreError::InvalidState(
+                "new WorkItem objective must not be empty".into(),
+            ));
+        }
+        let id = WorkItemId::new();
+        tx.execute(
+            "INSERT INTO work_items \
+             (id, workspace_id, project_id, objective, acceptance_criteria, state, revision, \
+              owner_actor, owner_run_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, ?6, ?7, ?8, ?8)",
+            params![
+                id.as_bytes(),
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes(),
+                h.objective,
+                serde_json::to_string(&h.acceptance_criteria)?,
+                h.source_actor,
+                h.source_run_id.as_bytes(),
+                now,
+            ],
+        )?;
+        (id, 1)
+    };
+
+    let id = HandoffId::new();
     let open_q = serde_json::to_string(&h.open_questions)?;
     let next_s = serde_json::to_string(&h.next_steps)?;
     let files = serde_json::to_string(&h.files_touched)?;
@@ -1008,18 +1119,22 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
         }
     });
     let from_agent = h.from_agent.as_str();
-    let to_agent = h.to_agent.map(AgentKind::as_str);
-    conn.execute(
+    let to_agent = h.to_agent.map(engram_core::AgentKind::as_str);
+    tx.execute(
         "INSERT INTO handoffs \
-         (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
-          open_questions, next_steps, files_touched, state, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)",
+         (id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, from_agent, \
+          source_actor, to_agent, cwd, summary, open_questions, next_steps, files_touched, state, \
+          revision, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'open', 1, ?15)",
         params![
             id.as_bytes(),
+            work_item_id.as_bytes(),
             h.workspace_id.as_bytes(),
             h.project_id.as_bytes(),
             from_session,
+            h.source_run_id.as_bytes(),
             from_agent,
+            h.source_actor,
             to_agent,
             cwd,
             h.summary,
@@ -1029,35 +1144,1110 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
             now,
         ],
     )?;
-    Ok(id)
+    audit_continuity(
+        &tx,
+        "handoff_publish",
+        h.workspace_id,
+        h.project_id,
+        work_item_id,
+        h.source_run_id,
+        Some(id),
+        Some(1),
+        None,
+        &h.source_actor,
+        "published",
+        now,
+    )?;
+    tx.commit()?;
+    Ok(PublishedHandoff {
+        work_item_id,
+        handoff_id: id,
+        work_item_revision,
+        handoff_revision: 1,
+    })
 }
 
-/// Mark a handoff accepted by `accepting_agent` / `accepting_session`.
-pub fn accept_handoff(
+/// Atomically claim an exact eligible Handoff revision.
+pub fn claim_handoff(
     conn: &mut Connection,
-    handoff_id: &HandoffId,
-    accepting_agent: AgentKind,
-    accepting_session: Option<&SessionId>,
-) -> StoreResult<()> {
+    input: &HandoffClaim,
+) -> StoreResult<HandoffClaimResult> {
+    if !(1..=3_600).contains(&input.lease_seconds) {
+        return Err(StoreError::InvalidState(
+            "lease_seconds must be between 1 and 3600".into(),
+        ));
+    }
     let now = Timestamp::now().as_microsecond();
-    let agent = accepting_agent.as_str();
-    let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
-    conn.execute(
-        "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
-         accepted_by_session = ?3 \
-         WHERE id = ?4 AND state = 'open'",
-        params![agent, now, session, handoff_id.as_bytes()],
+    let tx = conn.transaction()?;
+    let mut handoff = load_handoff(&tx, input.handoff_id)?
+        .ok_or_else(|| StoreError::NotFound(format!("handoff {}", input.handoff_id)))?;
+    let digest = canonical_digest(&serde_json::json!({
+        "handoff_id": input.handoff_id,
+        "expected_revision": input.expected_revision,
+        "run_id": input.run_id,
+        "lease_seconds": input.lease_seconds,
+    }))?;
+    if let Some(replayed) = replay_attempt::<HandoffClaimResult>(
+        &tx,
+        input.attempt_id,
+        "claim",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        handoff.work_item_id,
+        Some(input.handoff_id),
+        None,
+        Some(input.expected_revision),
+        &digest,
+    )? {
+        tx.commit()?;
+        return replayed;
+    }
+    let validation =
+        if handoff.workspace_id != input.workspace_id || handoff.project_id != input.project_id {
+            Some("handoff does not belong to the resolved scope".to_string())
+        } else if handoff.revision != input.expected_revision {
+            Some(format!(
+                "stale handoff revision: expected {}, current {}",
+                input.expected_revision, handoff.revision
+            ))
+        } else if handoff.state == HandoffState::Claimed {
+            let live: Option<(i64, String, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT lease_expires_at, actor_key, run_id FROM handoff_claims \
+             WHERE handoff_id = ?1 AND state = 'live'",
+                    params![input.handoff_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            match live {
+                Some((expires, _, _)) if expires <= now => {
+                    tx.execute(
+                        "UPDATE handoff_claims SET state = 'expired', resolved_at = ?1 \
+                     WHERE handoff_id = ?2 AND state = 'live'",
+                        params![now, input.handoff_id.as_bytes()],
+                    )?;
+                    audit_continuity(
+                        &tx,
+                        "handoff_claim_expire",
+                        input.workspace_id,
+                        input.project_id,
+                        handoff.work_item_id,
+                        input.run_id,
+                        Some(input.handoff_id),
+                        Some(handoff.revision),
+                        Some(input.attempt_id),
+                        &input.actor_key,
+                        "expired",
+                        now,
+                    )?;
+                    handoff.state = HandoffState::Open;
+                    None
+                }
+                Some(_) => Some("handoff already has a live claim".to_string()),
+                None => Some("claimed handoff has no live claim record".to_string()),
+            }
+        } else if handoff.state != HandoffState::Open {
+            Some(format!(
+                "handoff is not claimable in state {}",
+                handoff.state.as_str()
+            ))
+        } else {
+            None
+        };
+    if let Some(message) = validation {
+        record_attempt_error(
+            &tx,
+            input.attempt_id,
+            "claim",
+            &input.actor_key,
+            input.workspace_id,
+            input.project_id,
+            handoff.work_item_id,
+            Some(input.handoff_id),
+            None,
+            Some(input.expected_revision),
+            &digest,
+            &message,
+            now,
+        )?;
+        audit_continuity(
+            &tx,
+            "handoff_claim",
+            input.workspace_id,
+            input.project_id,
+            handoff.work_item_id,
+            input.run_id,
+            Some(input.handoff_id),
+            Some(handoff.revision),
+            Some(input.attempt_id),
+            &input.actor_key,
+            "conflict",
+            now,
+        )?;
+        tx.commit()?;
+        return Err(StoreError::InvalidState(message));
+    }
+
+    let claim_id = ClaimId::new();
+    let lease_micros = i64::try_from(input.lease_seconds)
+        .map_err(|_| StoreError::InvalidState("lease_seconds is too large".into()))?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| StoreError::InvalidState("lease_seconds is too large".into()))?;
+    let lease_expires_at = now
+        .checked_add(lease_micros)
+        .ok_or_else(|| StoreError::InvalidState("lease expiry overflow".into()))?;
+    let next_revision = input
+        .expected_revision
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+    tx.execute(
+        "INSERT INTO handoff_claims \
+         (id, handoff_id, work_item_id, workspace_id, project_id, handoff_revision, actor_key, \
+          run_id, state, claimed_at, lease_expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'live', ?9, ?10)",
+        params![
+            claim_id.as_bytes(),
+            input.handoff_id.as_bytes(),
+            handoff.work_item_id.as_bytes(),
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            next_revision,
+            input.actor_key,
+            input.run_id.as_bytes(),
+            now,
+            lease_expires_at
+        ],
+    )?;
+    let changed = tx.execute(
+        "UPDATE handoffs SET state = 'claimed', revision = ?1 \
+         WHERE id = ?2 AND revision = ?3 AND state IN ('open','claimed')",
+        params![
+            next_revision,
+            input.handoff_id.as_bytes(),
+            input.expected_revision
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(
+            "handoff claim compare-and-set conflict".into(),
+        ));
+    }
+    handoff.state = HandoffState::Claimed;
+    handoff.revision = next_revision;
+    let result = HandoffClaimResult {
+        work_item_id: handoff.work_item_id,
+        handoff_id: handoff.id,
+        claim_id,
+        lease_expires_at: Timestamp::from_microsecond(lease_expires_at)
+            .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
+        revision: next_revision,
+        handoff,
+    };
+    record_attempt_success(
+        &tx,
+        input.attempt_id,
+        "claim",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        result.work_item_id,
+        Some(input.handoff_id),
+        None,
+        Some(input.expected_revision),
+        &digest,
+        &result,
+        now,
+    )?;
+    audit_continuity(
+        &tx,
+        "handoff_claim",
+        input.workspace_id,
+        input.project_id,
+        result.work_item_id,
+        input.run_id,
+        Some(input.handoff_id),
+        Some(next_revision),
+        Some(input.attempt_id),
+        &input.actor_key,
+        "claimed",
+        now,
+    )?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Release an exact live claim back to open state.
+pub fn release_handoff(
+    conn: &mut Connection,
+    input: &HandoffRelease,
+) -> StoreResult<HandoffReleaseResult> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let handoff = load_handoff(&tx, input.handoff_id)?
+        .ok_or_else(|| StoreError::NotFound(format!("handoff {}", input.handoff_id)))?;
+    let digest = canonical_digest(&serde_json::json!({
+        "handoff_id": input.handoff_id,
+        "claim_id": input.claim_id,
+        "expected_revision": input.expected_revision,
+        "run_id": input.run_id,
+    }))?;
+    if let Some(replayed) = replay_attempt::<HandoffReleaseResult>(
+        &tx,
+        input.attempt_id,
+        "release",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        handoff.work_item_id,
+        Some(input.handoff_id),
+        None,
+        Some(input.expected_revision),
+        &digest,
+    )? {
+        tx.commit()?;
+        return replayed;
+    }
+    let claim: Option<(String, Vec<u8>, i64, String)> = tx.query_row(
+        "SELECT actor_key, run_id, lease_expires_at, state FROM handoff_claims WHERE id = ?1 AND handoff_id = ?2",
+        params![input.claim_id.as_bytes(), input.handoff_id.as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?;
+    let validation =
+        if handoff.workspace_id != input.workspace_id || handoff.project_id != input.project_id {
+            Some("handoff does not belong to the resolved scope".to_string())
+        } else if handoff.revision != input.expected_revision {
+            Some(format!(
+                "stale handoff revision: expected {}, current {}",
+                input.expected_revision, handoff.revision
+            ))
+        } else {
+            match claim {
+                None => Some("claim not found for handoff".to_string()),
+                Some((actor, run, _expires, _state))
+                    if actor != input.actor_key || run.as_slice() != input.run_id.as_bytes() =>
+                {
+                    Some("claim belongs to a different actor or Run".to_string())
+                }
+                Some((_, _, expires, _)) if expires <= now => {
+                    Some("claim lease has expired".to_string())
+                }
+                Some((_, _, _, state)) if state != "live" => {
+                    Some(format!("claim is not live: {state}"))
+                }
+                Some(_) if handoff.state != HandoffState::Claimed => {
+                    Some("handoff is not claimed".to_string())
+                }
+                Some(_) => None,
+            }
+        };
+    if let Some(message) = validation {
+        record_attempt_error(
+            &tx,
+            input.attempt_id,
+            "release",
+            &input.actor_key,
+            input.workspace_id,
+            input.project_id,
+            handoff.work_item_id,
+            Some(input.handoff_id),
+            None,
+            Some(input.expected_revision),
+            &digest,
+            &message,
+            now,
+        )?;
+        audit_continuity(
+            &tx,
+            "handoff_release",
+            input.workspace_id,
+            input.project_id,
+            handoff.work_item_id,
+            input.run_id,
+            Some(input.handoff_id),
+            Some(handoff.revision),
+            Some(input.attempt_id),
+            &input.actor_key,
+            "conflict",
+            now,
+        )?;
+        tx.commit()?;
+        return Err(StoreError::InvalidState(message));
+    }
+    let next_revision = input
+        .expected_revision
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+    let claim_changed = tx.execute("UPDATE handoff_claims SET state = 'released', resolved_at = ?1 WHERE id = ?2 AND state = 'live'",
+        params![now, input.claim_id.as_bytes()])?;
+    let handoff_changed = tx.execute("UPDATE handoffs SET state = 'open', revision = ?1 WHERE id = ?2 AND revision = ?3 AND state = 'claimed'",
+        params![next_revision, input.handoff_id.as_bytes(), input.expected_revision])?;
+    if claim_changed != 1 || handoff_changed != 1 {
+        return Err(StoreError::InvalidState(
+            "handoff release compare-and-set conflict".into(),
+        ));
+    }
+    let result = HandoffReleaseResult {
+        work_item_id: handoff.work_item_id,
+        handoff_id: handoff.id,
+        revision: next_revision,
+        state: HandoffState::Open,
+    };
+    record_attempt_success(
+        &tx,
+        input.attempt_id,
+        "release",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        handoff.work_item_id,
+        Some(input.handoff_id),
+        None,
+        Some(input.expected_revision),
+        &digest,
+        &result,
+        now,
+    )?;
+    audit_continuity(
+        &tx,
+        "handoff_release",
+        input.workspace_id,
+        input.project_id,
+        handoff.work_item_id,
+        input.run_id,
+        Some(input.handoff_id),
+        Some(next_revision),
+        Some(input.attempt_id),
+        &input.actor_key,
+        "released",
+        now,
+    )?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Source-only cancellation of an exact open Handoff.
+pub fn cancel_handoff(
+    conn: &mut Connection,
+    input: &HandoffCancel,
+) -> StoreResult<HandoffReleaseResult> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let handoff = load_handoff(&tx, input.handoff_id)?
+        .ok_or_else(|| StoreError::NotFound(format!("handoff {}", input.handoff_id)))?;
+    if handoff.workspace_id != input.workspace_id || handoff.project_id != input.project_id {
+        return Err(StoreError::InvalidState(
+            "handoff does not belong to the resolved scope".into(),
+        ));
+    }
+    if handoff.source_actor != input.actor_key || handoff.source_run_id != input.run_id {
+        return Err(StoreError::InvalidState(
+            "only the source actor and Run may cancel this handoff".into(),
+        ));
+    }
+    if handoff.revision != input.expected_revision || handoff.state != HandoffState::Open {
+        return Err(StoreError::InvalidState(format!(
+            "handoff cannot be cancelled from state {} at revision {}",
+            handoff.state.as_str(),
+            handoff.revision
+        )));
+    }
+    let next_revision = handoff
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+    let changed = tx.execute("UPDATE handoffs SET state = 'expired', revision = ?1 WHERE id = ?2 AND revision = ?3 AND state = 'open'",
+        params![next_revision, input.handoff_id.as_bytes(), input.expected_revision])?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(
+            "handoff cancellation compare-and-set conflict".into(),
+        ));
+    }
+    audit_continuity(
+        &tx,
+        "handoff_cancel",
+        input.workspace_id,
+        input.project_id,
+        handoff.work_item_id,
+        input.run_id,
+        Some(input.handoff_id),
+        Some(next_revision),
+        None,
+        &input.actor_key,
+        "expired",
+        now,
+    )?;
+    tx.commit()?;
+    Ok(HandoffReleaseResult {
+        work_item_id: handoff.work_item_id,
+        handoff_id: handoff.id,
+        revision: next_revision,
+        state: HandoffState::Expired,
+    })
+}
+
+/// Append one ordered checkpoint and acknowledge an exact claim in the same
+/// transaction when claim fields are present.
+pub fn write_checkpoint(
+    conn: &mut Connection,
+    input: &CheckpointWrite,
+) -> StoreResult<CheckpointWriteResult> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let work_item: Option<WorkItemCheckpointRow> = tx
+        .query_row(
+            "SELECT workspace_id, project_id, state, revision, owner_actor, owner_run_id, \
+                    acceptance_criteria \
+             FROM work_items WHERE id = ?1",
+            params![input.work_item_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((ws, project, _state, revision, owner_actor, owner_run, criteria_json)) = work_item
+    else {
+        return Err(StoreError::NotFound(format!(
+            "work item {}",
+            input.work_item_id
+        )));
+    };
+    let digest = canonical_digest(&serde_json::json!({
+        "work_item_id": input.work_item_id,
+        "run_id": input.run_id,
+        "expected_work_item_revision": input.expected_work_item_revision,
+        "handoff_id": input.handoff_id,
+        "claim_id": input.claim_id,
+        "expected_handoff_revision": input.expected_handoff_revision,
+        "summary": input.summary,
+        "work_item_state": input.work_item_state,
+        "acceptance_criteria": input.acceptance_criteria,
+    }))?;
+    if let Some(replayed) = replay_attempt::<CheckpointWriteResult>(
+        &tx,
+        input.attempt_id,
+        "checkpoint",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        input.work_item_id,
+        input.handoff_id,
+        Some(input.expected_work_item_revision),
+        input.expected_handoff_revision,
+        &digest,
+    )? {
+        tx.commit()?;
+        return replayed;
+    }
+
+    let stable_criteria: Vec<String> = serde_json::from_str(&criteria_json)?;
+    let checkpoint_criteria: Vec<&str> = input
+        .acceptance_criteria
+        .iter()
+        .map(|status| status.criterion.as_str())
+        .collect();
+    let mut validation = if ws.as_slice() != input.workspace_id.as_bytes()
+        || project.as_slice() != input.project_id.as_bytes()
+    {
+        Some("work item does not belong to the resolved scope".to_string())
+    } else if u64::try_from(revision).ok() != Some(input.expected_work_item_revision) {
+        Some(format!(
+            "stale work item revision: expected {}, current {}",
+            input.expected_work_item_revision, revision
+        ))
+    } else if stable_criteria
+        .iter()
+        .map(String::as_str)
+        .ne(checkpoint_criteria.iter().copied())
+    {
+        Some(
+            "checkpoint must report every stable acceptance criterion exactly once and in order"
+                .to_string(),
+        )
+    } else if input.work_item_state == WorkItemState::Completed
+        && input
+            .acceptance_criteria
+            .iter()
+            .any(|status| !status.satisfied)
+    {
+        Some("completed WorkItem requires every acceptance criterion to be satisfied".to_string())
+    } else if input.summary.trim().is_empty() {
+        Some("checkpoint summary must not be empty".to_string())
+    } else {
+        None
+    };
+
+    let acknowledgement = match (
+        input.handoff_id,
+        input.claim_id,
+        input.expected_handoff_revision,
+    ) {
+        (None, None, None) => None,
+        (Some(handoff_id), Some(claim_id), Some(revision)) => {
+            Some((handoff_id, claim_id, revision))
+        }
+        _ => {
+            validation.get_or_insert_with(|| {
+                "handoff_id, claim_id, and expected_handoff_revision must be supplied together"
+                    .to_string()
+            });
+            None
+        }
+    };
+
+    let mut acknowledged_handoff: Option<(Handoff, ClaimId, u64)> = None;
+    if let (None, Some((handoff_id, claim_id, expected_handoff_revision))) =
+        (&validation, acknowledgement)
+    {
+        match load_handoff(&tx, handoff_id)? {
+            None => validation = Some("handoff not found".to_string()),
+            Some(handoff) => {
+                if handoff.work_item_id != input.work_item_id
+                    || handoff.workspace_id != input.workspace_id
+                    || handoff.project_id != input.project_id
+                {
+                    validation =
+                        Some("handoff does not belong to the exact WorkItem scope".to_string());
+                } else if handoff.revision != expected_handoff_revision {
+                    validation = Some(format!(
+                        "stale handoff revision: expected {expected_handoff_revision}, current {}",
+                        handoff.revision
+                    ));
+                } else if handoff.state != HandoffState::Claimed {
+                    validation = Some(format!(
+                        "handoff is not claimed: {}",
+                        handoff.state.as_str()
+                    ));
+                } else {
+                    let claim: Option<(String, Vec<u8>, i64, String)> = tx
+                        .query_row(
+                            "SELECT actor_key, run_id, lease_expires_at, state \
+                             FROM handoff_claims WHERE id = ?1 AND handoff_id = ?2",
+                            params![claim_id.as_bytes(), handoff_id.as_bytes()],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .optional()?;
+                    match claim {
+                        None => validation = Some("claim not found for handoff".to_string()),
+                        Some((actor, run, _, _))
+                            if actor != input.actor_key
+                                || run.as_slice() != input.run_id.as_bytes() =>
+                        {
+                            validation =
+                                Some("claim belongs to a different actor or Run".to_string());
+                        }
+                        Some((_, _, expires, _)) if expires <= now => {
+                            validation = Some("claim lease has expired".to_string());
+                        }
+                        Some((_, _, _, state)) if state != "live" => {
+                            validation = Some(format!("claim is not live: {state}"));
+                        }
+                        Some(_) => {
+                            acknowledged_handoff =
+                                Some((handoff, claim_id, expected_handoff_revision));
+                        }
+                    }
+                }
+            }
+        }
+    } else if validation.is_none() && acknowledgement.is_none() {
+        let owner_run_matches = owner_run
+            .as_deref()
+            .is_some_and(|bytes| bytes == input.run_id.as_bytes());
+        if owner_actor != input.actor_key || !owner_run_matches {
+            validation =
+                Some("only the current WorkItem owner Run may append this checkpoint".into());
+        }
+    }
+
+    if let Some(message) = validation {
+        record_attempt_error(
+            &tx,
+            input.attempt_id,
+            "checkpoint",
+            &input.actor_key,
+            input.workspace_id,
+            input.project_id,
+            input.work_item_id,
+            input.handoff_id,
+            Some(input.expected_work_item_revision),
+            input.expected_handoff_revision,
+            &digest,
+            &message,
+            now,
+        )?;
+        audit_continuity(
+            &tx,
+            "checkpoint_write",
+            input.workspace_id,
+            input.project_id,
+            input.work_item_id,
+            input.run_id,
+            input.handoff_id,
+            input.expected_handoff_revision,
+            Some(input.attempt_id),
+            &input.actor_key,
+            "conflict",
+            now,
+        )?;
+        tx.commit()?;
+        return Err(StoreError::InvalidState(message));
+    }
+
+    let sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM checkpoints WHERE work_item_id = ?1",
+        params![input.work_item_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    let checkpoint_id = CheckpointId::new();
+    let next_work_item_revision = input
+        .expected_work_item_revision
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState("work item revision overflow".into()))?;
+    tx.execute(
+        "INSERT INTO checkpoints \
+         (id, work_item_id, workspace_id, project_id, run_id, handoff_id, sequence, \
+          work_item_revision, summary, work_item_state, acceptance_criteria, actor_key, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            checkpoint_id.as_bytes(), input.work_item_id.as_bytes(), input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(), input.run_id.as_bytes(),
+            input.handoff_id.map(|id| id.as_bytes().as_slice().to_vec()), sequence,
+            next_work_item_revision, input.summary, input.work_item_state.as_str(),
+            serde_json::to_string(&input.acceptance_criteria)?, input.actor_key, now,
+        ],
+    )?;
+    let work_item_changed = tx.execute(
+        "UPDATE work_items SET state = ?1, revision = ?2, owner_actor = ?3, owner_run_id = ?4, \
+         updated_at = ?5 WHERE id = ?6 AND revision = ?7",
+        params![
+            input.work_item_state.as_str(),
+            next_work_item_revision,
+            input.actor_key,
+            input.run_id.as_bytes(),
+            now,
+            input.work_item_id.as_bytes(),
+            input.expected_work_item_revision
+        ],
+    )?;
+    if work_item_changed != 1 {
+        return Err(StoreError::InvalidState(
+            "checkpoint work item compare-and-set conflict".into(),
+        ));
+    }
+
+    let (handoff_revision, handoff_state) =
+        if let Some((handoff, claim_id, expected)) = acknowledged_handoff {
+            let next = expected
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+            let claim_changed = tx.execute(
+                "UPDATE handoff_claims SET state = 'acknowledged', resolved_at = ?1 \
+             WHERE id = ?2 AND state = 'live'",
+                params![now, claim_id.as_bytes()],
+            )?;
+            let handoff_changed = tx.execute(
+                "UPDATE handoffs SET state = 'acknowledged', revision = ?1, acknowledged_by = ?2, \
+             acknowledged_at = ?3, acknowledged_by_session = NULL \
+             WHERE id = ?4 AND revision = ?5 AND state = 'claimed'",
+                params![next, input.actor_key, now, handoff.id.as_bytes(), expected],
+            )?;
+            if claim_changed != 1 || handoff_changed != 1 {
+                return Err(StoreError::InvalidState(
+                    "checkpoint acknowledgement compare-and-set conflict".into(),
+                ));
+            }
+            audit_continuity(
+                &tx,
+                "handoff_acknowledge",
+                input.workspace_id,
+                input.project_id,
+                input.work_item_id,
+                input.run_id,
+                Some(handoff.id),
+                Some(next),
+                Some(input.attempt_id),
+                &input.actor_key,
+                "acknowledged",
+                now,
+            )?;
+            (Some(next), Some(HandoffState::Acknowledged))
+        } else {
+            (None, None)
+        };
+
+    let result = CheckpointWriteResult {
+        checkpoint_id,
+        work_item_id: input.work_item_id,
+        sequence: u64::try_from(sequence)
+            .map_err(|_| StoreError::MalformedRecord("negative checkpoint sequence".into()))?,
+        work_item_revision: next_work_item_revision,
+        work_item_state: input.work_item_state,
+        handoff_id: input.handoff_id,
+        handoff_revision,
+        handoff_state,
+    };
+    record_attempt_success(
+        &tx,
+        input.attempt_id,
+        "checkpoint",
+        &input.actor_key,
+        input.workspace_id,
+        input.project_id,
+        input.work_item_id,
+        input.handoff_id,
+        Some(input.expected_work_item_revision),
+        input.expected_handoff_revision,
+        &digest,
+        &result,
+        now,
+    )?;
+    audit_continuity(
+        &tx,
+        "checkpoint_write",
+        input.workspace_id,
+        input.project_id,
+        input.work_item_id,
+        input.run_id,
+        input.handoff_id,
+        handoff_revision,
+        Some(input.attempt_id),
+        &input.actor_key,
+        input.work_item_state.as_str(),
+        now,
+    )?;
+    if matches!(
+        input.work_item_state,
+        WorkItemState::Completed | WorkItemState::Abandoned
+    ) {
+        audit_continuity(
+            &tx,
+            "work_item_terminal",
+            input.workspace_id,
+            input.project_id,
+            input.work_item_id,
+            input.run_id,
+            input.handoff_id,
+            handoff_revision,
+            Some(input.attempt_id),
+            &input.actor_key,
+            input.work_item_state.as_str(),
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(result)
+}
+
+fn canonical_digest(value: &serde_json::Value) -> StoreResult<[u8; 32]> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_attempt<T: serde::de::DeserializeOwned>(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: AttemptId,
+    operation: &str,
+    actor_key: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    handoff_id: Option<HandoffId>,
+    expected_work_item_revision: Option<u64>,
+    expected_handoff_revision: Option<u64>,
+    digest: &[u8; 32],
+) -> StoreResult<Option<StoreResult<T>>> {
+    let stored: Option<ContinuityAttemptRow> = tx
+        .query_row(
+            "SELECT operation, actor_key, workspace_id, project_id, work_item_id, handoff_id, \
+                    expected_work_item_revision, expected_handoff_revision, request_digest, outcome_json \
+             FROM continuity_attempts WHERE id = ?1",
+            params![attempt_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
+        )
+        .optional()?;
+    let Some((
+        stored_op,
+        stored_actor,
+        stored_ws,
+        stored_project,
+        stored_work_item,
+        stored_handoff,
+        stored_work_revision,
+        stored_handoff_revision,
+        stored_digest,
+        outcome,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let handoff_matches = match (stored_handoff.as_deref(), handoff_id) {
+        (None, None) => true,
+        (Some(bytes), Some(id)) => bytes == id.as_bytes(),
+        _ => false,
+    };
+    let binding_matches = stored_op == operation
+        && stored_actor == actor_key
+        && stored_ws.as_slice() == workspace_id.as_bytes()
+        && stored_project.as_slice() == project_id.as_bytes()
+        && stored_work_item.as_slice() == work_item_id.as_bytes()
+        && handoff_matches
+        && stored_work_revision == expected_work_item_revision.map(|v| v as i64)
+        && stored_handoff_revision == expected_handoff_revision.map(|v| v as i64)
+        && stored_digest.as_slice() == digest;
+    if !binding_matches {
+        return Err(StoreError::InvalidState(format!(
+            "attempt {attempt_id} was already used with a different continuity request"
+        )));
+    }
+    let envelope: serde_json::Value = serde_json::from_str(&outcome)?;
+    if envelope["status"] == "error" {
+        let message = envelope["error"]
+            .as_str()
+            .unwrap_or("recorded continuity attempt failed");
+        return Ok(Some(Err(StoreError::InvalidState(message.to_string()))));
+    }
+    let value = serde_json::from_value(envelope["value"].clone())?;
+    Ok(Some(Ok(value)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_attempt_success<T: serde::Serialize>(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: AttemptId,
+    operation: &str,
+    actor_key: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    handoff_id: Option<HandoffId>,
+    expected_work_item_revision: Option<u64>,
+    expected_handoff_revision: Option<u64>,
+    digest: &[u8; 32],
+    value: &T,
+    now: i64,
+) -> StoreResult<()> {
+    let outcome = serde_json::to_string(&serde_json::json!({"status": "ok", "value": value}))?;
+    insert_attempt(
+        tx,
+        attempt_id,
+        operation,
+        actor_key,
+        workspace_id,
+        project_id,
+        work_item_id,
+        handoff_id,
+        expected_work_item_revision,
+        expected_handoff_revision,
+        digest,
+        &outcome,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_attempt_error(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: AttemptId,
+    operation: &str,
+    actor_key: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    handoff_id: Option<HandoffId>,
+    expected_work_item_revision: Option<u64>,
+    expected_handoff_revision: Option<u64>,
+    digest: &[u8; 32],
+    message: &str,
+    now: i64,
+) -> StoreResult<()> {
+    let outcome = serde_json::to_string(&serde_json::json!({"status": "error", "error": message}))?;
+    insert_attempt(
+        tx,
+        attempt_id,
+        operation,
+        actor_key,
+        workspace_id,
+        project_id,
+        work_item_id,
+        handoff_id,
+        expected_work_item_revision,
+        expected_handoff_revision,
+        digest,
+        &outcome,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: AttemptId,
+    operation: &str,
+    actor_key: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    handoff_id: Option<HandoffId>,
+    expected_work_item_revision: Option<u64>,
+    expected_handoff_revision: Option<u64>,
+    digest: &[u8; 32],
+    outcome: &str,
+    now: i64,
+) -> StoreResult<()> {
+    tx.execute(
+        "INSERT INTO continuity_attempts \
+         (id, operation, actor_key, workspace_id, project_id, work_item_id, handoff_id, \
+          expected_work_item_revision, expected_handoff_revision, request_digest, outcome_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![attempt_id.as_bytes(), operation, actor_key, workspace_id.as_bytes(), project_id.as_bytes(),
+            work_item_id.as_bytes(), handoff_id.map(|id| id.as_bytes().as_slice().to_vec()),
+            expected_work_item_revision.map(|v| v as i64), expected_handoff_revision.map(|v| v as i64),
+            digest.as_slice(), outcome, now],
     )?;
     Ok(())
 }
 
-/// Mark an open handoff expired so it will no longer be consumed.
-pub fn cancel_handoff(conn: &mut Connection, handoff_id: &HandoffId) -> StoreResult<bool> {
-    let changed = conn.execute(
-        "UPDATE handoffs SET state = 'expired' WHERE id = ?1 AND state = 'open'",
-        params![handoff_id.as_bytes()],
+fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<Handoff>> {
+    let row = conn
+        .query_row(
+            "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                acknowledged_by_session FROM handoffs WHERE id = ?1",
+            params![handoff_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<i64>>(18)?,
+                    row.get::<_, Option<Vec<u8>>>(19)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        work_item,
+        ws,
+        project,
+        from_session,
+        source_run,
+        from_agent,
+        source_actor,
+        to_agent,
+        cwd,
+        summary,
+        open_questions,
+        next_steps,
+        files_touched,
+        state,
+        revision,
+        created_at,
+        acknowledged_by,
+        acknowledged_at,
+        acknowledged_by_session,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Handoff {
+        id: HandoffId::from_slice(&id)?,
+        work_item_id: WorkItemId::from_slice(&work_item)?,
+        workspace_id: WorkspaceId::from_slice(&ws)?,
+        project_id: ProjectId::from_slice(&project)?,
+        from_session_id: from_session
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?,
+        source_run_id: SessionId::from_slice(&source_run)?,
+        from_agent: engram_core::AgentKind::from_wire(&from_agent),
+        source_actor,
+        to_agent: to_agent.map(|value| engram_core::AgentKind::from_wire(&value)),
+        cwd,
+        summary,
+        open_questions: serde_json::from_str(&open_questions)?,
+        next_steps: serde_json::from_str(&next_steps)?,
+        files_touched: serde_json::from_str(&files_touched)?,
+        state: state.parse()?,
+        revision: u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?,
+        created_at: Timestamp::from_microsecond(created_at)
+            .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
+        acknowledged_by,
+        acknowledged_at: acknowledged_at
+            .map(Timestamp::from_microsecond)
+            .transpose()
+            .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
+        acknowledged_by_session: acknowledged_by_session
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_continuity(
+    tx: &rusqlite::Transaction<'_>,
+    op: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    run_id: SessionId,
+    handoff_id: Option<HandoffId>,
+    revision: Option<u64>,
+    attempt_id: Option<AttemptId>,
+    actor: &str,
+    outcome: &str,
+    at: i64,
+) -> StoreResult<()> {
+    let detail = serde_json::to_string(&serde_json::json!({
+        "actor": actor,
+        "work_item_id": work_item_id,
+        "run_id": run_id,
+        "handoff_id": handoff_id,
+        "revision": revision,
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+    }))?;
+    tx.execute(
+        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)",
+        params![
+            at,
+            op,
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            detail
+        ],
     )?;
-    Ok(changed > 0)
+    Ok(())
 }
 
 fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
@@ -1322,6 +2512,14 @@ pub struct MoveSummary {
     pub observations_moved: u64,
     /// `handoffs` rows re-stamped.
     pub handoffs_moved: u64,
+    /// `work_items` rows re-stamped.
+    pub work_items_moved: u64,
+    /// `handoff_claims` rows re-stamped.
+    pub handoff_claims_moved: u64,
+    /// `checkpoints` rows re-stamped.
+    pub checkpoints_moved: u64,
+    /// `continuity_attempts` rows re-stamped.
+    pub continuity_attempts_moved: u64,
     /// `audit_log` rows re-stamped.
     pub audit_log_moved: u64,
     /// `auto_improve_runs` rows re-stamped.
@@ -1381,6 +2579,22 @@ pub fn move_project_workspace(
         "UPDATE handoffs SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    let work_items_moved = tx.execute(
+        "UPDATE work_items SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )? as u64;
+    let handoff_claims_moved = tx.execute(
+        "UPDATE handoff_claims SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )? as u64;
+    let checkpoints_moved = tx.execute(
+        "UPDATE checkpoints SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )? as u64;
+    let continuity_attempts_moved = tx.execute(
+        "UPDATE continuity_attempts SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )? as u64;
     let audit_log_moved = tx.execute(
         "UPDATE audit_log SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -1418,6 +2632,10 @@ pub fn move_project_workspace(
         sessions_moved,
         observations_moved,
         handoffs_moved,
+        work_items_moved,
+        handoff_claims_moved,
+        checkpoints_moved,
+        continuity_attempts_moved,
         audit_log_moved,
         auto_improve_runs_moved,
         auto_improve_proposals_moved,
@@ -1498,7 +2716,8 @@ mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use engram_core::{
-        LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier, WorkspaceId,
+        AgentKind, LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier,
+        WorkspaceId,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -1840,141 +3059,6 @@ mod tests {
             resolved.as_deref(),
             Some(&target_id.as_bytes()[..]),
             "link must resolve across projects once the target lands"
-        );
-    }
-
-    /// Handoff state machine: insert → Open; accept_handoff → Accepted
-    /// with accepted_by stamped. Calling accept again must be safe
-    /// (idempotent at the DB level) because hooks fire-and-forget.
-    #[test]
-    fn accept_handoff_transitions_open_to_accepted() {
-        let (_tmp, mut conn, ws, proj) = fresh_db();
-        let new = NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: None,
-            summary: "test summary".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        };
-        let id = insert_handoff(&mut conn, &new).unwrap();
-
-        // Pre-state: Open, accepted_by NULL.
-        let (state, accepted_by): (String, Option<String>) = conn
-            .query_row(
-                "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
-                params![&id.as_bytes()[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "open");
-        assert!(accepted_by.is_none());
-
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
-        let (state, accepted_by): (String, Option<String>) = conn
-            .query_row(
-                "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
-                params![&id.as_bytes()[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "accepted");
-        assert_eq!(accepted_by.as_deref(), Some("codex"));
-
-        // Idempotency: accepting an already-accepted handoff must
-        // either succeed silently or fail clearly, never corrupt
-        // the row. (Current impl is a no-op UPDATE with a state
-        // guard.)
-        let second = accept_handoff(&mut conn, &id, AgentKind::Codex, None);
-        assert!(second.is_ok(), "double-accept must not error");
-    }
-
-    /// The stored cwd is normalized (trailing path separator stripped) at insert time
-    /// so trailing-slash drift between agent payloads cannot break the next
-    /// session's path-boundary match. Covers both manual and auto handoffs,
-    /// since both go through `insert_handoff`.
-    #[test]
-    fn insert_handoff_strips_trailing_separator_from_cwd() {
-        let (_tmp, mut conn, ws, proj) = fresh_db();
-        let new = NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: Some(std::path::PathBuf::from("/home/u/repo/")),
-            summary: "trailing slash".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        };
-        let id = insert_handoff(&mut conn, &new).unwrap();
-        let cwd: Option<String> = conn
-            .query_row(
-                "SELECT cwd FROM handoffs WHERE id = ?1",
-                params![&id.as_bytes()[..]],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(cwd.as_deref(), Some("/home/u/repo"));
-
-        let windows = NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: Some(std::path::PathBuf::from(r"C:\repo\")),
-            summary: "trailing backslash".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        };
-        let id = insert_handoff(&mut conn, &windows).unwrap();
-        let cwd: Option<String> = conn
-            .query_row(
-                "SELECT cwd FROM handoffs WHERE id = ?1",
-                params![&id.as_bytes()[..]],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(cwd.as_deref(), Some(r"C:\repo"));
-    }
-
-    #[test]
-    fn cancel_handoff_transitions_open_to_expired() {
-        let (_tmp, mut conn, ws, proj) = fresh_db();
-        let new = NewHandoff {
-            workspace_id: ws,
-            project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::ClaudeCode,
-            to_agent: None,
-            cwd: None,
-            summary: "accidental handoff".into(),
-            open_questions: vec![],
-            next_steps: vec![],
-            files_touched: vec![],
-        };
-        let id = insert_handoff(&mut conn, &new).unwrap();
-
-        assert!(cancel_handoff(&mut conn, &id).unwrap());
-        let state: String = conn
-            .query_row(
-                "SELECT state FROM handoffs WHERE id = ?1",
-                params![&id.as_bytes()[..]],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "expired");
-
-        assert!(
-            !cancel_handoff(&mut conn, &id).unwrap(),
-            "double-cancel should be a no-op"
         );
     }
 
@@ -2440,10 +3524,71 @@ mod tests {
         )
         .unwrap();
 
+        let published = publish_handoff(
+            &mut conn,
+            &NewHandoff {
+                work_item_id: None,
+                workspace_id: src_ws,
+                project_id: proj,
+                from_session_id: Some(sid),
+                source_run_id: sid,
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "source".into(),
+                to_agent: None,
+                cwd: None,
+                objective: "Move continuity state with its project".into(),
+                acceptance_criteria: vec![],
+                summary: "continuity row".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            },
+        )
+        .unwrap();
+        let receiver_run = SessionId::new();
+        let claim = claim_handoff(
+            &mut conn,
+            &HandoffClaim {
+                handoff_id: published.handoff_id,
+                workspace_id: src_ws,
+                project_id: proj,
+                expected_revision: 1,
+                run_id: receiver_run,
+                attempt_id: AttemptId::new(),
+                actor_key: "receiver".into(),
+                lease_seconds: 60,
+            },
+        )
+        .unwrap();
+        write_checkpoint(
+            &mut conn,
+            &CheckpointWrite {
+                work_item_id: published.work_item_id,
+                workspace_id: src_ws,
+                project_id: proj,
+                run_id: receiver_run,
+                expected_work_item_revision: 1,
+                handoff_id: Some(published.handoff_id),
+                claim_id: Some(claim.claim_id),
+                expected_handoff_revision: Some(claim.revision),
+                summary: "receiver checkpoint".into(),
+                work_item_state: WorkItemState::Active,
+                acceptance_criteria: vec![],
+                actor_key: "receiver".into(),
+                attempt_id: AttemptId::new(),
+            },
+        )
+        .unwrap();
+
         let summary = move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
         assert_eq!(summary.pages_moved, 1);
         assert_eq!(summary.sessions_moved, 1);
         assert_eq!(summary.observations_moved, 1);
+        assert_eq!(summary.handoffs_moved, 1);
+        assert_eq!(summary.work_items_moved, 1);
+        assert_eq!(summary.handoff_claims_moved, 1);
+        assert_eq!(summary.checkpoints_moved, 1);
+        assert_eq!(summary.continuity_attempts_moved, 2);
 
         // The project_id is unchanged; every row now points at dst_ws.
         // `projects` keys the project by `id`; child tables by `project_id`.
@@ -2460,8 +3605,22 @@ mod tests {
             )
             .unwrap()
         };
-        for table in ["projects", "pages", "sessions", "observations"] {
-            assert_eq!(count_in(table, &dst_ws), 1, "{table} must move to dst ws");
+        for (table, expected) in [
+            ("projects", 1),
+            ("pages", 1),
+            ("sessions", 1),
+            ("observations", 1),
+            ("work_items", 1),
+            ("handoffs", 1),
+            ("handoff_claims", 1),
+            ("checkpoints", 1),
+            ("continuity_attempts", 2),
+        ] {
+            assert_eq!(
+                count_in(table, &dst_ws),
+                expected,
+                "{table} must move to dst ws"
+            );
             assert_eq!(count_in(table, &src_ws), 0, "{table} must leave src ws");
         }
         // The page keeps its id (embeddings/links follow via page_id).
@@ -3100,15 +4259,20 @@ mod tests {
         let (_tmp, mut conn, ws, _proj) = fresh_db();
         // Add a standalone handoff to scratch (no from_session_id).
         let scratch = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
-        insert_handoff(
+        publish_handoff(
             &mut conn,
             &NewHandoff {
+                work_item_id: None,
                 workspace_id: ws,
                 project_id: scratch,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: None,
+                objective: "standalone".into(),
+                acceptance_criteria: vec![],
                 summary: "standalone".into(),
                 open_questions: vec![],
                 next_steps: vec![],
@@ -3243,26 +4407,31 @@ mod tests {
         // Assert the BEFORE INSERT trigger fires on a stale pair, and
         // a corrected pair lands cleanly.
         let mismatched_handoff = NewHandoff {
+            work_item_id: None,
             workspace_id: other_ws,
             project_id: proj,
             from_session_id: None,
+            source_run_id: SessionId::new(),
             from_agent: AgentKind::ClaudeCode,
+            source_actor: "test".into(),
             to_agent: None,
             cwd: None,
+            objective: "stale".into(),
+            acceptance_criteria: vec![],
             summary: "stale".into(),
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
         };
         assert!(
-            insert_handoff(&mut conn, &mismatched_handoff).is_err(),
+            publish_handoff(&mut conn, &mismatched_handoff).is_err(),
             "handoff insert with mismatched workspace must abort"
         );
         let good_handoff = NewHandoff {
             workspace_id: ws,
             ..mismatched_handoff
         };
-        insert_handoff(&mut conn, &good_handoff).unwrap();
+        publish_handoff(&mut conn, &good_handoff).unwrap();
     }
 
     /// Regression for the rename-vs-purge race that live exploration

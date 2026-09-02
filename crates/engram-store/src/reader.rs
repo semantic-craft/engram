@@ -6,6 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use engram_core::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
     Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, User,
-    UserId, WorkspaceId,
+    UserId, WorkItem, WorkItemId, WorkspaceId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -33,6 +34,14 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
+
+struct FusedPageHit {
+    path: PagePath,
+    title: String,
+    snippet: String,
+    fused_rank: f64,
+    provenance: BTreeSet<String>,
+}
 
 fn hex_bytes(bytes: [u8; 32]) -> String {
     let mut output = String::with_capacity(64);
@@ -55,6 +64,32 @@ pub struct PageHit {
     pub snippet: String,
     /// FTS5 rank score (lower is better — closer to query terms).
     pub rank: f64,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
+}
+
+/// Full source record used to build or resolve a page ContextRef.
+#[derive(Debug, Clone)]
+pub struct PageContextSource {
+    /// Exact page revision.
+    pub id: PageId,
+    /// Workspace id used for isolation checks.
+    pub workspace_id: WorkspaceId,
+    /// Project id used for isolation checks.
+    pub project_id: ProjectId,
+    /// Workspace name serialized into ContextRef.
+    pub workspace_name: String,
+    /// Project name serialized into ContextRef.
+    pub project_name: String,
+    /// Stable page identity.
+    pub path: PagePath,
+    /// Page title.
+    pub title: String,
+    /// Exact revision body.
+    pub body: String,
+    /// SHA-256 content-equivalence key.
+    pub body_sha256: String,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -113,6 +148,9 @@ pub struct StoredPageBody {
 /// per-hit metadata lookups after a global search.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHitWithMeta {
+    /// Stable identifier for this page version.
+    #[serde(skip_serializing)]
+    pub id: PageId,
     /// Name of the workspace containing the page.
     pub workspace_name: String,
     /// Name of the project containing the page.
@@ -125,6 +163,9 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// FTS5 rank score (lower is better — closer to query terms).
     pub rank: f64,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
 }
 
 /// Superset row produced by `routed_page_search`; the public search
@@ -147,17 +188,20 @@ impl RoutedPageRow {
             title: self.title,
             snippet: self.snippet,
             rank: self.rank,
+            provenance: vec!["fts".to_string()],
         }
     }
 
     fn into_page_hit_with_meta(self) -> PageHitWithMeta {
         PageHitWithMeta {
+            id: self.id,
             workspace_name: self.workspace_name,
             project_name: self.project_name,
             path: self.path,
             title: self.title,
             snippet: self.snippet,
             rank: self.rank,
+            provenance: vec!["fts".to_string()],
         }
     }
 }
@@ -179,6 +223,145 @@ pub struct ObservationHit {
     pub rank: f64,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
+}
+
+/// Full immutable observation source used by the Context Assembler.
+#[derive(Debug, Clone)]
+pub struct ObservationContextSource {
+    /// Stable observation identity and revision.
+    pub id: ObservationId,
+    /// Workspace id used for isolation checks.
+    pub workspace_id: WorkspaceId,
+    /// Project id used for isolation checks.
+    pub project_id: ProjectId,
+    /// Workspace name serialized into ContextRef.
+    pub workspace_name: String,
+    /// Project name serialized into ContextRef.
+    pub project_name: String,
+    /// Observation title.
+    pub title: String,
+    /// Exact evidence body.
+    pub body: String,
+}
+
+type PageContextRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+);
+
+type ObservationContextRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, String, String, String);
+
+fn context_batch_parts<T>(ids: &[T], to_blob: impl Fn(&T) -> Vec<u8>) -> (String, Vec<Value>) {
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let params = ids.iter().map(|id| Value::Blob(to_blob(id))).collect();
+    (placeholders, params)
+}
+
+fn page_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PageContextRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn page_context_source(row: PageContextRow) -> StoreResult<PageContextSource> {
+    let (id, workspace_id, project_id, workspace, project, path, title, body, hash) = row;
+    let hash: [u8; 32] = hash.try_into().map_err(|_| {
+        StoreError::Memory(engram_core::MemoryError::MalformedRecord(
+            "page body_sha256 must be 32 bytes".into(),
+        ))
+    })?;
+    Ok(PageContextSource {
+        id: PageId::from_slice(&id)?,
+        workspace_id: WorkspaceId::from_slice(&workspace_id)?,
+        project_id: ProjectId::from_slice(&project_id)?,
+        workspace_name: workspace,
+        project_name: project,
+        path: PagePath::new(path)?,
+        title,
+        body,
+        body_sha256: hex_bytes(hash),
+    })
+}
+
+fn observation_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationContextRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn observation_context_source(row: ObservationContextRow) -> StoreResult<ObservationContextSource> {
+    let (id, workspace_id, project_id, workspace, project, title, body) = row;
+    Ok(ObservationContextSource {
+        id: ObservationId::from_slice(&id)?,
+        workspace_id: WorkspaceId::from_slice(&workspace_id)?,
+        project_id: ProjectId::from_slice(&project_id)?,
+        workspace_name: workspace,
+        project_name: project,
+        title,
+        body,
+    })
+}
+
+fn query_context_pages(conn: &Connection, ids: &[PageId]) -> StoreResult<Vec<PageContextSource>> {
+    let (placeholders, params) = context_batch_parts(ids, |id| id.as_bytes().to_vec());
+    let sql = format!(
+        "SELECT pg.id, pg.workspace_id, pg.project_id, w.name, p.name, \
+                pg.path, pg.title, pg.body, pg.body_sha256 \
+         FROM pages pg \
+         JOIN workspaces w ON w.id = pg.workspace_id \
+         JOIN projects p ON p.id = pg.project_id \
+         WHERE pg.id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), page_context_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(page_context_source).collect()
+}
+
+fn query_context_observations(
+    conn: &Connection,
+    ids: &[ObservationId],
+) -> StoreResult<Vec<ObservationContextSource>> {
+    let (placeholders, params) = context_batch_parts(ids, |id| id.as_bytes().to_vec());
+    let sql = format!(
+        "SELECT o.id, o.workspace_id, o.project_id, w.name, p.name, o.title, o.body \
+         FROM observations o \
+         JOIN workspaces w ON w.id = o.workspace_id \
+         JOIN projects p ON p.id = o.project_id \
+         WHERE o.id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), observation_context_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(observation_context_source).collect()
 }
 
 /// Aggregate counts surfaced by [`ReaderPool::status_counts`] and consumed
@@ -492,20 +675,24 @@ pub struct SessionSummary {
 pub struct HandoffSummary {
     /// Handoff id.
     pub id: String,
+    /// Stable WorkItem id this transfer belongs to.
+    pub work_item_id: String,
+    /// Current compare-and-set revision.
+    pub revision: u64,
     /// Agent that wrote the handoff.
     pub from_agent: String,
     /// Optional target-agent hint.
     pub to_agent: Option<String>,
     /// Terse summary line.
     pub summary: String,
-    /// `open` | `accepted` | `expired`.
+    /// `open` | `claimed` | `acknowledged` | `expired`.
     pub state: String,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
-    /// Agent that consumed the handoff, when accepted.
-    pub accepted_by: Option<String>,
-    /// ISO-8601 acceptance timestamp, when accepted.
-    pub accepted_at: Option<String>,
+    /// Actor that acknowledged the handoff with a checkpoint.
+    pub acknowledged_by: Option<String>,
+    /// ISO-8601 acknowledgement timestamp.
+    pub acknowledged_at: Option<String>,
     /// Session the handoff was written from, when it came from one.
     pub from_session_id: Option<String>,
 }
@@ -983,6 +1170,9 @@ impl ReaderPool {
                         std::collections::hash_map::Entry::Occupied(mut occupied) => {
                             let entry = occupied.get_mut();
                             entry.1 += contrib;
+                            entry.0.provenance.extend(hit.provenance);
+                            entry.0.provenance.sort();
+                            entry.0.provenance.dedup();
                             if entry.0.snippet.is_empty() {
                                 entry.0.snippet = hit.snippet;
                             }
@@ -1044,6 +1234,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    provenance: vec!["recent".to_string()],
                 });
             }
             Ok(hits)
@@ -1092,6 +1283,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    provenance: vec!["recent".to_string()],
                 });
             }
             Ok(hits)
@@ -1316,8 +1508,8 @@ impl ReaderPool {
     }
 
     /// Handoff history for one project, newest-first, in every state.
-    /// [`Self::latest_open_handoff`] stays the accept path; this is the
-    /// read-only audit view.
+    /// [`Self::latest_claimable_handoff`] stays the continuation path; this is
+    /// the read-only audit view.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -1330,8 +1522,8 @@ impl ReaderPool {
         let limit = i64::try_from(limit.clamp(1, 500)).unwrap_or(50);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, from_agent, to_agent, summary, state, created_at, \
-                        accepted_by, accepted_at, from_session_id \
+                "SELECT id, work_item_id, revision, from_agent, to_agent, summary, state, created_at, \
+                        acknowledged_by, acknowledged_at, from_session_id \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                  ORDER BY created_at DESC, id DESC \
@@ -1341,23 +1533,27 @@ impl ReaderPool {
                 params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
-                    let from_agent: String = row.get(1)?;
-                    let to_agent: Option<String> = row.get(2)?;
-                    let summary: String = row.get(3)?;
-                    let state: String = row.get(4)?;
-                    let created_us: i64 = row.get(5)?;
-                    let accepted_by: Option<String> = row.get(6)?;
-                    let accepted_us: Option<i64> = row.get(7)?;
-                    let from_session: Option<Vec<u8>> = row.get(8)?;
+                    let work_item_bytes: Vec<u8> = row.get(1)?;
+                    let revision: i64 = row.get(2)?;
+                    let from_agent: String = row.get(3)?;
+                    let to_agent: Option<String> = row.get(4)?;
+                    let summary: String = row.get(5)?;
+                    let state: String = row.get(6)?;
+                    let created_us: i64 = row.get(7)?;
+                    let acknowledged_by: Option<String> = row.get(8)?;
+                    let acknowledged_us: Option<i64> = row.get(9)?;
+                    let from_session: Option<Vec<u8>> = row.get(10)?;
                     Ok((
                         id_bytes,
+                        work_item_bytes,
+                        revision,
                         from_agent,
                         to_agent,
                         summary,
                         state,
                         created_us,
-                        accepted_by,
-                        accepted_us,
+                        acknowledged_by,
+                        acknowledged_us,
                         from_session,
                     ))
                 },
@@ -1366,24 +1562,30 @@ impl ReaderPool {
             for row in rows {
                 let (
                     id_bytes,
+                    work_item_bytes,
+                    revision,
                     from_agent,
                     to_agent,
                     summary,
                     state,
                     created_us,
-                    accepted_by,
-                    accepted_us,
+                    acknowledged_by,
+                    acknowledged_us,
                     from_session,
                 ) = row?;
                 out.push(HandoffSummary {
                     id: HandoffId::from_slice(&id_bytes)?.to_string(),
+                    work_item_id: WorkItemId::from_slice(&work_item_bytes)?.to_string(),
+                    revision: u64::try_from(revision).map_err(|_| {
+                        StoreError::MalformedRecord("negative handoff revision".into())
+                    })?,
                     from_agent,
                     to_agent,
                     summary,
                     state,
                     created_at: iso_timestamp(created_us).unwrap_or_default(),
-                    accepted_by,
-                    accepted_at: accepted_us.and_then(iso_timestamp),
+                    acknowledged_by,
+                    acknowledged_at: acknowledged_us.and_then(iso_timestamp),
                     from_session_id: from_session
                         .map(|b| SessionId::from_slice(&b).map(|id| id.to_string()))
                         .transpose()?,
@@ -1997,6 +2199,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank: 0.0,
+                    provenance: vec!["link_neighbor".to_string()],
                 });
                 if out.len() >= limit {
                     break;
@@ -2067,51 +2270,67 @@ impl ReaderPool {
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
-        let mut fused: std::collections::HashMap<PageId, (PagePath, String, String, f64, f64)> =
+        let mut fused: std::collections::HashMap<PageId, FusedPageHit> =
             std::collections::HashMap::new();
 
         for (rank, h) in fts_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("fts".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: h.path.clone(),
+                    title: h.title.clone(),
+                    snippet: h.snippet.clone(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["fts".to_string()]),
+                });
         }
         for (rank, (id, path, _score)) in vec_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(*id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((path.clone(), String::new(), String::new(), contrib, 0.0));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("vector".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: path.clone(),
+                    title: String::new(),
+                    snippet: String::new(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["vector".to_string()]),
+                });
         }
         for (rank, h) in graph_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("link_neighbor".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: h.path.clone(),
+                    title: h.title.clone(),
+                    snippet: h.snippet.clone(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["link_neighbor".to_string()]),
+                });
         }
 
         let mut out: Vec<PageHit> = fused
             .into_iter()
-            .map(|(id, (path, title, snippet, fused_rank, _orig))| PageHit {
+            .map(|(id, fused)| PageHit {
                 id,
-                path,
-                title,
-                snippet,
-                rank: -fused_rank, // lower = better (matches FTS5 convention)
+                path: fused.path,
+                title: fused.title,
+                snippet: fused.snippet,
+                rank: -fused.fused_rank, // lower = better (matches FTS5 convention)
+                provenance: fused.provenance.into_iter().collect(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -2185,12 +2404,14 @@ impl ReaderPool {
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(PageHitWithMeta {
+                            id,
                             workspace_name,
                             project_name,
                             path: PagePath::new(path)?,
                             title,
                             snippet: String::new(),
                             rank,
+                            provenance: vec!["vector".to_string()],
                         });
                     }
                 }
@@ -2248,14 +2469,24 @@ impl ReaderPool {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(id)
-                .and_modify(|entry| entry.1 += contrib)
+                .and_modify(|entry| {
+                    entry.1 += contrib;
+                    entry.0.provenance.extend(hit.provenance.clone());
+                    entry.0.provenance.sort();
+                    entry.0.provenance.dedup();
+                })
                 .or_insert((hit, contrib));
         }
         for (rank, (id, hit)) in vec_hits.into_iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(id)
-                .and_modify(|entry| entry.1 += contrib)
+                .and_modify(|entry| {
+                    entry.1 += contrib;
+                    entry.0.provenance.extend(hit.provenance.clone());
+                    entry.0.provenance.sort();
+                    entry.0.provenance.dedup();
+                })
                 .or_insert((hit, contrib));
         }
 
@@ -2294,23 +2525,29 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn latest_open_handoff(
+    pub async fn latest_claimable_handoff(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         cwd_filter: Option<String>,
+        include_claimed: bool,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                        cwd, summary, open_questions, next_steps, files_touched, state, \
-                        created_at, accepted_by, accepted_at, accepted_by_session \
-                 FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
+                "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                        from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                        files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                        acknowledged_by_session \
+                 FROM handoffs h \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND (state = 'open' OR (state = 'claimed' AND \
+                        (?3 = 1 OR EXISTS (SELECT 1 FROM handoff_claims c \
+                                          WHERE c.handoff_id = h.id AND c.state = 'live' \
+                                            AND c.lease_expires_at <= ?4)))) \
                  ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), include_claimed, Timestamp::now().as_microsecond()],
                 row_to_handoff,
             )?;
             let mut selected: Option<Handoff> = None;
@@ -2337,15 +2574,85 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let row = conn
                 .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                    "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                            from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                            files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                            acknowledged_by_session \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
                 )
                 .optional()?;
             row.transpose()
+        })
+        .await
+    }
+
+    /// Look up the stable WorkItem behind a discovered Handoff.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
+    pub async fn work_item_by_id(&self, work_item_id: WorkItemId) -> StoreResult<Option<WorkItem>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, workspace_id, project_id, objective, acceptance_criteria, state, \
+                            revision, owner_actor, owner_run_id, created_at, updated_at \
+                     FROM work_items WHERE id = ?1",
+                    params![work_item_id.as_bytes()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, Option<Vec<u8>>>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                id,
+                workspace,
+                project,
+                objective,
+                criteria,
+                state,
+                revision,
+                owner_actor,
+                owner_run,
+                created_at,
+                updated_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WorkItem {
+                id: WorkItemId::from_slice(&id)?,
+                workspace_id: WorkspaceId::from_slice(&workspace)?,
+                project_id: ProjectId::from_slice(&project)?,
+                objective,
+                acceptance_criteria: serde_json::from_str(&criteria)?,
+                state: state.parse()?,
+                revision: u64::try_from(revision).map_err(|_| {
+                    StoreError::MalformedRecord("negative work item revision".into())
+                })?,
+                owner_actor,
+                owner_run_id: owner_run
+                    .as_deref()
+                    .map(SessionId::from_slice)
+                    .transpose()?,
+                created_at: Timestamp::from_microsecond(created_at)
+                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+                updated_at: Timestamp::from_microsecond(updated_at)
+                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+            }))
         })
         .await
     }
@@ -2727,16 +3034,17 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn latest_open_handoff_for_workspace(
+    pub async fn latest_claimable_handoff_for_workspace(
         &self,
         workspace_id: WorkspaceId,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             let row_opt = conn
                 .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                    "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
+                            from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
+                            files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
+                            acknowledged_by_session \
                      FROM handoffs \
                      WHERE workspace_id = ?1 AND state = 'open' \
                      ORDER BY created_at DESC LIMIT 1",
@@ -3839,6 +4147,39 @@ impl ReaderPool {
             Ok(row)
         })
         .await
+    }
+
+    /// Batch-load exact page revisions for context assembly and ContextRef
+    /// resolution. One read-connection query serves the entire candidate set,
+    /// avoiding per-hit metadata/body lookups.
+    ///
+    /// # Errors
+    /// Propagates SQL, identifier, path, or stored-hash errors.
+    pub async fn context_pages_by_ids(
+        &self,
+        ids: Vec<PageId>,
+    ) -> StoreResult<Vec<PageContextSource>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| query_context_pages(conn, &ids))
+            .await
+    }
+
+    /// Batch-load exact immutable observations for context assembly and
+    /// ContextRef resolution.
+    ///
+    /// # Errors
+    /// Propagates SQL or identifier errors.
+    pub async fn context_observations_by_ids(
+        &self,
+        ids: Vec<ObservationId>,
+    ) -> StoreResult<Vec<ObservationContextSource>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| query_context_observations(conn, &ids))
+            .await
     }
 
     /// Whether a Wiki-page proposal for this path completed the explicit
@@ -5380,7 +5721,7 @@ fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
 
 /// Pick the handoff to deliver from a project's open handoffs.
 ///
-/// See [`ReaderPool::latest_open_handoff`] for the full contract: manual handoffs
+/// See [`ReaderPool::latest_claimable_handoff`] for the full contract: manual handoffs
 /// are project-wide, auto handoffs are filtered by cwd path-boundary, and a
 /// manual handoff always beats an auto one, then most specific cwd, then newest.
 #[cfg(test)]
@@ -5400,27 +5741,34 @@ fn iso_timestamp(micros: i64) -> Option<String> {
 
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
-    let ws_bytes: Vec<u8> = row.get(1)?;
-    let pj_bytes: Vec<u8> = row.get(2)?;
-    let from_session_bytes: Option<Vec<u8>> = row.get(3)?;
-    let from_agent: String = row.get(4)?;
-    let to_agent: Option<String> = row.get(5)?;
-    let cwd: Option<String> = row.get(6)?;
-    let summary: String = row.get(7)?;
-    let open_q_json: String = row.get(8)?;
-    let next_s_json: String = row.get(9)?;
-    let files_json: String = row.get(10)?;
-    let state: String = row.get(11)?;
-    let created_us: i64 = row.get(12)?;
-    let accepted_by: Option<String> = row.get(13)?;
-    let accepted_at_us: Option<i64> = row.get(14)?;
-    let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
+    let work_item_bytes: Vec<u8> = row.get(1)?;
+    let ws_bytes: Vec<u8> = row.get(2)?;
+    let pj_bytes: Vec<u8> = row.get(3)?;
+    let from_session_bytes: Option<Vec<u8>> = row.get(4)?;
+    let source_run_bytes: Vec<u8> = row.get(5)?;
+    let from_agent: String = row.get(6)?;
+    let source_actor: String = row.get(7)?;
+    let to_agent: Option<String> = row.get(8)?;
+    let cwd: Option<String> = row.get(9)?;
+    let summary: String = row.get(10)?;
+    let open_q_json: String = row.get(11)?;
+    let next_s_json: String = row.get(12)?;
+    let files_json: String = row.get(13)?;
+    let state: String = row.get(14)?;
+    let revision: i64 = row.get(15)?;
+    let created_us: i64 = row.get(16)?;
+    let acknowledged_by: Option<String> = row.get(17)?;
+    let acknowledged_at_us: Option<i64> = row.get(18)?;
+    let acknowledged_by_session_bytes: Option<Vec<u8>> = row.get(19)?;
     Ok(materialise_handoff(
         id_bytes,
+        work_item_bytes,
         ws_bytes,
         pj_bytes,
         from_session_bytes,
+        source_run_bytes,
         from_agent,
+        source_actor,
         to_agent,
         cwd,
         summary,
@@ -5428,20 +5776,24 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
         next_s_json,
         files_json,
         state,
+        revision,
         created_us,
-        accepted_by,
-        accepted_at_us,
-        accepted_by_session_bytes,
+        acknowledged_by,
+        acknowledged_at_us,
+        acknowledged_by_session_bytes,
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn materialise_handoff(
     id_bytes: Vec<u8>,
+    work_item_bytes: Vec<u8>,
     ws_bytes: Vec<u8>,
     pj_bytes: Vec<u8>,
     from_session_bytes: Option<Vec<u8>>,
+    source_run_bytes: Vec<u8>,
     from_agent: String,
+    source_actor: String,
     to_agent: Option<String>,
     cwd: Option<String>,
     summary: String,
@@ -5449,10 +5801,11 @@ fn materialise_handoff(
     next_s_json: String,
     files_json: String,
     state: String,
+    revision: i64,
     created_us: i64,
-    accepted_by: Option<String>,
-    accepted_at_us: Option<i64>,
-    accepted_by_session_bytes: Option<Vec<u8>>,
+    acknowledged_by: Option<String>,
+    acknowledged_at_us: Option<i64>,
+    acknowledged_by_session_bytes: Option<Vec<u8>>,
 ) -> StoreResult<Handoff> {
     let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
     let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
@@ -5461,16 +5814,19 @@ fn materialise_handoff(
         .as_deref()
         .map(SessionId::from_slice)
         .transpose()?;
-    let accepted_session = accepted_by_session_bytes
+    let acknowledged_session = acknowledged_by_session_bytes
         .as_deref()
         .map(SessionId::from_slice)
         .transpose()?;
     Ok(Handoff {
         id: HandoffId::from_slice(&id_bytes)?,
+        work_item_id: WorkItemId::from_slice(&work_item_bytes)?,
         workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
         project_id: ProjectId::from_slice(&pj_bytes)?,
         from_session_id: from_session,
+        source_run_id: SessionId::from_slice(&source_run_bytes)?,
         from_agent: parse_agent(&from_agent),
+        source_actor,
         to_agent: to_agent.as_deref().map(parse_agent),
         cwd,
         summary,
@@ -5478,21 +5834,23 @@ fn materialise_handoff(
         next_steps,
         files_touched,
         state: state.parse::<HandoffState>().map_err(StoreError::from)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?,
         created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
             StoreError::Memory(engram_core::MemoryError::MalformedRecord(format!(
                 "bad created_at: {e}"
             )))
         })?,
-        accepted_by: accepted_by.as_deref().map(parse_agent),
-        accepted_at: accepted_at_us
+        acknowledged_by,
+        acknowledged_at: acknowledged_at_us
             .map(jiff::Timestamp::from_microsecond)
             .transpose()
             .map_err(|e| {
                 StoreError::Memory(engram_core::MemoryError::MalformedRecord(format!(
-                    "bad accepted_at: {e}"
+                    "bad acknowledged_at: {e}"
                 )))
             })?,
-        accepted_by_session: accepted_session,
+        acknowledged_by_session: acknowledged_session,
     })
 }
 
@@ -5735,6 +6093,7 @@ fn observation_row_to_hit(row: ObservationRow) -> StoreResult<ObservationHit> {
         created_at: jiff::Timestamp::from_microsecond(created_us)
             .map(|ts| ts.to_string())
             .unwrap_or_default(),
+        provenance: vec!["observation_fts".to_string()],
     })
 }
 
@@ -6037,10 +6396,13 @@ mod tests {
     fn handoff(summary: &str, cwd: Option<&str>, manual: bool, t: i64) -> Handoff {
         Handoff {
             id: HandoffId::new(),
+            work_item_id: engram_core::WorkItemId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             from_session_id: if manual { None } else { Some(SessionId::new()) },
+            source_run_id: SessionId::new(),
             from_agent: AgentKind::ClaudeCode,
+            source_actor: "test".into(),
             to_agent: None,
             cwd: cwd.map(str::to_string),
             summary: summary.to_string(),
@@ -6048,10 +6410,11 @@ mod tests {
             next_steps: vec![],
             files_touched: vec![],
             state: HandoffState::Open,
+            revision: 1,
             created_at: jiff::Timestamp::from_microsecond(t).unwrap(),
-            accepted_by: None,
-            accepted_at: None,
-            accepted_by_session: None,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            acknowledged_by_session: None,
         }
     }
 
@@ -6221,7 +6584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_open_handoff_preserves_workspace_project_isolation() {
+    async fn latest_claimable_handoff_preserves_workspace_project_isolation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let ws_a = store.writer.get_or_create_workspace("a").await.unwrap();
@@ -6239,13 +6602,18 @@ mod tests {
 
         store
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws_b,
                 project_id: proj_b,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: None,
+                objective: "wrong workspace".into(),
+                acceptance_criteria: vec![],
                 summary: "wrong workspace".into(),
                 open_questions: vec![],
                 next_steps: vec![],
@@ -6255,13 +6623,18 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_handoff(NewHandoff {
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
                 workspace_id: ws_a,
                 project_id: proj_a,
                 from_session_id: None,
+                source_run_id: SessionId::new(),
                 from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
                 to_agent: None,
                 cwd: None,
+                objective: "right project".into(),
+                acceptance_criteria: vec![],
                 summary: "right project".into(),
                 open_questions: vec![],
                 next_steps: vec![],
@@ -6272,7 +6645,7 @@ mod tests {
 
         let handoff = store
             .reader
-            .latest_open_handoff(ws_a, proj_a, Some("/repo".into()))
+            .latest_claimable_handoff(ws_a, proj_a, Some("/repo".into()), false)
             .await
             .unwrap()
             .unwrap();

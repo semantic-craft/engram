@@ -1,8 +1,8 @@
 #!/bin/sh
 # Grok Build CLI SessionStart hook.
 # Grok ignores SessionStart stdout, so this hook captures the event only.
-# Do NOT fetch /handoff here: accepting a handoff is destructive and Grok
-# would discard the returned context.
+# Do NOT fetch /handoff here: Grok discards SessionStart stdout, so the
+# read-only response would be wasted. It can discover the Handoff via MCP.
 _lib_dir="$(dirname "$0")"
 [ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
 . "$_lib_dir/_lib.sh"

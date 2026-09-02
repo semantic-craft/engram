@@ -264,10 +264,9 @@ where
         )
         .await;
         // Only fetch the handoff for agents that inject the session-start
-        // hook's stdout as context. Grok ignores it, so fetching here would
-        // consume the handoff server-side (the GET is destructive) and then
-        // discard the result — silently losing it. Those agents recover the
-        // handoff on demand via the MCP `memory_handoff_accept` tool.
+        // hook's stdout as context. Grok ignores it, so the read-only fetch
+        // would be wasted; those agents discover the same still-open Handoff
+        // on demand via the MCP `memory_handoff_discover` tool.
         if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;

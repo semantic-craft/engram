@@ -156,7 +156,7 @@ still take precedence — see
 Each agent CLI needs two things:
 
 1. **MCP registration** - so the agent can call `memory_query`,
-   `memory_recent`, `memory_handoff_accept`.
+   `memory_recent`, and the discover/claim/checkpoint Handoff lifecycle.
 2. **Lifecycle hooks** - so the server auto-captures session events.
    Without this, the agent can still query memory but capture
    becomes manual.
@@ -317,10 +317,10 @@ engram install-mcp --client vscode-copilot  --apply --auth-token "$TOKEN" \
 Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
 `install-hooks`. Grok Build CLI is hook-only in engram's installer today:
 `install-hooks --agent grok` captures lifecycle events, but Grok ignores
-`SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
+`SessionStart` stdout, so Handoffs must be discovered through MCP with
+`memory_handoff_discover` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
 so you'll need to nudge the model to call `memory_query` /
-`memory_handoff_accept` itself.
+`memory_handoff_discover` itself, then claim before continuing.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Grok's no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).

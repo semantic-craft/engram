@@ -157,13 +157,18 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         if label == "doomed" {
             store
                 .writer
-                .insert_handoff(NewHandoff {
+                .publish_handoff(NewHandoff {
+                    work_item_id: None,
                     workspace_id: ws,
                     project_id: proj,
                     from_session_id: Some(sid),
+                    source_run_id: sid,
                     from_agent: AgentKind::ClaudeCode,
+                    source_actor: "test".into(),
                     to_agent: None,
                     cwd: None,
+                    objective: "doomed handoff".into(),
+                    acceptance_criteria: vec![],
                     summary: "doomed handoff".into(),
                     open_questions: vec![],
                     next_steps: vec![],

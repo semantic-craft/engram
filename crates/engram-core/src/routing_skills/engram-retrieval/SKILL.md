@@ -10,7 +10,8 @@ Use this skill for read-only engram lookups, catch-up, and applying remembered p
 
 ## Tools in this cluster
 
-- `memory_query` searches the current project's wiki for prior decisions, gotchas, procedures, rules, and session notes.
+- `memory_query` searches existing FTS/vector/link candidates and assembles them into a caller-budgeted ContextPackage with stable ContextRefs and a decision trace. Always pass `context_budget`; its deterministic unit is selected-content UTF-8 bytes.
+- `memory_context_read` resolves one returned ContextRef to the exact full-evidence source revision.
 - `memory_recent` lists the most recently updated pages when the user wants a light activity check.
 - `memory_read_page` fetches a full page body after a search hit or direct path lookup.
 - `memory_status` reports whether engram is healthy and how large the knowledge base is.
@@ -38,9 +39,9 @@ If a current-project search is empty or thin, do not conclude the knowledge was 
 - If you do not know where it lives, search globally across every project with `global=true`.
 - Do not combine `global=true` with `scopes`, `project`, or `workspace` arguments.
 
-## Snippets are not full pages
+## Budgeted packages are not flat rankings
 
-Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.
+Search returns ordered brief, overview, or full-evidence entries within the requested budget. Inspect the trace for deduplication, quota, omission, truncation, and consumption decisions. A brief is intentionally incomplete; resolve its stable ContextRef with `memory_context_read` when exact evidence is needed. Use `memory_read_page` for direct path or top-query wiki navigation.
 
 ## Apply retrieved guidance
 

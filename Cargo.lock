@@ -665,6 +665,7 @@ dependencies = [
 name = "engram-core"
 version = "2.2.0"
 dependencies = [
+ "base64 0.22.1",
  "jiff",
  "regex",
  "schemars",

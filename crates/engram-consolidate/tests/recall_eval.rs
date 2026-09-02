@@ -48,7 +48,7 @@ const CORPUS: &[(&str, &str)] = &[
     (
         "notes/handoff.md",
         "Cross agent handoff lets Codex pick up the working directory where \
-         Claude Code left off via memory_handoff_begin and memory_handoff_accept",
+         Claude Code left off via memory_handoff_begin then discover claim and checkpoint",
     ),
     (
         "notes/backup.md",
