@@ -6,6 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,14 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::users::TOKEN_HASH_LEN;
 
+struct FusedPageHit {
+    path: PagePath,
+    title: String,
+    snippet: String,
+    fused_rank: f64,
+    provenance: BTreeSet<String>,
+}
+
 fn hex_bytes(bytes: [u8; 32]) -> String {
     let mut output = String::with_capacity(64);
     for byte in bytes {
@@ -55,6 +64,32 @@ pub struct PageHit {
     pub snippet: String,
     /// FTS5 rank score (lower is better — closer to query terms).
     pub rank: f64,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
+}
+
+/// Full source record used to build or resolve a page ContextRef.
+#[derive(Debug, Clone)]
+pub struct PageContextSource {
+    /// Exact page revision.
+    pub id: PageId,
+    /// Workspace id used for isolation checks.
+    pub workspace_id: WorkspaceId,
+    /// Project id used for isolation checks.
+    pub project_id: ProjectId,
+    /// Workspace name serialized into ContextRef.
+    pub workspace_name: String,
+    /// Project name serialized into ContextRef.
+    pub project_name: String,
+    /// Stable page identity.
+    pub path: PagePath,
+    /// Page title.
+    pub title: String,
+    /// Exact revision body.
+    pub body: String,
+    /// SHA-256 content-equivalence key.
+    pub body_sha256: String,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -113,6 +148,9 @@ pub struct StoredPageBody {
 /// per-hit metadata lookups after a global search.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHitWithMeta {
+    /// Stable identifier for this page version.
+    #[serde(skip_serializing)]
+    pub id: PageId,
     /// Name of the workspace containing the page.
     pub workspace_name: String,
     /// Name of the project containing the page.
@@ -125,6 +163,9 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// FTS5 rank score (lower is better — closer to query terms).
     pub rank: f64,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
 }
 
 /// Superset row produced by `routed_page_search`; the public search
@@ -147,17 +188,20 @@ impl RoutedPageRow {
             title: self.title,
             snippet: self.snippet,
             rank: self.rank,
+            provenance: vec!["fts".to_string()],
         }
     }
 
     fn into_page_hit_with_meta(self) -> PageHitWithMeta {
         PageHitWithMeta {
+            id: self.id,
             workspace_name: self.workspace_name,
             project_name: self.project_name,
             path: self.path,
             title: self.title,
             snippet: self.snippet,
             rank: self.rank,
+            provenance: vec!["fts".to_string()],
         }
     }
 }
@@ -179,6 +223,145 @@ pub struct ObservationHit {
     pub rank: f64,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
+    /// Retrieval legs that contributed this hit.
+    #[serde(skip_serializing)]
+    pub provenance: Vec<String>,
+}
+
+/// Full immutable observation source used by the Context Assembler.
+#[derive(Debug, Clone)]
+pub struct ObservationContextSource {
+    /// Stable observation identity and revision.
+    pub id: ObservationId,
+    /// Workspace id used for isolation checks.
+    pub workspace_id: WorkspaceId,
+    /// Project id used for isolation checks.
+    pub project_id: ProjectId,
+    /// Workspace name serialized into ContextRef.
+    pub workspace_name: String,
+    /// Project name serialized into ContextRef.
+    pub project_name: String,
+    /// Observation title.
+    pub title: String,
+    /// Exact evidence body.
+    pub body: String,
+}
+
+type PageContextRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+);
+
+type ObservationContextRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, String, String, String);
+
+fn context_batch_parts<T>(ids: &[T], to_blob: impl Fn(&T) -> Vec<u8>) -> (String, Vec<Value>) {
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let params = ids.iter().map(|id| Value::Blob(to_blob(id))).collect();
+    (placeholders, params)
+}
+
+fn page_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PageContextRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn page_context_source(row: PageContextRow) -> StoreResult<PageContextSource> {
+    let (id, workspace_id, project_id, workspace, project, path, title, body, hash) = row;
+    let hash: [u8; 32] = hash.try_into().map_err(|_| {
+        StoreError::Memory(engram_core::MemoryError::MalformedRecord(
+            "page body_sha256 must be 32 bytes".into(),
+        ))
+    })?;
+    Ok(PageContextSource {
+        id: PageId::from_slice(&id)?,
+        workspace_id: WorkspaceId::from_slice(&workspace_id)?,
+        project_id: ProjectId::from_slice(&project_id)?,
+        workspace_name: workspace,
+        project_name: project,
+        path: PagePath::new(path)?,
+        title,
+        body,
+        body_sha256: hex_bytes(hash),
+    })
+}
+
+fn observation_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationContextRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn observation_context_source(row: ObservationContextRow) -> StoreResult<ObservationContextSource> {
+    let (id, workspace_id, project_id, workspace, project, title, body) = row;
+    Ok(ObservationContextSource {
+        id: ObservationId::from_slice(&id)?,
+        workspace_id: WorkspaceId::from_slice(&workspace_id)?,
+        project_id: ProjectId::from_slice(&project_id)?,
+        workspace_name: workspace,
+        project_name: project,
+        title,
+        body,
+    })
+}
+
+fn query_context_pages(conn: &Connection, ids: &[PageId]) -> StoreResult<Vec<PageContextSource>> {
+    let (placeholders, params) = context_batch_parts(ids, |id| id.as_bytes().to_vec());
+    let sql = format!(
+        "SELECT pg.id, pg.workspace_id, pg.project_id, w.name, p.name, \
+                pg.path, pg.title, pg.body, pg.body_sha256 \
+         FROM pages pg \
+         JOIN workspaces w ON w.id = pg.workspace_id \
+         JOIN projects p ON p.id = pg.project_id \
+         WHERE pg.id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), page_context_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(page_context_source).collect()
+}
+
+fn query_context_observations(
+    conn: &Connection,
+    ids: &[ObservationId],
+) -> StoreResult<Vec<ObservationContextSource>> {
+    let (placeholders, params) = context_batch_parts(ids, |id| id.as_bytes().to_vec());
+    let sql = format!(
+        "SELECT o.id, o.workspace_id, o.project_id, w.name, p.name, o.title, o.body \
+         FROM observations o \
+         JOIN workspaces w ON w.id = o.workspace_id \
+         JOIN projects p ON p.id = o.project_id \
+         WHERE o.id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), observation_context_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(observation_context_source).collect()
 }
 
 /// Aggregate counts surfaced by [`ReaderPool::status_counts`] and consumed
@@ -987,6 +1170,9 @@ impl ReaderPool {
                         std::collections::hash_map::Entry::Occupied(mut occupied) => {
                             let entry = occupied.get_mut();
                             entry.1 += contrib;
+                            entry.0.provenance.extend(hit.provenance);
+                            entry.0.provenance.sort();
+                            entry.0.provenance.dedup();
                             if entry.0.snippet.is_empty() {
                                 entry.0.snippet = hit.snippet;
                             }
@@ -1048,6 +1234,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    provenance: vec!["recent".to_string()],
                 });
             }
             Ok(hits)
@@ -1096,6 +1283,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    provenance: vec!["recent".to_string()],
                 });
             }
             Ok(hits)
@@ -2011,6 +2199,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank: 0.0,
+                    provenance: vec!["link_neighbor".to_string()],
                 });
                 if out.len() >= limit {
                     break;
@@ -2081,51 +2270,67 @@ impl ReaderPool {
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
-        let mut fused: std::collections::HashMap<PageId, (PagePath, String, String, f64, f64)> =
+        let mut fused: std::collections::HashMap<PageId, FusedPageHit> =
             std::collections::HashMap::new();
 
         for (rank, h) in fts_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("fts".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: h.path.clone(),
+                    title: h.title.clone(),
+                    snippet: h.snippet.clone(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["fts".to_string()]),
+                });
         }
         for (rank, (id, path, _score)) in vec_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(*id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((path.clone(), String::new(), String::new(), contrib, 0.0));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("vector".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: path.clone(),
+                    title: String::new(),
+                    snippet: String::new(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["vector".to_string()]),
+                });
         }
         for (rank, h) in graph_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+                .and_modify(|entry| {
+                    entry.fused_rank += contrib;
+                    entry.provenance.insert("link_neighbor".to_string());
+                })
+                .or_insert(FusedPageHit {
+                    path: h.path.clone(),
+                    title: h.title.clone(),
+                    snippet: h.snippet.clone(),
+                    fused_rank: contrib,
+                    provenance: BTreeSet::from(["link_neighbor".to_string()]),
+                });
         }
 
         let mut out: Vec<PageHit> = fused
             .into_iter()
-            .map(|(id, (path, title, snippet, fused_rank, _orig))| PageHit {
+            .map(|(id, fused)| PageHit {
                 id,
-                path,
-                title,
-                snippet,
-                rank: -fused_rank, // lower = better (matches FTS5 convention)
+                path: fused.path,
+                title: fused.title,
+                snippet: fused.snippet,
+                rank: -fused.fused_rank, // lower = better (matches FTS5 convention)
+                provenance: fused.provenance.into_iter().collect(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -2199,12 +2404,14 @@ impl ReaderPool {
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(PageHitWithMeta {
+                            id,
                             workspace_name,
                             project_name,
                             path: PagePath::new(path)?,
                             title,
                             snippet: String::new(),
                             rank,
+                            provenance: vec!["vector".to_string()],
                         });
                     }
                 }
@@ -2262,14 +2469,24 @@ impl ReaderPool {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(id)
-                .and_modify(|entry| entry.1 += contrib)
+                .and_modify(|entry| {
+                    entry.1 += contrib;
+                    entry.0.provenance.extend(hit.provenance.clone());
+                    entry.0.provenance.sort();
+                    entry.0.provenance.dedup();
+                })
                 .or_insert((hit, contrib));
         }
         for (rank, (id, hit)) in vec_hits.into_iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
             fused
                 .entry(id)
-                .and_modify(|entry| entry.1 += contrib)
+                .and_modify(|entry| {
+                    entry.1 += contrib;
+                    entry.0.provenance.extend(hit.provenance.clone());
+                    entry.0.provenance.sort();
+                    entry.0.provenance.dedup();
+                })
                 .or_insert((hit, contrib));
         }
 
@@ -3930,6 +4147,39 @@ impl ReaderPool {
             Ok(row)
         })
         .await
+    }
+
+    /// Batch-load exact page revisions for context assembly and ContextRef
+    /// resolution. One read-connection query serves the entire candidate set,
+    /// avoiding per-hit metadata/body lookups.
+    ///
+    /// # Errors
+    /// Propagates SQL, identifier, path, or stored-hash errors.
+    pub async fn context_pages_by_ids(
+        &self,
+        ids: Vec<PageId>,
+    ) -> StoreResult<Vec<PageContextSource>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| query_context_pages(conn, &ids))
+            .await
+    }
+
+    /// Batch-load exact immutable observations for context assembly and
+    /// ContextRef resolution.
+    ///
+    /// # Errors
+    /// Propagates SQL or identifier errors.
+    pub async fn context_observations_by_ids(
+        &self,
+        ids: Vec<ObservationId>,
+    ) -> StoreResult<Vec<ObservationContextSource>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| query_context_observations(conn, &ids))
+            .await
     }
 
     /// Whether a Wiki-page proposal for this path completed the explicit
@@ -5843,6 +6093,7 @@ fn observation_row_to_hit(row: ObservationRow) -> StoreResult<ObservationHit> {
         created_at: jiff::Timestamp::from_microsecond(created_us)
             .map(|ts| ts.to_string())
             .unwrap_or_default(),
+        provenance: vec!["observation_fts".to_string()],
     })
 }
 

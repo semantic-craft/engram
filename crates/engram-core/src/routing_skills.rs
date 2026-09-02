@@ -92,6 +92,7 @@ mod tests {
 
     const EXPECTED_TOOL_CLUSTERS: &[(&str, &str)] = &[
         ("memory_query", "engram-retrieval"),
+        ("memory_context_read", "engram-retrieval"),
         ("memory_recent", "engram-retrieval"),
         ("memory_read_page", "engram-retrieval"),
         ("memory_status", "engram-retrieval"),

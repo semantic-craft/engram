@@ -32,7 +32,8 @@ match the intent to the tool. They do not need to name the tool.
 
 | User says / situation | Tool |
 |---|---|
-| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (current project; `scopes` for named siblings; `global=true` to search every project) |
+| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` (always pass `context_budget`; current project by default; `scopes` for named siblings; `global=true` to search every project) |
+| "read the exact evidence selected by memory_query" | `memory_context_read` (pass the selected `context_ref`; resolves that exact existing scope and revision) |
 | "what's been going on" / "show recent activity" (light) | `memory_recent` |
 | "is engram healthy?" / "how big is the wiki?" | `memory_status` |
 | "give me the stats" / structured snapshot for the agent to consume | `memory_briefing` (read-only; never creates handoffs) |
@@ -67,16 +68,16 @@ project** — shared `infra`, `ops`, or a related app. Don't conclude
 - **Know which projects to check?** Re-run with explicit `scopes`, e.g.
   `scopes: [{ "workspace": "default", "project": "infra" }]`.
 - **Don't know where it lives?** Pass `global=true` to search every
-  project in every workspace at once. Each hit is annotated with its
+  project in every workspace at once. Each selected entry is annotated with its
   workspace + project so you can tell where it came from. `global=true`
   cannot be combined with `scopes`/`project`/`workspace`.
 
-`memory_query` returns **snippets, not full page bodies** — an empty or
-short snippet does **not** mean the page is empty (a large page can
-match outside the snippet window). To read the whole page, use
-`memory_read_page` (by `path`, or pass a `query` to fetch the top hit's
-full body; add `workspace` + `project` together only when the user names
-a sibling workspace/project).
+`memory_query` requires `context_budget` in conservative UTF-8-byte units and
+returns an ordered ContextPackage plus a content-free assembly trace. Entries
+contain budgeted brief, overview, or full-evidence representations and stable
+ContextRefs. Use `memory_context_read` to resolve a selected ref's exact
+existing scope and revision, or `memory_read_page` for path/query-oriented wiki
+navigation.
 
 ### Use Retrieved Memory As Operating Guidance
 
@@ -84,7 +85,8 @@ When `memory_query` or `memory_recent` returns `_rules/`, `gotchas/`,
 `procedures/`, or `decisions/` pages that match the current task, treat
 them as actionable context, not trivia:
 
-- Read full pages with `memory_read_page` when the snippet looks relevant.
+- Resolve selected package entries exactly with `memory_context_read`; use
+  `memory_read_page` only for path/query-oriented wiki navigation.
 - Apply `_rules/` as constraints.
 - Check `gotchas/` as preflight warnings before editing the same subsystem.
 - Follow `procedures/` as checklists for releases, PR reviews, deploys,

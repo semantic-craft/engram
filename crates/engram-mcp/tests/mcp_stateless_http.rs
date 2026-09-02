@@ -252,7 +252,8 @@ async fn stateless_initialize_returns_json_result() {
 
 /// Project-instruction application remains a local CLI capability. Task
 /// continuity replaces accept with discover/claim/release/checkpoint, but the
-/// remote MCP surface still carries no repository apply authority.
+/// remote MCP surface still carries no repository apply authority; it does
+/// expose the read-only exact context reader.
 #[tokio::test]
 async fn stateless_remote_mcp_has_no_repository_instruction_write_tool() {
     let tmp = TempDir::new().unwrap();
@@ -267,8 +268,8 @@ async fn stateless_remote_mcp_has_no_repository_instruction_write_tool() {
         .expect("tools/list result must contain tools");
     assert_eq!(
         tools.len(),
-        19,
-        "the MCP tool surface must contain the complete WorkItem lifecycle"
+        20,
+        "the MCP tool surface must contain WorkItem continuity and context reading"
     );
 
     let names: Vec<_> = tools
@@ -292,6 +293,10 @@ async fn stateless_remote_mcp_has_no_repository_instruction_write_tool() {
     assert!(
         !names.contains(&"memory_handoff_accept"),
         "the single-use accept contract must be removed: {names:?}"
+    );
+    assert!(
+        names.contains(&"memory_context_read"),
+        "the budgeted query package reader must be available"
     );
     assert!(
         names.iter().all(|name| !name.contains("instruction_apply")

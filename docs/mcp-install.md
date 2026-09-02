@@ -518,8 +518,8 @@ same: ask the model to list its available MCP tools, or to call
 You: List the MCP tools you can call. Use one of them to check
      engram's status.
 
-Model (any client): I can call: memory_query, memory_recent,
-     memory_status, memory_briefing, memory_explore,
+  Model (any client): I can call: memory_query, memory_recent,
+     memory_context_read, memory_status, memory_briefing, memory_explore,
      memory_handoff_begin, memory_handoff_discover, memory_handoff_claim,
      memory_handoff_release, memory_checkpoint_write, memory_handoff_cancel,
      memory_consolidate, memory_auto_improve, memory_write_page, memory_read_page, memory_delete_page,

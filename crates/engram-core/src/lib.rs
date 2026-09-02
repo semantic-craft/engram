@@ -7,6 +7,7 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod context;
 pub mod error;
 pub mod handoff;
 pub mod ids;
@@ -37,6 +38,12 @@ pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
 pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
+pub use context::{
+    AssemblyOmission, AssemblyOmissionReason, AssemblyTrace, CONTEXT_BUDGET_UNIT, ContextAssembler,
+    ContextAssemblyRequest, ContextAssemblyResult, ContextCandidate, ContextDetailTier,
+    ContextEntry, ContextKind, ContextPackage, ContextProvenance, ContextQuota, ContextRef,
+    ContextRefError, ContextRepresentations, ContextTruncation,
+};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{
     AcceptanceCriterionStatus, CheckpointWrite, CheckpointWriteResult, Handoff, HandoffCancel,

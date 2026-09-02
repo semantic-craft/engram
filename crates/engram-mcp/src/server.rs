@@ -1,6 +1,6 @@
 //! [`EngramServer`] — the MCP server skeleton + tool router.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -10,8 +10,10 @@ use engram_consolidate::{
 };
 use engram_core::{
     AcceptanceCriterionStatus, ActiveProject, AgentKind, AttemptId, AuthLevel, Capability,
-    CheckpointWrite, ClaimId, HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff,
-    PageId, PagePath, ProjectId, SessionId, Tier, WorkItemId, WorkItemState, WorkspaceId,
+    CheckpointWrite, ClaimId, ContextAssembler, ContextAssemblyRequest, ContextCandidate,
+    ContextKind, ContextProvenance, ContextQuota, ContextRef, ContextRepresentations,
+    HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff, PageId, PagePath,
+    ProjectId, SessionId, Tier, WorkItemId, WorkItemState, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider};
 use engram_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
@@ -25,6 +27,7 @@ use rmcp::model::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const HANDOFF_SUMMARY_MAX_CHARS: usize = 3_000;
 const HANDOFF_ITEM_MAX_CHARS: usize = 1_500;
@@ -174,10 +177,15 @@ the conversation calls for them:\n\
   to propose architecture (always check first). Defaults to the \
   current project; pass `scopes` to search named sibling projects, \
   or `global=true` to search EVERY project at once when you don't \
-  know where the knowledge lives. Default-scoped calls also return \
-  `global_scope_hits` — standing user/team preferences from the \
-  reserved `_global` scope; treat them as context that applies to \
-  every project.\n\
+  know where the knowledge lives. Always supply `context_budget`, \
+  measured in conservative UTF-8-byte units. The result is an ordered \
+  ContextPackage plus a content-free assembly trace; use ContextRefs \
+  to identify exact selected revisions. Default-scoped calls include \
+  matching standing user/team preferences from the reserved `_global` \
+  scope in the same assembled package.\n\
+- `memory_context_read` — when a selected ContextRef needs its exact \
+  full-evidence body. The reference resolves its encoded existing \
+  scope, kind, identity, and revision and fails closed on a mismatch.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is engram healthy' or \
@@ -277,17 +285,18 @@ search EVERY project in EVERY workspace at once when you don't know \
 where the knowledge lives — each hit then carries its workspace + \
 project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
-it' after one project misses. Note also that `memory_query` returns \
-SNIPPETS, not full page bodies — an empty or short snippet does NOT \
-mean the page is empty (a large page can match outside the snippet \
-window); to read the whole page use `memory_read_page` (by `path`, \
-or a `query` for the top hit's body; add `workspace` + `project` \
-together only for a named sibling workspace/project).\n\
+it' after one project misses. Query entries are budgeted brief, \
+overview, or full-evidence representations, not an unbounded flat \
+ranking. Use `memory_context_read` with an entry's ContextRef for its \
+exact full evidence, or `memory_read_page` for path/query-oriented wiki \
+navigation.\n\
 \n\
 **Use retrieved memory as operating guidance, not trivia.** When \
-`memory_query` or `memory_recent` returns `_rules/`, `gotchas/`, \
-`procedures/`, or `decisions/` pages relevant to the task, read the \
-full page with `memory_read_page` before acting. Treat `_rules/` as \
+`memory_query` selects `_rules/`, `gotchas/`, `procedures/`, or \
+`decisions/` entries relevant to the task, resolve the selected \
+ContextRef with `memory_context_read` before acting. For \
+`memory_recent` results or path/query-oriented wiki navigation, read \
+the full page with `memory_read_page`. Treat `_rules/` as \
 constraints, `gotchas/` as preflight warnings, `procedures/` as \
 checklists, and `decisions/` as settled architecture unless the user \
 explicitly asks to revisit them. Before non-trivial coding, debugging, \
@@ -370,6 +379,16 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Maximum UTF-8 bytes of selected context content. Candidate generation
+    /// may inspect more data, but the returned package never exceeds this
+    /// deterministic budget.
+    context_budget: usize,
+    /// Optional per-kind entry ceilings. Omitted values use Engram defaults.
+    #[serde(default)]
+    context_quotas: Option<ContextQuotaArgs>,
+    /// Exact ContextRefs already present in the caller's active context.
+    #[serde(default)]
+    already_used_context: Vec<engram_core::ContextRef>,
     /// Project to search. Omit to target the project you're currently
     /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.** Only needed when
     /// one shared server fields several projects at once.
@@ -387,13 +406,25 @@ struct QueryArgs {
     /// Search EVERY project in every workspace in one call (cross-project
     /// global search). Use when you don't know which project holds the
     /// knowledge — e.g. shared infra/ops notes. When true, omit
-    /// `project`/`workspace`/`scopes`; results are returned in
-    /// `global_hits` (`hits` stays empty), each annotated with its
-    /// workspace + project so you can tell where it came from. Uses the
+    /// `project`/`workspace`/`scopes`; candidates from every existing
+    /// scope enter the same assembled ContextPackage. Uses the
     /// same hybrid FTS + vector retrieval as scoped queries when an
     /// embedder is configured.
     #[serde(default)]
     global: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ContextQuotaArgs {
+    /// Maximum normal wiki pages (default 6).
+    #[serde(default)]
+    wiki_page: Option<usize>,
+    /// Maximum session-summary pages (default 3).
+    #[serde(default)]
+    session_page: Option<usize>,
+    /// Maximum raw observations (default 3).
+    #[serde(default)]
+    observation: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -428,22 +459,12 @@ struct QueryResponse<T: Serialize> {
     hits: Vec<T>,
 }
 
-#[derive(Debug, Serialize)]
-struct MemoryQueryResponse {
-    hits: Vec<engram_store::PageHit>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    raw_hits: Vec<engram_store::ObservationHit>,
-    /// Populated only by a `global=true` query: cross-project hits, each
-    /// carrying its workspace + project name.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    global_hits: Vec<engram_store::PageHitWithMeta>,
-    /// Standing user/team context from the reserved `_global` preferences
-    /// scope, unioned into default-scoped queries alongside the current
-    /// project's `hits` (issue #154). Empty when the scope doesn't exist or
-    /// the query was explicitly scoped (`workspace`/`project`/`scopes`/
-    /// `global=true`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    global_scope_hits: Vec<engram_store::PageHit>,
+#[derive(Debug)]
+struct PageCandidateHit {
+    id: PageId,
+    rank: f64,
+    snippet: String,
+    provenance: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -744,6 +765,12 @@ struct ReadPageArgs {
     /// a shared server).
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ReadContextArgs {
+    /// Stable ContextRef returned by `memory_query`.
+    context_ref: ContextRef,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1149,6 +1176,48 @@ impl EngramServer {
             .await
     }
 
+    async fn assemble_query_context(
+        &self,
+        page_hits: Vec<PageCandidateHit>,
+        observation_hits: Vec<engram_store::ObservationHit>,
+        budget: usize,
+        quotas: Option<ContextQuotaArgs>,
+        already_used: Vec<ContextRef>,
+    ) -> Result<engram_core::ContextAssemblyResult, McpError> {
+        let page_sources = self
+            .reader
+            .context_pages_by_ids(page_hits.iter().map(|hit| hit.id).collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let observation_sources = self
+            .reader
+            .context_observations_by_ids(observation_hits.iter().map(|hit| hit.id).collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let pages_by_id: HashMap<_, _> = page_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let observations_by_id: HashMap<_, _> = observation_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let candidates = build_context_candidates(
+            page_hits,
+            observation_hits,
+            &pages_by_id,
+            &observations_by_id,
+        )?;
+        Ok(ContextAssembler.assemble(
+            candidates,
+            ContextAssemblyRequest {
+                budget,
+                quotas: context_quotas(quotas),
+                already_used: already_used.into_iter().collect::<BTreeSet<_>>(),
+            },
+        ))
+    }
+
     /// Override the retention-sweep parameters (typically populated
     /// from the user's config.toml `[decay]` table).
     #[must_use]
@@ -1210,12 +1279,15 @@ impl EngramServer {
         designs, BEFORE answering 'why does X work this way', and \
         whenever the user references prior work you don't recognise. \
         FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
-        Returns up to `limit` pages with HTML-marked snippets and a rank \
-        score (lower rank = better match). Only latest page versions. \
-        If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches. Default-scoped calls also return \
-        `global_scope_hits`: standing user/team preferences from the \
-        reserved `_global` scope that apply across projects. Set \
+        Candidate generation is unchanged; the shared Context Assembler \
+        then returns broad brief coverage before overview/full-evidence \
+        upgrades within the required `context_budget` (UTF-8 bytes). The \
+        response contains stable ContextRefs, source revisions, tiers, \
+        provenance, truncation state, consumption, omissions, and a \
+        content-free assembly trace. Use `memory_context_read` for exact \
+        full evidence. If compiled wiki search misses, bounded raw \
+        observations become candidates. Default-scoped calls also assemble \
+        standing user/team preferences from the reserved `_global` scope. Set \
         `global=true` to search EVERY \
         project at once (cross-project) when you don't know which project \
         holds the knowledge — each hit then carries its workspace + \
@@ -1248,12 +1320,25 @@ impl EngramServer {
                 .search_global(&args.query, query_vec.as_deref(), limit)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            return ok_json(&MemoryQueryResponse {
-                hits: Vec::new(),
-                raw_hits: Vec::new(),
-                global_hits,
-                global_scope_hits: Vec::new(),
-            });
+            let page_hits = global_hits
+                .into_iter()
+                .map(|hit| PageCandidateHit {
+                    id: hit.id,
+                    rank: hit.rank,
+                    snippet: hit.snippet,
+                    provenance: hit.provenance,
+                })
+                .collect();
+            let assembled = self
+                .assemble_query_context(
+                    page_hits,
+                    Vec::new(),
+                    args.context_budget,
+                    args.context_quotas,
+                    args.already_used_context,
+                )
+                .await?;
+            return ok_json(&assembled);
         }
         if !args.scopes.is_empty()
             && (args
@@ -1376,13 +1461,34 @@ impl EngramServer {
         } else {
             Vec::new()
         };
-        let response = MemoryQueryResponse {
-            hits,
-            raw_hits,
-            global_hits: Vec::new(),
-            global_scope_hits,
-        };
-        ok_json(&response)
+        let mut page_hits: Vec<PageCandidateHit> = hits
+            .into_iter()
+            .map(|hit| PageCandidateHit {
+                id: hit.id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                provenance: hit.provenance,
+            })
+            .collect();
+        page_hits.extend(global_scope_hits.into_iter().map(|mut hit| {
+            hit.provenance.push("global_scope".to_string());
+            PageCandidateHit {
+                id: hit.id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                provenance: hit.provenance,
+            }
+        }));
+        let assembled = self
+            .assemble_query_context(
+                page_hits,
+                raw_hits,
+                args.context_budget,
+                args.context_quotas,
+                args.already_used_context,
+            )
+            .await?;
+        ok_json(&assembled)
     }
 
     /// Return the N most-recently-updated pages.
@@ -1937,6 +2043,32 @@ impl EngramServer {
             "path": path.to_string(),
             "checkpoint": checkpoint
         }))
+    }
+
+    /// Resolve exact full evidence from a stable ContextRef.
+    #[tool(
+        description = "Resolve the exact full-evidence body for a stable ContextRef returned by `memory_query`. The reference carries its context kind, workspace/project scope, stable source identity, and exact revision without exposing an absolute storage path. Reads resolve only an existing encoded scope and fail closed if the source, revision, kind, or scope does not match. Returns the exact revision and full evidence; it never mutates wiki pages."
+    )]
+    async fn memory_context_read(
+        &self,
+        Parameters(args): Parameters<ReadContextArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::authorize_parts(&parts, Capability::NormalRead)?;
+        let reference = args.context_ref;
+        let scope = engram_store::lookup_existing_scope(
+            &self.reader,
+            reference.workspace(),
+            reference.project(),
+        )
+        .await
+        .map_err(Self::scope_error)?;
+        match reference.kind() {
+            ContextKind::WikiPage | ContextKind::SessionPage => {
+                self.resolve_page_context(reference, scope).await
+            }
+            ContextKind::Observation => self.resolve_observation_context(reference, scope).await,
+        }
     }
 
     /// Fetch the full body of a single wiki page.
@@ -2717,12 +2849,269 @@ impl EngramServer {
             }
         });
     }
+
+    async fn resolve_page_context(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<CallToolResult, McpError> {
+        let revision = reference.page_revision().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain a page revision", None)
+        })?;
+        let path = reference.page_path().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain a page path", None)
+        })?;
+        let source = self
+            .reader
+            .context_pages_by_ids(vec![revision])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .find(|source| {
+                source.workspace_id == scope.workspace_id
+                    && source.project_id == scope.project_id
+                    && source.path == *path
+            })
+            .ok_or_else(|| missing_context("page"))?;
+        let kind = if source.path.as_str().starts_with("sessions/") {
+            ContextKind::SessionPage
+        } else {
+            ContextKind::WikiPage
+        };
+        if kind != reference.kind() {
+            return Err(McpError::invalid_params(
+                "ContextRef kind does not match its page source",
+                None,
+            ));
+        }
+        context_evidence(reference, kind, source.id, &source.title, &source.body)
+    }
+
+    async fn resolve_observation_context(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = reference.observation_id().ok_or_else(|| {
+            McpError::invalid_params("ContextRef does not contain an observation id", None)
+        })?;
+        let source = self
+            .reader
+            .context_observations_by_ids(vec![identity])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .find(|source| {
+                source.workspace_id == scope.workspace_id && source.project_id == scope.project_id
+            })
+            .ok_or_else(|| missing_context("observation"))?;
+        context_evidence(
+            reference,
+            ContextKind::Observation,
+            source.id,
+            &source.title,
+            &source.body,
+        )
+    }
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
+}
+
+fn missing_context(kind: &str) -> McpError {
+    McpError::invalid_params(
+        format!("ContextRef {kind} source, revision, or scope does not exist"),
+        None,
+    )
+}
+
+fn context_evidence(
+    reference: ContextRef,
+    kind: ContextKind,
+    source_revision: impl ToString,
+    title: &str,
+    body: &str,
+) -> Result<CallToolResult, McpError> {
+    ok_json(&serde_json::json!({
+        "context_ref": reference,
+        "kind": kind,
+        "source_revision": source_revision.to_string(),
+        "full_evidence": format!("# {title}\n\n{body}"),
+    }))
+}
+
+fn clean_search_snippet(snippet: &str) -> String {
+    snippet
+        .replace("<mark>", "")
+        .replace("</mark>", "")
+        .trim()
+        .to_string()
+}
+
+fn truncate_utf8_bytes(value: &str, maximum: usize) -> &str {
+    let mut end = maximum.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn make_brief(title: &str, snippet: &str) -> String {
+    if snippet.is_empty() {
+        return title.to_string();
+    }
+    format!("{title} — {}", truncate_utf8_bytes(snippet, 160))
+}
+
+fn make_overview(title: &str, snippet: &str) -> String {
+    if snippet.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{snippet}")
+    }
+}
+
+struct ContextCandidateParts<'a> {
+    context_ref: ContextRef,
+    title: &'a str,
+    snippet: &'a str,
+    score: f64,
+    deduplication_key: String,
+    retrieval_sources: Vec<String>,
+    selection_reason: &'a str,
+    body: &'a str,
+}
+
+fn context_candidate(parts: ContextCandidateParts<'_>) -> ContextCandidate {
+    let clean_snippet = clean_search_snippet(parts.snippet);
+    ContextCandidate {
+        provenance: parts
+            .retrieval_sources
+            .into_iter()
+            .map(|source| ContextProvenance {
+                source,
+                context_ref: parts.context_ref.clone(),
+            })
+            .collect(),
+        context_ref: parts.context_ref,
+        title: parts.title.to_string(),
+        score: parts.score,
+        deduplication_key: parts.deduplication_key,
+        selection_reason: parts.selection_reason.to_string(),
+        representations: ContextRepresentations {
+            brief: make_brief(parts.title, &clean_snippet),
+            overview: make_overview(parts.title, &clean_snippet),
+            full_evidence: format!("# {}\n\n{}", parts.title, parts.body),
+        },
+    }
+}
+
+fn page_context_candidate(
+    hit: PageCandidateHit,
+    source: &engram_store::PageContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    let context_ref = ContextRef::page(
+        source.workspace_name.clone(),
+        source.project_name.clone(),
+        source.path.clone(),
+        source.id,
+    )?;
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: &hit.snippet,
+        score: hit.rank,
+        deduplication_key: format!("sha256:{}", source.body_sha256),
+        retrieval_sources: hit.provenance,
+        selection_reason: "existing_hybrid_retrieval_rank",
+        body: &source.body,
+    }))
+}
+
+fn observation_context_candidate(
+    hit: engram_store::ObservationHit,
+    source: &engram_store::ObservationContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    let context_ref = ContextRef::observation(
+        source.workspace_name.clone(),
+        source.project_name.clone(),
+        source.id,
+    )?;
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: &hit.snippet,
+        score: hit.rank,
+        deduplication_key: format!("sha256:{:x}", Sha256::digest(source.body.as_bytes())),
+        retrieval_sources: hit.provenance,
+        selection_reason: "raw_observation_fallback_rank",
+        body: &source.body,
+    }))
+}
+
+fn build_context_candidates(
+    page_hits: Vec<PageCandidateHit>,
+    observation_hits: Vec<engram_store::ObservationHit>,
+    pages_by_id: &HashMap<PageId, engram_store::PageContextSource>,
+    observations_by_id: &HashMap<
+        engram_core::ObservationId,
+        engram_store::ObservationContextSource,
+    >,
+) -> Result<Vec<ContextCandidate>, McpError> {
+    let mut candidates = Vec::with_capacity(page_hits.len() + observation_hits.len());
+    for hit in page_hits {
+        let source = pages_by_id.get(&hit.id).ok_or_else(|| {
+            McpError::internal_error(
+                format!("retrieval candidate page revision {} is missing", hit.id),
+                None,
+            )
+        })?;
+        candidates.push(
+            page_context_candidate(hit, source)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        );
+    }
+    for hit in observation_hits {
+        let source = observations_by_id.get(&hit.id).ok_or_else(|| {
+            McpError::internal_error(
+                format!(
+                    "retrieval candidate observation revision {} is missing",
+                    hit.id
+                ),
+                None,
+            )
+        })?;
+        candidates.push(
+            observation_context_candidate(hit, source)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        );
+    }
+    Ok(candidates)
+}
+
+fn context_quotas(quotas: Option<ContextQuotaArgs>) -> Vec<ContextQuota> {
+    let quotas = quotas.unwrap_or(ContextQuotaArgs {
+        wiki_page: None,
+        session_page: None,
+        observation: None,
+    });
+    vec![
+        ContextQuota {
+            kind: ContextKind::WikiPage,
+            maximum: quotas.wiki_page.unwrap_or(6),
+        },
+        ContextQuota {
+            kind: ContextKind::SessionPage,
+            maximum: quotas.session_page.unwrap_or(3),
+        },
+        ContextQuota {
+            kind: ContextKind::Observation,
+            maximum: quotas.observation.unwrap_or(3),
+        },
+    ]
 }
 
 fn checkpoint_or_mcp(wiki: &Wiki, message: impl AsRef<str>) -> Result<Option<String>, McpError> {
@@ -2950,6 +3339,7 @@ mod tests {
 
     const MCP_TOOL_NAMES: &[&str] = &[
         "memory_query",
+        "memory_context_read",
         "memory_recent",
         "memory_status",
         "memory_briefing",
@@ -2972,6 +3362,7 @@ mod tests {
 
     const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
         "memory_query",
+        "memory_context_read",
         "memory_recent",
         "memory_status",
         "memory_briefing",
@@ -3177,8 +3568,8 @@ mod tests {
     fn prompts_teach_cross_project_search_strategy() {
         // Regression: a single-project miss must not read as "never recorded".
         // Both surfaces must point the agent at `scopes` **and** at
-        // `global=true` (the two broadening modes), warn that query returns
-        // snippets (not full page bodies), and NOT contain the contradictory
+        // `global=true` (the two broadening modes), teach the budgeted package
+        // and ContextRef full-evidence path, and NOT contain the contradictory
         // legacy "no global mode" phrasing that briefly shipped in #56.
         // (Learned the hard way when cluster-access info lived in a sibling
         // `infra` project.)
@@ -3196,8 +3587,16 @@ mod tests {
                 "{label} must mention knowledge can live in a sibling project"
             );
             assert!(
-                prompt.contains("snippet") || prompt.contains("SNIPPET"),
-                "{label} must warn that query returns snippets, not full bodies"
+                prompt.contains("context_budget"),
+                "{label} must require a query budget"
+            );
+            assert!(
+                prompt.contains("ContextRef"),
+                "{label} must teach stable context references"
+            );
+            assert!(
+                prompt.contains("memory_context_read"),
+                "{label} must teach full-evidence lookup"
             );
             // Guard against the contradiction: standalone prose must not say
             // a global mode doesn't exist when the bullet/table-row above it
@@ -3292,6 +3691,22 @@ mod tests {
                     && lower.contains("auth")
                     && lower.contains("migration"),
                 "{label} must make proactive retrieval the default for risky work"
+            );
+            assert!(
+                lower.contains("memory_context_read")
+                    && lower.contains("selected")
+                    && lower.contains("contextref"),
+                "{label} must resolve selected query entries by exact ContextRef"
+            );
+            assert!(
+                lower.contains("memory_recent")
+                    && lower.contains("memory_read_page")
+                    && lower.contains("path/query"),
+                "{label} must reserve memory_read_page for recent/path navigation"
+            );
+            assert!(
+                !prompt.contains("`memory_query` or `memory_recent` returns"),
+                "{label} must not collapse exact refs and path navigation into one read path"
             );
         });
     }
@@ -3772,6 +4187,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "karpathy".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3785,7 +4203,156 @@ mod tests {
             Some(t) => t.text.clone(),
             None => panic!("expected text content"),
         };
-        assert!(text.contains("foo.md"), "expected hit; got {text}");
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            response.get("package").is_some(),
+            "memory_query must return an assembled context package: {text}"
+        );
+        assert!(
+            response.get("trace").is_some(),
+            "memory_query must return an assembly trace: {text}"
+        );
+        let entry = &response["package"]["entries"][0];
+        assert_eq!(entry["kind"], "wiki_page");
+        assert!(entry["detail_tier"].as_str().is_some());
+        assert!(entry["context_ref"].as_str().is_some());
+        assert!(entry["source_revision"].as_str().is_some());
+        assert!(entry["provenance"].as_array().is_some());
+        assert!(
+            response["package"]["estimated_consumption"].as_u64()
+                <= response["package"]["budget"].as_u64()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_small_budget_ref_resolves_exact_full_evidence_and_scope() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    context_budget: 12,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let response = call_tool_json(result);
+        assert!(
+            response["package"]["estimated_consumption"]
+                .as_u64()
+                .unwrap()
+                <= 12
+        );
+        assert_eq!(response["package"]["entries"][0]["truncation"], "truncated");
+        let reference: ContextRef =
+            serde_json::from_value(response["package"]["entries"][0]["context_ref"].clone())
+                .unwrap();
+        let source_revision = reference.source_revision();
+
+        let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+        let same_named_project = store
+            .writer
+            .get_or_create_project(other_workspace, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: other_workspace,
+                project_id: same_named_project,
+                path: reference.page_path().unwrap().clone(),
+                title: "Foreign".into(),
+                body: "must never replace exact referenced evidence".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        server
+            .active_project
+            .set(other_workspace, same_named_project);
+
+        for auth_level in [AuthLevel::Root, AuthLevel::User, AuthLevel::Anonymous] {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(auth_level);
+            let evidence = server
+                .memory_context_read(
+                    Parameters(ReadContextArgs {
+                        context_ref: reference.clone(),
+                    }),
+                    rmcp::handler::server::tool::Extension(parts),
+                )
+                .await
+                .unwrap();
+            let evidence = call_tool_json(evidence);
+            assert_eq!(evidence["source_revision"], source_revision);
+            assert!(
+                evidence["full_evidence"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Karpathy says compile")
+            );
+        }
+
+        let cross_workspace = ContextRef::page(
+            "other",
+            "scratch",
+            reference.page_path().unwrap().clone(),
+            reference.page_revision().unwrap(),
+        )
+        .unwrap();
+        let error = server
+            .memory_context_read(
+                Parameters(ReadContextArgs {
+                    context_ref: cross_workspace,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("same-named cross-workspace pages must not satisfy an exact revision");
+        assert!(error.to_string().contains("does not exist"), "{error}");
+
+        let wrong_scope = ContextRef::page(
+            reference.workspace(),
+            "missing-project",
+            reference.page_path().unwrap().clone(),
+            reference.page_revision().unwrap(),
+        )
+        .unwrap();
+        let error = server
+            .memory_context_read(
+                Parameters(ReadContextArgs {
+                    context_ref: wrong_scope,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("ContextRef reads must not create or fall back from a missing scope");
+        assert!(error.to_string().contains("not found"), "{error}");
+
+        for (workspace, project) in [("", "scratch"), ("default", "")] {
+            assert!(
+                ContextRef::page(
+                    workspace,
+                    project,
+                    reference.page_path().unwrap().clone(),
+                    reference.page_revision().unwrap(),
+                )
+                .is_err(),
+                "ContextRef makes partial scope structurally invalid"
+            );
+        }
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -3816,6 +4383,9 @@ mod tests {
         let query = |workspace: Option<&str>, project: Option<&str>| QueryArgs {
             query: "karpathy".into(),
             limit: Some(5),
+            context_budget: 4_096,
+            context_quotas: None,
+            already_used_context: Vec::new(),
             project: project.map(str::to_string),
             scopes: Vec::new(),
             workspace: workspace.map(str::to_string),
@@ -3830,15 +4400,24 @@ mod tests {
             .await
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        let entries = response["package"]["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Foo"))
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Style"))
+        }));
         assert!(
-            text.text.contains("foo.md"),
-            "current-project hit must remain: {}",
-            text.text
-        );
-        assert!(
-            text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
-            "default query must union the reserved global scope: {}",
-            text.text
+            entries.iter().any(
+                |entry| entry["provenance"].as_array().is_some_and(|sources| sources
+                    .iter()
+                    .any(|source| source["source"] == "global_scope"))
+            )
         );
 
         let result = server
@@ -3850,8 +4429,8 @@ mod tests {
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
         assert!(
-            !text.text.contains("preferences/style.md"),
-            "explicitly scoped queries must not union the global scope: {}",
+            !text.text.contains("Style"),
+            "explicit scope must skip global context: {}",
             text.text
         );
     }
@@ -3866,6 +4445,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "karpathy".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3876,11 +4458,9 @@ mod tests {
             .await
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
-        assert!(
-            !text.text.contains("global_scope_hits"),
-            "no reserved scope -> field elided: {}",
-            text.text
-        );
+        let response: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(response["trace"]["candidate_count"], 1);
+        assert!(!text.text.contains("global_scope"));
         assert_eq!(
             engram_store::lookup_global_scope(&store.reader)
                 .await
@@ -3951,7 +4531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_query_returns_raw_hits_when_pages_miss() {
+    async fn memory_query_packages_observation_fallback_when_pages_miss() {
         let (_tmp, store, server, ws, proj) = setup_server().await;
         let session_id = SessionId::new();
         store
@@ -3986,6 +4566,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "quokka".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -3999,15 +4582,9 @@ mod tests {
             Some(t) => t.text.clone(),
             None => panic!("expected text content"),
         };
-        assert!(
-            text.contains("\"hits\": []"),
-            "expected no page hits; got {text}"
-        );
-        assert!(
-            text.contains("raw_hits"),
-            "expected raw fallback; got {text}"
-        );
-        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["package"]["entries"][0]["kind"], "observation");
+        assert!(text.contains("quokka"), "expected raw evidence; got {text}");
     }
 
     #[tokio::test]
@@ -4045,6 +4622,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "workspace_specific_token".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: Some("unit-testing".into()),
                     scopes: Vec::new(),
                     workspace: Some("practice".into()),
@@ -4060,7 +4640,10 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap();
-        assert!(text.contains("patterns.md"), "expected hit; got {text}");
+        assert!(
+            text.contains("Testing Patterns"),
+            "expected hit; got {text}"
+        );
     }
 
     #[tokio::test]
@@ -4249,6 +4832,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "multi_scope_token".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: vec![
                         MemoryScopeArg {
@@ -4273,12 +4859,18 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap();
-        assert!(text.contains("product.md"), "expected product hit: {text}");
         assert!(
-            text.contains("patterns.md"),
+            text.contains("Product Rules"),
+            "expected product hit: {text}"
+        );
+        assert!(
+            text.contains("Testing Patterns"),
             "expected practice hit: {text}"
         );
-        assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+        assert!(
+            !text.contains("must not be returned"),
+            "unexpected hidden hit: {text}"
+        );
     }
 
     #[tokio::test]
@@ -4327,6 +4919,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "global_token".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -4350,7 +4945,7 @@ mod tests {
             text.contains("infra"),
             "hit must carry project name: {text}"
         );
-        assert!(text.contains("global_hits"), "global hits field: {text}");
+        assert!(text.contains("package"), "assembled package field: {text}");
     }
 
     /// Regression for the `global=true` retrieval gap (#10): the global
@@ -4413,6 +5008,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "qzxvw frobnicate".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -4429,8 +5027,8 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(
-            text.contains("notes/cjk.md"),
-            "vector stream must surface the page in global_hits: {text}"
+            text.contains("CJK note") && text.contains("\"source\": \"vector\""),
+            "vector stream must surface the page in the package: {text}"
         );
     }
 
@@ -4442,6 +5040,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "x".into(),
                     limit: Some(5),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: Some("product".into()),
                     scopes: Vec::new(),
                     workspace: None,
@@ -5616,6 +6217,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "Karpathy".into(),
                     limit: Some(99_999),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,
@@ -5647,6 +6251,9 @@ mod tests {
                 Parameters(QueryArgs {
                     query: "\"unbalanced".into(),
                     limit: Some(10),
+                    context_budget: 4_096,
+                    context_quotas: None,
+                    already_used_context: Vec::new(),
                     project: None,
                     scopes: Vec::new(),
                     workspace: None,

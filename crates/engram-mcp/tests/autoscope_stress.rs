@@ -247,7 +247,11 @@ fn mcp_query_request(user: Option<&str>, session_id: Option<&str>) -> Request<Bo
         "method": "tools/call",
         "params": {
             "name": "memory_query",
-            "arguments": { "query": "markerstream", "limit": 20 }
+            "arguments": {
+                "query": "markerstream",
+                "limit": 20,
+                "context_budget": 20_000
+            }
         }
     });
     build_mcp_request(body.to_string(), user, session_id)
@@ -493,7 +497,11 @@ async fn per_session_isolates_concurrent_writes() {
                 "method": "tools/call",
                 "params": {
                     "name": "memory_query",
-                    "arguments": { "query": "writefromsess*", "limit": 20 }
+                    "arguments": {
+                        "query": "writefromsess*",
+                        "limit": 20,
+                        "context_budget": 20_000
+                    }
                 }
             });
             let resp = router

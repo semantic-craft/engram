@@ -55,8 +55,9 @@ at the managed engram Agent Skills that carry detailed tool routing.
 
 | You say | Agent calls | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, with bounded raw-observation fallback. |
-| Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` with `context_budget` | Existing FTS + graph/vector RRF candidates become a deterministic brief/overview/full-evidence package with stable ContextRefs and trace. |
+| Before proposing architecture | `memory_query` with `context_budget` | Checks prior decisions and gotchas within a caller-bounded context package. |
+| "Show the exact evidence for this result" | `memory_context_read` | Resolves the selected ContextRef's exact source revision through an existing, fail-closed scope. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_discover` if no block exists | Reads the latest claimable Handoff without mutation. |
 | "Continue that work" | `memory_handoff_claim`, then `memory_checkpoint_write` | Claims an exact revision and acknowledges receipt with the first durable checkpoint. |
@@ -70,9 +71,9 @@ at the managed engram Agent Skills that carry detailed tool routing.
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
 | "How big is the wiki?" / "stats?" | `memory_status`, `memory_briefing` | Counts and recent activity windows; `memory_briefing` is read-only. |
 
-Agents should treat retrieved memory as operating guidance. When search returns
-matching `_rules/`, `gotchas/`, `procedures/`, or `decisions/` pages, read the
-full page before acting: rules are constraints, gotchas are preflight warnings,
+Agents should treat retrieved memory as operating guidance. When a package
+selects matching `_rules/`, `gotchas/`, `procedures/`, or `decisions/` context,
+resolve the ContextRef's full evidence before acting: rules are constraints, gotchas are preflight warnings,
 procedures are checklists, and decisions are settled architecture unless the
 user explicitly asks to revisit them.
 
