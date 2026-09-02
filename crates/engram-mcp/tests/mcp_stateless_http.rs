@@ -2189,14 +2189,16 @@ async fn explicit_handoff_context_refs_precede_retrieval_candidates_at_claim() {
     );
 }
 
-/// Tracer for the claim-side retrieval query (#44): the handoff text reaches
-/// the store as raw prose so `route_fts_query` normalizes it exactly once.
+/// Tracer for the claim-side retrieval query (#44): handoff text reaches the
+/// store as prose, never as an FTS5 expression.
 ///
-/// Pre-quoting it here would look like explicit FTS5 syntax to the router,
+/// Pre-quoting it would look like explicit FTS5 syntax to `route_fts_query`,
 /// which then skips term routing — and a 1–2 character CJK term, the most
 /// common shape of a Chinese query, has no unicode61 leg that can match it.
+/// Generated prose can also carry those triggers by accident, and a parse
+/// failure lands after the compare-and-set, on an already-claimed Handoff.
 #[tokio::test]
-async fn cjk_handoff_text_still_routes_to_the_like_leg_at_claim() {
+async fn handoff_text_routes_as_prose_at_claim() {
     use engram_core::{NewPage, PagePath, Tier};
 
     let tmp = TempDir::new().unwrap();
@@ -2264,5 +2266,42 @@ async fn cjk_handoff_text_still_routes_to_the_like_leg_at_claim() {
             .iter()
             .any(|entry| entry["page_path"] == "notes/continuity.md"),
         "a multi-term CJK handoff must still find continuation candidates: {claimed}"
+    );
+
+    // Prose carrying FTS5 grammar: a bare `NOT` cannot open an FTS5
+    // expression, and parentheses/quotes are query syntax. Claim assembly runs
+    // after the compare-and-set, so a parse failure here would hand back an
+    // error on a Handoff that stays claimed until release or lease expiry.
+    let awkward = call_tool(
+        &router,
+        212,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0044-0000-7000-8000-000000000014",
+            "objective": "Ship the continuity work",
+            "summary": "NOT ready: the \"context package\" (#44) needs review AND a rerun",
+            "next_steps": ["re-run the gate (all four)"],
+        }),
+    )
+    .await;
+    let awkward_claim = call_tool_outcome(
+        &router,
+        213,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": awkward["handoff_id"],
+            "expected_revision": 1,
+            "run_id": "019f0044-0000-7000-8000-000000000015",
+            "attempt_id": "019f0044-0000-7000-8000-000000000016",
+            "context_budget": 4096,
+            "lease_seconds": 30
+        }),
+    )
+    .await;
+    let awkward_claim = awkward_claim
+        .unwrap_or_else(|error| panic!("prose must not be parsed as an FTS5 expression: {error}"));
+    assert_eq!(
+        awkward_claim["handoff"]["state"], "claimed",
+        "the claim must survive prose that looks like query syntax: {awkward_claim}"
     );
 }

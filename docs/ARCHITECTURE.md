@@ -304,8 +304,11 @@ compared before the retrieval score, so a publisher-selected source enters
 quota and budget ahead of any rank; unresolved or unauthorized refs become
 bounded diagnostics without substituting another scope, and the package plus
 trace are returned on a successful claim. The retrieval leg receives the
-handoff text raw so the store's routed search normalizes it once and keeps
-its CJK legs. Rendering or assembling
+handoff text as prose — never pre-compiled into an FTS5 expression — so the
+store's routed search normalizes it once and keeps its CJK legs, and
+generated prose carrying `NOT`, quotes, or parentheses cannot fail parsing
+after the compare-and-set has already claimed the Handoff. Pages surfaced by
+that leg take the same access bump as every other retrieval path. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
 Checkpoint accepts it. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.

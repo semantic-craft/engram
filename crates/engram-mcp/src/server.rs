@@ -1467,6 +1467,10 @@ impl EngramServer {
                 limit,
             )
             .await?;
+        // Same reinforcement term as every `memory_query` page path: material
+        // reused only through claims must not look cold to the retention
+        // sweep.
+        self.spawn_access_bump(page_hits.iter().map(|hit| hit.id).collect());
         let observation_hits = if page_hits.is_empty() {
             self.reader
                 .search_observations_for_project(
@@ -3570,12 +3574,36 @@ fn handoff_retrieval_query(handoff: &Handoff) -> String {
     .filter(|part| !part.trim().is_empty())
     .collect::<Vec<_>>()
     .join(" ");
-    // Raw on purpose: `search_pages_for_project` /
-    // `search_observations_for_project` run `route_fts_query`, which
-    // normalizes once and routes CJK terms to the trigram and LIKE legs.
-    // Pre-injecting `OR`/quotes here would make the router treat the text as
-    // explicit FTS5 syntax and skip that routing.
-    raw
+    force_natural_language(&raw)
+}
+
+/// Route handoff-derived text as prose, never as an FTS5 expression.
+///
+/// The store's routed search normalizes the query itself, so this must not
+/// pre-run `prepare_fts5_query`: the injected `OR`/quotes would look like
+/// deliberate FTS5 syntax to `route_fts_query`, which then skips term routing
+/// and drops the LIKE leg a 1–2 character CJK term depends on.
+///
+/// Handoff summaries are generated prose, though, and prose can carry the
+/// same triggers by accident — a summary of `NOT ready` or `(#44)` would
+/// select explicit-query mode and then fail FTS5 parsing. Because the claim's
+/// compare-and-set has already succeeded by then, that surfaces as an error
+/// on a Handoff that stays claimed until release or lease expiry. Neutralize
+/// exactly the four triggers: drop `"`/`(`/`)`, and lower-case the bare
+/// operator words (unicode61 folds case, so recall is unchanged). Every
+/// remaining term is then quoted or passed through by the router's own token
+/// pipeline.
+fn force_natural_language(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if matches!(c, '"' | '(' | ')') { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|term| match term {
+            "OR" | "AND" | "NOT" | "NEAR" => term.to_lowercase(),
+            _ => term.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn explicit_page_candidate(

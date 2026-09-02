@@ -177,8 +177,15 @@ pub struct Handoff {
     pub cwd: Option<String>,
     pub summary: String,
     /// Bounded continuation brief. Distinct from referenced canonical bodies.
+    ///
+    /// Defaulted on read: successful claim Attempts recorded before V104
+    /// persist a serialized `Handoff` without this field, and an identical
+    /// retry must still replay its exact recorded envelope.
+    #[serde(default)]
     pub brief: String,
-    /// Revisioned evidence locators published with this transfer.
+    /// Revisioned evidence locators published with this transfer. Defaulted
+    /// on read for pre-V104 attempt envelopes, like `brief`.
+    #[serde(default)]
     pub context_refs: Vec<ContextRef>,
     pub open_questions: Vec<String>,
     pub next_steps: Vec<String>,
@@ -304,4 +311,43 @@ pub struct CheckpointWriteResult {
     pub relationships: Vec<WorkItemRelationship>,
     #[serde(default)]
     pub parent_result: Option<ParentResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Successful claim Attempts recorded before V104 persist a serialized
+    /// `Handoff` with no `brief` and no `context_refs`. An identical retry
+    /// must still replay that exact recorded envelope rather than failing on
+    /// a missing field.
+    #[test]
+    fn pre_v104_attempt_envelopes_still_deserialize() {
+        let stored = serde_json::json!({
+            "id": "01a062bf-14ab-7d73-9c43-ee3760232336",
+            "work_item_id": "01a062bf-14ab-7d73-9c43-ee2fd747e292",
+            "workspace_id": "01a062bf-148d-7430-8234-dda64f9d6a83",
+            "project_id": "01a062bf-148d-7430-8234-ddb6dacfe75a",
+            "from_session_id": null,
+            "source_run_id": "019f0044-0000-7000-8000-000000000001",
+            "from_agent": "other",
+            "source_actor": "anonymous",
+            "to_agent": null,
+            "cwd": null,
+            "summary": "recorded before the brief and context_refs columns",
+            "open_questions": [],
+            "next_steps": [],
+            "files_touched": [],
+            "state": "claimed",
+            "revision": 2,
+            "created_at": "2026-09-02T15:31:24.971519Z",
+            "acknowledged_by": null,
+            "acknowledged_at": null,
+            "acknowledged_by_session": null
+        });
+        let handoff: Handoff = serde_json::from_value(stored).unwrap();
+        assert!(handoff.brief.is_empty());
+        assert!(handoff.context_refs.is_empty());
+        assert!(handoff.artifacts.is_empty());
+    }
 }
