@@ -7297,6 +7297,89 @@ mod tests {
         );
     }
 
+    /// #54: a receiver that crashes leaves recoverable work. Once its lease
+    /// expires the transfer is claimable again, so the briefing must count it
+    /// as pending instead of reporting an idle project.
+    #[tokio::test]
+    async fn briefing_pending_count_includes_expired_lease_claimed_handoff() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+        let published = call_tool_json(
+            server
+                .memory_handoff_begin(
+                    Parameters(HandoffBeginArgs {
+                        work_item_id: None,
+                        expected_work_item_revision: None,
+                        expected_checkpoint_revision: None,
+                        run_id: SessionId::new().to_string(),
+                        objective: Some("survive a receiver crash".into()),
+                        acceptance_criteria: vec!["the work is picked up again".into()],
+                        summary: "Continue after the crash.".into(),
+                        brief: None,
+                        context_refs: vec![],
+                        open_questions: vec![],
+                        next_steps: vec![],
+                        files_touched: vec![],
+                        artifacts: vec![],
+                        relationships: vec![],
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let handoff_id = published["handoff_id"].as_str().unwrap().to_string();
+        server
+            .memory_handoff_claim(
+                Parameters(claim_args(&handoff_id, SessionId::new(), 1, 4096)),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let pending_count = async || -> u64 {
+            call_tool_json(
+                server
+                    .memory_briefing(
+                        Parameters(BriefingArgs {
+                            recent_pages_limit: Some(5),
+                            project: None,
+                            workspace: None,
+                        }),
+                        rmcp::handler::server::tool::Extension(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            )["pending_handoff_count"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(
+            pending_count().await,
+            0,
+            "a live lease means the work is being carried, not waiting"
+        );
+
+        // Simulate the crashed receiver: the lease elapses with the claim
+        // still `live` and the transfer still `claimed`.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let expired = conn
+            .execute(
+                "UPDATE handoff_claims SET lease_expires_at = 0 WHERE state = 'live'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(expired, 1);
+
+        assert_eq!(
+            pending_count().await,
+            1,
+            "an expired lease returns the transfer to the pending pile"
+        );
+    }
+
     #[test]
     fn handoff_list_cap_keeps_marker_inside_total_budget() {
         let items = (0..10).map(|idx| format!("item-{idx}: {}", "x".repeat(80)));

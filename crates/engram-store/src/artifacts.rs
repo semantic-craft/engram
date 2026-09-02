@@ -15,6 +15,8 @@ pub(crate) const CHILD_MUTATION_FORBIDDEN: &str =
     "child WorkItem cannot complete, abandon, claim, or supersede its parent";
 pub(crate) const RELATIONSHIP_UNAUTHORIZED: &str =
     "unauthorized actor cannot create work item relationship";
+pub(crate) const SECOND_PARENT_FORBIDDEN: &str =
+    "work item already has a child_of parent; a child cannot have two parents";
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_artifacts(
@@ -380,6 +382,25 @@ fn persist_one_relationship(
             "work item relationship cannot be a self-link".into(),
         ));
     }
+    // V103's UNIQUE(kind, from, to) stops the same parent being recorded
+    // twice but not two *different* parents, which would make
+    // `parent_of_child` pick one arbitrarily. A child has exactly one
+    // parent, enforced here rather than by a migration (#54).
+    if input.kind == WorkItemRelationshipKind::ChildOf {
+        let existing_parent: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT to_work_item_id FROM work_item_relationships \
+                 WHERE kind = 'child_of' AND from_work_item_id = ?1 LIMIT 1",
+                params![from_work_item_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_parent.is_some() {
+            return Err(StoreError::InvalidState(
+                SECOND_PARENT_FORBIDDEN.to_string(),
+            ));
+        }
+    }
     let from_owner: Option<String> = tx
         .query_row(
             "SELECT owner_actor FROM work_items WHERE id = ?1",
@@ -539,6 +560,14 @@ pub(crate) fn load_work_item_relationships(
     Ok(relationships)
 }
 
+/// Whether `(actor_key, run_id)` acts as a *child* of `parent_work_item_id`,
+/// which is what makes completing, abandoning, claiming, or superseding that
+/// parent forbidden.
+///
+/// Owning the parent settles the question first. One Run legitimately creates
+/// a parent WorkItem and a child of it, and that Run owns both rows; without
+/// the ownership check the child relationship it just created would classify
+/// it as a foreign child and lock it out of the parent it owns (#54).
 pub(crate) fn actor_run_is_child_of(
     conn: &Connection,
     parent_work_item_id: WorkItemId,
@@ -552,7 +581,12 @@ pub(crate) fn actor_run_is_child_of(
             WHERE r.kind = 'child_of' \
               AND r.to_work_item_id = ?1 \
               AND child.owner_actor = ?2 \
-              AND child.owner_run_id = ?3\
+              AND child.owner_run_id = ?3 \
+              AND NOT EXISTS (\
+                    SELECT 1 FROM work_items parent \
+                    WHERE parent.id = ?1 \
+                      AND parent.owner_actor = ?2 \
+                      AND parent.owner_run_id = ?3)\
          )",
         params![parent_work_item_id.as_bytes(), actor_key, run_id.as_bytes()],
         |row| row.get(0),
@@ -560,6 +594,11 @@ pub(crate) fn actor_run_is_child_of(
     Ok(found != 0)
 }
 
+/// The single parent of a child WorkItem, if it has one.
+///
+/// `persist_one_relationship` rejects a second `child_of` row for the same
+/// `from_work_item_id`, so at most one row can match; the ordering only keeps
+/// the read deterministic for stores written before that check existed.
 pub(crate) fn parent_of_child(
     conn: &Connection,
     child_work_item_id: WorkItemId,
@@ -701,4 +740,176 @@ fn artifact_id_from_hash(hash: &[u8; 32]) -> ArtifactId {
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     ArtifactId(Uuid::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Parent/child resolution rules, tested against real rows because both
+    //! bugs they cover were SQL-shaped rather than Rust-shaped.
+    use super::*;
+    use crate::ops::{get_or_create_project, get_or_create_workspace};
+    use engram_core::WorkItemRelationshipKind;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    fn fresh_db() -> (TempDir, Connection, WorkspaceId, ProjectId) {
+        let tmp = TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("test.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let ws = get_or_create_workspace(&mut conn, "default").unwrap();
+        let proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        (tmp, conn, ws, proj)
+    }
+
+    fn work_item(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        objective: &str,
+        owner_actor: &str,
+        owner_run_id: SessionId,
+    ) -> WorkItemId {
+        let id = WorkItemId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO work_items \
+             (id, workspace_id, project_id, objective, acceptance_criteria, state, \
+              revision, owner_actor, owner_run_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, '[]', 'active', 1, ?5, ?6, ?7, ?7)",
+            params![
+                id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                objective,
+                owner_actor,
+                owner_run_id.as_bytes(),
+                now,
+            ],
+        )
+        .unwrap();
+        id
+    }
+
+    fn link(
+        conn: &mut Connection,
+        from: WorkItemId,
+        scope: (WorkspaceId, ProjectId),
+        owner: (&str, SessionId),
+        kind: WorkItemRelationshipKind,
+        target: WorkItemId,
+    ) -> StoreResult<WorkItemRelationship> {
+        let (workspace_id, project_id) = scope;
+        let (actor_key, run_id) = owner;
+        let tx = conn.transaction().unwrap();
+        let result = persist_one_relationship(
+            &tx,
+            from,
+            workspace_id,
+            project_id,
+            actor_key,
+            run_id,
+            jiff::Timestamp::now().as_microsecond(),
+            &RelationshipInput {
+                kind,
+                target_work_item_id: target,
+                target_workspace_id: workspace_id,
+                target_project_id: project_id,
+            },
+        );
+        if result.is_ok() {
+            tx.commit().unwrap();
+        }
+        result
+    }
+
+    /// #54: one Run that creates a parent WorkItem and a child of it owns
+    /// both. The child link must not turn that Run into a forbidden child of
+    /// the parent it owns, which is what made `CHILD_MUTATION_FORBIDDEN` fire
+    /// on the owner's own parent.
+    #[test]
+    fn parent_owner_is_not_its_own_forbidden_child() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let run = SessionId::new();
+        let parent = work_item(&conn, ws, proj, "parent", "agent:alice", run);
+        let child = work_item(&conn, ws, proj, "child", "agent:alice", run);
+        link(
+            &mut conn,
+            child,
+            (ws, proj),
+            ("agent:alice", run),
+            WorkItemRelationshipKind::ChildOf,
+            parent,
+        )
+        .unwrap();
+
+        assert!(
+            !actor_run_is_child_of(&conn, parent, "agent:alice", run).unwrap(),
+            "the Run owning the parent must stay free to mutate it"
+        );
+
+        // A different Run that only owns the child is still the child.
+        let other_run = SessionId::new();
+        let foreign_child = work_item(&conn, ws, proj, "foreign child", "agent:bob", other_run);
+        link(
+            &mut conn,
+            foreign_child,
+            (ws, proj),
+            ("agent:bob", other_run),
+            WorkItemRelationshipKind::ChildOf,
+            parent,
+        )
+        .unwrap();
+        assert!(
+            actor_run_is_child_of(&conn, parent, "agent:bob", other_run).unwrap(),
+            "a Run that owns only the child stays a forbidden parent-mutator"
+        );
+    }
+
+    /// #54: V103's UNIQUE(kind, from, to) allows two *different* parents for
+    /// one child, which would make `parent_of_child` arbitrary. The second
+    /// `child_of` is refused at the store layer.
+    #[test]
+    fn second_child_of_parent_is_rejected() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let run = SessionId::new();
+        let child = work_item(&conn, ws, proj, "child", "agent:alice", run);
+        let first_parent = work_item(&conn, ws, proj, "parent one", "agent:alice", run);
+        let second_parent = work_item(&conn, ws, proj, "parent two", "agent:alice", run);
+
+        link(
+            &mut conn,
+            child,
+            (ws, proj),
+            ("agent:alice", run),
+            WorkItemRelationshipKind::ChildOf,
+            first_parent,
+        )
+        .unwrap();
+        let error = link(
+            &mut conn,
+            child,
+            (ws, proj),
+            ("agent:alice", run),
+            WorkItemRelationshipKind::ChildOf,
+            second_parent,
+        )
+        .expect_err("a child cannot acquire a second parent");
+        assert!(
+            error.to_string().contains(SECOND_PARENT_FORBIDDEN),
+            "{error}"
+        );
+        assert_eq!(parent_of_child(&conn, child).unwrap(), Some(first_parent));
+
+        // Other relationship kinds stay unrestricted.
+        link(
+            &mut conn,
+            child,
+            (ws, proj),
+            ("agent:alice", run),
+            WorkItemRelationshipKind::DependsOn,
+            second_parent,
+        )
+        .unwrap();
+    }
 }

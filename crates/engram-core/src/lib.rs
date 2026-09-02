@@ -57,9 +57,9 @@ pub use handoff::{
     HandoffReleaseResult, HandoffState, NewHandoff, PublishedHandoff, WorkItem, WorkItemState,
 };
 pub use ids::{
-    AgentKind, ArtifactId, AttemptId, AutoImproveProposalId, AutoImproveRunId, BackgroundJobId,
-    CheckpointId, ClaimId, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId,
-    UserId, WorkItemId, WorkItemRelationshipId, WorkspaceId,
+    AgentKind, ArtifactId, AttemptId, AutoImproveProposalId, AutoImproveRunId, CheckpointId,
+    ClaimId, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, UserId, WorkItemId,
+    WorkItemRelationshipId, WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};

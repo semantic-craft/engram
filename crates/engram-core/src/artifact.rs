@@ -387,6 +387,13 @@ fn nonempty_opt(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Canonicalize a locator so identity does not depend on the reporting
+/// machine's path separator.
+///
+/// `\` collapses to `/` before the caller derives an identity key: the same
+/// repository file reported as `src\lib.rs` from Windows and `src/lib.rs`
+/// from macOS is one object, so both must produce one key. Every locator
+/// leaving this function therefore uses `/` exclusively.
 fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -397,14 +404,15 @@ fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
             "artifact locator must not contain NUL".into(),
         ));
     }
-    for segment in trimmed.split(['/', '\\']) {
+    let unified = trimmed.replace('\\', "/");
+    for segment in unified.split('/') {
         if segment == ".." {
             return Err(MemoryError::MalformedRecord(
                 "artifact locator must not contain parent segments".into(),
             ));
         }
     }
-    Ok(trimmed.trim_end_matches(['/', '\\']).to_string())
+    Ok(unified.trim_end_matches('/').to_string())
 }
 
 fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
@@ -420,9 +428,11 @@ fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
 /// `C:\\`. Requiring three characters would let that root through as
 /// cross-machine identity, which is exactly what `local_path_hint` is for.
 /// `C:relative` is drive-relative and not a repository path either.
+///
+/// Input is always a [`normalize_locator`] result, so separators are already
+/// `/`: a UNC root arrives as `//host/share` and needs no separate `\` case.
 fn is_absolute_path(value: &str) -> bool {
     value.starts_with('/')
-        || value.starts_with('\\')
         || (value.len() >= 2
             && value.as_bytes()[1] == b':'
             && value.as_bytes()[0].is_ascii_alphabetic())
@@ -590,6 +600,90 @@ mod tests {
             let facts = DeliveryFacts::only(flag).unwrap();
             assert_eq!(facts.asserted_flags(), vec![flag]);
         }
+    }
+
+    /// #54: one repository file reported from Windows (`src\lib.rs`) and from
+    /// a POSIX machine (`src/lib.rs`) is one object under #42's cross-machine
+    /// identity rule, so the separator the reporter happened to use must not
+    /// survive into the identity key — scoped or unscoped.
+    #[test]
+    fn file_identity_is_separator_independent() {
+        let project_id = ProjectId::new();
+        let posix = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/nested/lib.rs".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            ..empty_input()
+        };
+        let windows = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src\\nested\\lib.rs".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            ..empty_input()
+        };
+        assert_eq!(
+            posix.identity_key().unwrap(),
+            windows.identity_key().unwrap()
+        );
+        assert_eq!(
+            posix
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id),
+            windows
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id)
+        );
+
+        // The repository-less file falls back to the project-scoped key,
+        // which embeds the locator too.
+        let scoped_posix = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/nested/lib.rs".into(),
+            ..empty_input()
+        };
+        let scoped_windows = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src\\nested\\lib.rs".into(),
+            ..empty_input()
+        };
+        assert_eq!(
+            scoped_posix
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id),
+            scoped_windows
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id)
+        );
+    }
+
+    /// The worktree key embeds the locator as well, so it inherits the same
+    /// separator hazard the File key had.
+    #[test]
+    fn worktree_identity_is_separator_independent() {
+        let posix = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt/machine-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("/tmp/machine-a/engram".into()),
+            ..empty_input()
+        };
+        let windows = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt\\machine-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("C:\\machine-a\\engram".into()),
+            ..empty_input()
+        };
+        assert_eq!(
+            posix.identity_key().unwrap(),
+            windows.identity_key().unwrap()
+        );
     }
 
     fn empty_input() -> ArtifactInput {

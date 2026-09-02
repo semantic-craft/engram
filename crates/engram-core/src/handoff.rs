@@ -4,9 +4,8 @@
 //! stable unit of user work, [`SessionId`] identifies one agent Run/Session,
 //! [`HandoffId`] identifies a revisioned transfer offer, [`ClaimId`] is the
 //! opaque lease capability for one receiver, [`CheckpointId`] identifies one
-//! append-only progress fact, [`AttemptId`] makes retryable mutations
-//! replay-safe, and [`BackgroundJobId`] remains reserved for asynchronous
-//! server processing. The Rust newtypes prevent accidental substitution.
+//! append-only progress fact, and [`AttemptId`] makes retryable mutations
+//! replay-safe. The Rust newtypes prevent accidental substitution.
 
 #![allow(missing_docs)]
 

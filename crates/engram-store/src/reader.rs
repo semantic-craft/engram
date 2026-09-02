@@ -588,7 +588,8 @@ pub struct BriefingSnapshot {
     /// if no observations exist. The `now - last_observation_at` gap
     /// is the signal `memory_explore` uses to scale its verbosity.
     pub last_observation_at: Option<String>,
-    /// Number of open (un-accepted) handoffs.
+    /// Number of handoffs a receiver could still claim: open transfers plus
+    /// claimed ones whose live lease has expired.
     pub pending_handoff_count: u64,
     /// All pages currently under `_rules/` — small, surfaced verbatim
     /// because they're the highest-signal type of memory.
@@ -2721,8 +2722,7 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count: u64 =
-                count(conn, "SELECT COUNT(*) FROM handoffs WHERE state = 'open'")?;
+            let pending_handoff_count = count_claimable_handoffs(conn, HandoffCountScope::Global)?;
 
             // Rules: any `is_latest = 1` page under `_rules/`.
             // Routed there automatically by the consolidator when
@@ -2862,11 +2862,9 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_project(
+            let pending_handoff_count = count_claimable_handoffs(
                 conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'",
-                workspace_id,
-                project_id,
+                HandoffCountScope::Project(workspace_id, project_id),
             )?;
 
             let mut rules_stmt = conn.prepare_cached(
@@ -3041,8 +3039,11 @@ impl ReaderPool {
         .await
     }
 
-    /// Return the latest open handoff for the workspace, aggregating
+    /// Return the latest claimable handoff for the workspace, aggregating
     /// across all of its projects (no project filter).
+    ///
+    /// Claimable follows [`claimable_handoff_predicate`], so a transfer whose
+    /// receiver crashed reappears here once its lease expires.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3051,14 +3052,15 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
+            let claimable = claimable_handoff_predicate("h", "?2");
             let row_opt = conn
                 .query_row(
                     &format!(
-                        "SELECT {HANDOFF_COLUMNS} FROM handoffs \
-                         WHERE workspace_id = ?1 AND state = 'open' \
+                        "SELECT {HANDOFF_COLUMNS} FROM handoffs h \
+                         WHERE h.workspace_id = ?1 AND {claimable} \
                          ORDER BY created_at DESC LIMIT 1"
                     ),
-                    params![workspace_id.as_bytes()],
+                    params![workspace_id.as_bytes(), Timestamp::now().as_microsecond()],
                     row_to_handoff,
                 )
                 .optional()?;
@@ -3178,11 +3180,8 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_workspace(
-                conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND state = 'open'",
-                workspace_id,
-            )?;
+            let pending_handoff_count =
+                count_claimable_handoffs(conn, HandoffCountScope::Workspace(workspace_id))?;
 
             let mut rules_stmt = conn.prepare_cached(
                 "SELECT path, title, \
@@ -5824,6 +5823,83 @@ fn load_work_item(conn: &Connection, work_item_id: WorkItemId) -> StoreResult<Op
     }))
 }
 
+/// One definition of "this `handoffs` row can still reach a receiver".
+///
+/// A transfer is claimable while it is `open`, and becomes claimable again
+/// once a claimed transfer's live lease has expired: a receiver that crashed
+/// before acknowledging leaves recoverable work, not lost work. Divergent
+/// copies of this rule are exactly how a claimed-but-abandoned Handoff stayed
+/// discoverable through `discover_continuation` while the workspace overview
+/// and every pending count reported nothing to pick up (#54).
+///
+/// `alias` is the alias bound to `handoffs` in the caller's query and
+/// `now_param` the positional placeholder the caller binds the current time
+/// (microseconds) to. Both are module-local constants interpolated into SQL,
+/// never caller input.
+fn claimable_handoff_predicate(alias: &str, now_param: &str) -> String {
+    format!(
+        "({alias}.state = 'open' \
+          OR ({alias}.state = 'claimed' \
+              AND EXISTS (SELECT 1 FROM handoff_claims c \
+                          WHERE c.handoff_id = {alias}.id \
+                            AND c.state = 'live' \
+                            AND c.lease_expires_at <= {now_param})))"
+    )
+}
+
+/// Which slice of `handoffs` a claimable count covers.
+#[derive(Clone, Copy)]
+enum HandoffCountScope {
+    /// Every project in every workspace (`memory_status`-style totals).
+    Global,
+    /// One workspace, across its projects.
+    Workspace(WorkspaceId),
+    /// One project.
+    Project(WorkspaceId, ProjectId),
+}
+
+/// Count the handoffs [`claimable_handoff_predicate`] would still offer.
+///
+/// Every briefing variant counts through here so a pending count can never
+/// disagree with what `memory_handoff_discover` actually hands out.
+fn count_claimable_handoffs(conn: &Connection, scope: HandoffCountScope) -> StoreResult<u64> {
+    let now_us = Timestamp::now().as_microsecond();
+    let n: Option<i64> = match scope {
+        HandoffCountScope::Global => {
+            let claimable = claimable_handoff_predicate("h", "?1");
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM handoffs h WHERE {claimable}"),
+                params![now_us],
+                |row| row.get(0),
+            )
+        }
+        HandoffCountScope::Workspace(workspace_id) => {
+            let claimable = claimable_handoff_predicate("h", "?2");
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs h \
+                     WHERE h.workspace_id = ?1 AND {claimable}"
+                ),
+                params![workspace_id.as_bytes(), now_us],
+                |row| row.get(0),
+            )
+        }
+        HandoffCountScope::Project(workspace_id, project_id) => {
+            let claimable = claimable_handoff_predicate("h", "?3");
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs h \
+                     WHERE h.workspace_id = ?1 AND h.project_id = ?2 AND {claimable}"
+                ),
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
+                |row| row.get(0),
+            )
+        }
+    }
+    .optional()?;
+    Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
 /// Pick the transfer a project's next receiver should be offered.
 ///
 /// Shared by [`ReaderPool::latest_claimable_handoff`] and
@@ -5836,14 +5912,12 @@ fn select_claimable_handoff(
     cwd_filter: Option<&str>,
     include_claimed: bool,
 ) -> StoreResult<Option<Handoff>> {
+    let claimable = claimable_handoff_predicate("h", "?4");
     let mut stmt = conn.prepare(&format!(
         "SELECT {HANDOFF_COLUMNS} \
              FROM handoffs h \
              WHERE workspace_id = ?1 AND project_id = ?2 \
-               AND (state = 'open' OR (state = 'claimed' AND \
-                    (?3 = 1 OR EXISTS (SELECT 1 FROM handoff_claims c \
-                                      WHERE c.handoff_id = h.id AND c.state = 'live' \
-                                        AND c.lease_expires_at <= ?4)))) \
+               AND ({claimable} OR (?3 = 1 AND h.state = 'claimed')) \
              ORDER BY created_at DESC",
     ))?;
     let rows = stmt.query_map(

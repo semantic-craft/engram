@@ -89,7 +89,6 @@ id_newtype!(pub WorkItemRelationshipId, "Identifier for one explicit WorkItem re
 id_newtype!(pub ClaimId, "Opaque identifier for one temporary handoff claim.");
 id_newtype!(pub CheckpointId, "Identifier for one durable WorkItem checkpoint.");
 id_newtype!(pub AttemptId, "Caller-supplied identifier for one retryable continuity mutation.");
-id_newtype!(pub BackgroundJobId, "Identifier for server-side asynchronous processing, never a WorkItem or Run identity.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
