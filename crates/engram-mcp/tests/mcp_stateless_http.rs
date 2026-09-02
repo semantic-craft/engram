@@ -394,6 +394,7 @@ async fn work_item_handoff_claim_checkpoint_and_completion_round_trip() {
             "expected_revision": 1,
             "run_id": receiving_run,
             "attempt_id": "019f0000-0000-7000-8000-000000000003",
+            "context_budget": 4096,
             "lease_seconds": 30
         }),
     )
@@ -402,6 +403,10 @@ async fn work_item_handoff_claim_checkpoint_and_completion_round_trip() {
     assert_eq!(claimed["handoff_id"], handoff_id);
     assert_eq!(claimed["revision"], 2);
     assert_eq!(claimed["handoff"]["state"], "claimed");
+    assert!(
+        claimed.get("package").is_some() && claimed.get("trace").is_some(),
+        "claim must return the shared ContextPackage contract: {claimed}"
+    );
     let claim_id = claimed["claim_id"].as_str().unwrap();
 
     let still_claimed = call_tool(
@@ -571,6 +576,7 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
         "expected_revision": 1,
         "run_id": receiver_run,
         "attempt_id": receiver_attempt,
+        "context_budget": 4096,
         "lease_seconds": 30
     });
     let rival_claim_args = serde_json::json!({
@@ -578,6 +584,7 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
         "expected_revision": 1,
         "run_id": rival_run,
         "attempt_id": rival_attempt,
+        "context_budget": 4096,
         "lease_seconds": 30
     });
     let (receiver_outcome, rival_outcome) = tokio::join!(
@@ -629,6 +636,14 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
         }
     };
     assert!(conflict.contains("stale handoff revision"), "{conflict}");
+    assert!(
+        first_claim.get("package").is_some(),
+        "the winning claim must return a ContextPackage: {first_claim}"
+    );
+    assert!(
+        !conflict.contains("\"package\""),
+        "the losing claim must not return a ContextPackage: {conflict}"
+    );
 
     let replayed_claim = call_tool(
         winning_router,
@@ -663,6 +678,7 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
             "expected_revision": 1,
             "run_id": winning_run,
             "attempt_id": winning_attempt,
+            "context_budget": 4096,
             "lease_seconds": 31
         }),
     )
@@ -720,6 +736,7 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
             "expected_revision": 3,
             "run_id": winning_run,
             "attempt_id": "019f0000-0000-7000-8000-000000000027",
+            "context_budget": 4096,
             "lease_seconds": 1
         }),
     )
@@ -735,6 +752,7 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
             "expected_revision": 4,
             "run_id": replacement_run,
             "attempt_id": "019f0000-0000-7000-8000-000000000028",
+            "context_budget": 4096,
             "lease_seconds": 30
         }),
     )
@@ -1285,7 +1303,8 @@ async fn work_item_relationships_fail_closed_and_do_not_inherit_claims() {
             "handoff_id": parent_handoff,
             "expected_revision": 1,
             "run_id": parent_run,
-            "attempt_id": "019f0042-0000-7000-8000-000000000022"
+            "attempt_id": "019f0042-0000-7000-8000-000000000022",
+            "context_budget": 4096
         }),
     )
     .await;
@@ -1346,7 +1365,8 @@ async fn work_item_relationships_fail_closed_and_do_not_inherit_claims() {
             "handoff_id": parent_handoff,
             "expected_revision": claimed["revision"],
             "run_id": "019f0042-0000-7000-8000-000000000023",
-            "attempt_id": "019f0042-0000-7000-8000-000000000024"
+            "attempt_id": "019f0042-0000-7000-8000-000000000024",
+            "context_budget": 4096
         }),
     )
     .await;
@@ -1621,7 +1641,8 @@ async fn artifact_text_is_scrubbed_and_audit_omits_claim_secrets() {
             "handoff_id": published["handoff_id"],
             "expected_revision": 1,
             "run_id": "019f0042-0000-7000-8000-000000000041",
-            "attempt_id": "019f0042-0000-7000-8000-000000000042"
+            "attempt_id": "019f0042-0000-7000-8000-000000000042",
+            "context_budget": 4096
         }),
     )
     .await;

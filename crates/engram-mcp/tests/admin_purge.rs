@@ -170,6 +170,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                     objective: "doomed handoff".into(),
                     acceptance_criteria: vec![],
                     summary: "doomed handoff".into(),
+                    brief: String::new(),
+                    context_refs: vec![],
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],

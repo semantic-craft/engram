@@ -166,7 +166,9 @@ Relationship   explicit depends_on / derived_from / child_of between WorkItems
 `memory_handoff_begin` creates a WorkItem plus open Handoff, or publishes a
 continuation for an exact existing WorkItem owned by the same authenticated
 actor and source Run. SessionStart and `memory_handoff_discover` are read-only.
-The receiver uses compare-and-set `memory_handoff_claim`; its first
+The receiver uses compare-and-set `memory_handoff_claim` with a caller
+`context_budget`; the claim returns the same ContextPackage and assembly
+trace as `memory_query`. Its first
 `memory_checkpoint_write` acknowledges the Claim and Handoff transactionally.
 Acknowledgement is not completion: only an explicit checkpoint state can block,
 complete, or abandon the WorkItem. `memory_handoff_release` reopens a live Claim,
@@ -212,9 +214,9 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
 | `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |
 | `memory_explore` | LLM-composed prose digest over `memory_briefing`; degrades to JSON without a provider | read-only |
-| `memory_handoff_begin` | Create or continue a WorkItem and publish an open Handoff | write |
+| `memory_handoff_begin` | Create or continue a WorkItem and publish an open Handoff with a bounded brief and revisioned ContextRefs | write |
 | `memory_handoff_discover` | Read a claimable Handoff without mutation | read-only |
-| `memory_handoff_claim` | Claim an exact revision under a bounded lease | write |
+| `memory_handoff_claim` | Claim an exact revision under a bounded lease and return a budgeted ContextPackage | write |
 | `memory_handoff_release` | Reopen an exact live Claim | write |
 | `memory_checkpoint_write` | Append progress and optionally acknowledge the receiving Claim | write |
 | `memory_handoff_cancel` | Source-owner cancellation of an exact open revision | write |

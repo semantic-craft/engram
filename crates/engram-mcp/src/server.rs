@@ -9,18 +9,19 @@ use engram_consolidate::{
     run_auto_improve_review, run_lint, run_sweep,
 };
 use engram_core::{
-    AcceptanceCriterionStatus, ActiveProject, AgentKind, ArtifactInput, AttemptId, AuthLevel,
-    Capability, CheckpointWrite, ClaimId, ContextAssembler, ContextAssemblyRequest,
-    ContextCandidate, ContextKind, ContextProvenance, ContextQuota, ContextRef,
-    ContextRepresentations, HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff,
-    PageId, PagePath, ParentResultInput, ProjectId, RelationshipInput, SessionId, Tier, WorkItemId,
+    AcceptanceCriterionStatus, ActiveProject, AgentKind, ArtifactInput, AssemblyOmission,
+    AssemblyOmissionReason, AttemptId, AuthLevel, Capability, CheckpointWrite, ClaimId,
+    ContextAssembler, ContextAssemblyRequest, ContextAssemblyResult, ContextCandidate, ContextKind,
+    ContextProvenance, ContextQuota, ContextRef, ContextRepresentations, Handoff, HandoffCancel,
+    HandoffClaim, HandoffClaimResult, HandoffId, HandoffRelease, NewHandoff, PageId, PagePath,
+    ParentResultInput, ProjectId, RelationshipInput, SessionId, Tier, WorkItemId,
     WorkItemRelationshipKind, WorkItemState, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider};
 use engram_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
 use engram_store::{
     DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    WriterHandle, lookup_existing_scope,
+    WriterHandle, lookup_existing_scope, prepare_fts5_query,
 };
 use engram_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -259,24 +260,29 @@ the conversation calls for them:\n\
   the current session and you want to ensure the next agent has context \
   (the SessionEnd hook also auto-captures this). Supply the source `run_id`; \
   omit `work_item_id` and supply an objective to create a WorkItem, or pass \
-  the exact owned WorkItem id to continue it. Attach typed `artifacts` \
-  (file/git/worktree/external) and explicit `depends_on`/`derived_from`/`child_of` \
-  relationships; absolute cwd is never artifact or WorkItem identity. Engram \
-  records observed status and does not run Git checkout, commit, push, merge, \
-  release, or deploy. Related work creates a new WorkItem and never inherits \
-  the prior claim or blockers. DO NOT use this to summarize work mid-session, \
-  check project status, or answer a request for a briefing. Keep the summary \
-  terse (2-3 sentences); put detail in open_questions + next_steps bullets. \
-  Pass `workspace` + `project` together only when leaving a handoff for a \
-  named sibling workspace/project.\n\
+  the exact owned WorkItem id to continue it. Attach a bounded `brief` and \
+  revisioned ContextRefs; do not copy canonical page bodies into the Handoff. \
+  Attach typed `artifacts` (file/git/worktree/external) and explicit \
+  `depends_on`/`derived_from`/`child_of` relationships; absolute cwd is never \
+  artifact or WorkItem identity. Engram records observed status and does not \
+  run Git checkout, commit, push, merge, release, or deploy. Related work \
+  creates a new WorkItem and never inherits the prior claim or blockers. DO \
+  NOT use this to summarize work mid-session, check project status, or answer \
+  a request for a briefing. Keep the summary terse (2-3 sentences); put detail \
+  in open_questions + next_steps bullets. Pass `workspace` + `project` \
+  together only when leaving a handoff for a named sibling workspace/project.\n\
 - `memory_handoff_discover` — when the user asks where work left off and \
   no SessionStart block is visible. This read is non-destructive: it never \
   consumes or acknowledges a Handoff. Responses include ArtifactRefs and \
   WorkItem relationships with stable identities and revisions.\n\
 - `memory_handoff_claim` — before acting as receiver, claim the exact \
-  Handoff revision with the current Run and a fresh caller-supplied \
-  `attempt_id`. Identical retries replay the original result; a changed \
-  request must use a new Attempt. A child WorkItem cannot claim its parent.\n\
+  Handoff revision with the current Run, a fresh caller-supplied \
+  `attempt_id`, and the same `context_budget` contract as `memory_query`. \
+  Success returns the claim envelope plus a ContextPackage and assembly \
+  trace. Identical retries replay the original claim and re-assemble; a \
+  changed request must use a new Attempt. Compare-and-set failure never \
+  returns a package as if ownership succeeded. Assembling the package \
+  never marks the Handoff accepted. A child WorkItem cannot claim its parent.\n\
 - `memory_checkpoint_write` — append durable progress for the exact \
   WorkItem, including typed artifacts, explicit WorkItem relationships, \
   and optional parent_result evidence. Responses expose ArtifactRefs and \
@@ -659,6 +665,13 @@ struct HandoffBeginArgs {
     /// Files touched during the session.
     #[serde(default)]
     files_touched: Vec<String>,
+    /// Bounded continuation brief. Omit to reuse `summary`. Never a copy of
+    /// referenced canonical page bodies.
+    #[serde(default)]
+    brief: Option<String>,
+    /// Revisioned ContextRefs whose bodies stay in canonical sources.
+    #[serde(default)]
+    context_refs: Vec<ContextRef>,
     /// Typed artifact evidence. Absolute cwd is never artifact identity.
     #[serde(default)]
     artifacts: Vec<ArtifactInput>,
@@ -715,12 +728,29 @@ struct HandoffClaimArgs {
     expected_revision: u64,
     run_id: String,
     attempt_id: String,
+    /// Maximum UTF-8 bytes of selected continuation content. Same unit and
+    /// assembler contract as `memory_query`.
+    context_budget: usize,
+    /// Optional per-kind entry ceilings. Omitted values use Engram defaults.
+    #[serde(default)]
+    context_quotas: Option<ContextQuotaArgs>,
+    /// Exact ContextRefs already present in the caller's active context.
+    #[serde(default)]
+    already_used_context: Vec<ContextRef>,
     #[serde(default)]
     lease_seconds: Option<u64>,
     #[serde(default)]
     project: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HandoffClaimEnvelope {
+    #[serde(flatten)]
+    claimed: HandoffClaimResult,
+    package: engram_core::ContextPackage,
+    trace: engram_core::AssemblyTrace,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1359,6 +1389,229 @@ impl EngramServer {
                 already_used: already_used.into_iter().collect::<BTreeSet<_>>(),
             },
         ))
+    }
+
+    async fn require_publishable_context_ref(
+        &self,
+        reference: &ContextRef,
+    ) -> Result<(), McpError> {
+        match self.resolve_explicit_context_ref(reference.clone()).await? {
+            ResolvedHandoffRef::Candidate(_) => Ok(()),
+            ResolvedHandoffRef::Omission(omission) => Err(McpError::invalid_params(
+                format!(
+                    "context_ref is {}: {}",
+                    context_ref_omission_label(omission.reason),
+                    omission.context_ref
+                ),
+                None,
+            )),
+        }
+    }
+
+    async fn assemble_handoff_claim_context(
+        &self,
+        handoff: &Handoff,
+        budget: usize,
+        quotas: Option<ContextQuotaArgs>,
+        already_used: Vec<ContextRef>,
+    ) -> Result<ContextAssemblyResult, McpError> {
+        let mut omissions = Vec::new();
+        let mut candidates = Vec::new();
+        for reference in &handoff.context_refs {
+            match self.resolve_explicit_context_ref(reference.clone()).await? {
+                ResolvedHandoffRef::Candidate(candidate) => candidates.push(candidate),
+                ResolvedHandoffRef::Omission(omission) => omissions.push(omission),
+            }
+        }
+        candidates.extend(
+            self.handoff_retrieval_candidates(handoff, 20)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        );
+        let mut assembled = ContextAssembler.assemble(
+            candidates,
+            ContextAssemblyRequest {
+                budget,
+                quotas: context_quotas(quotas),
+                already_used: already_used.into_iter().collect::<BTreeSet<_>>(),
+            },
+        );
+        assembled.trace.omissions.extend(omissions);
+        Ok(assembled)
+    }
+
+    async fn handoff_retrieval_candidates(
+        &self,
+        handoff: &Handoff,
+        limit: usize,
+    ) -> engram_store::StoreResult<Vec<ContextCandidate>> {
+        let query = handoff_retrieval_query(handoff);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query_vec = self.embed_query(&query).await;
+        let page_hits = self
+            .search_project(
+                handoff.workspace_id,
+                handoff.project_id,
+                &query,
+                query_vec.as_deref(),
+                limit,
+            )
+            .await?;
+        let observation_hits = if page_hits.is_empty() {
+            self.reader
+                .search_observations_for_project(
+                    handoff.workspace_id,
+                    handoff.project_id,
+                    query,
+                    limit,
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
+        let page_sources = self
+            .reader
+            .context_pages_by_ids(page_hits.iter().map(|hit| hit.id).collect())
+            .await?;
+        let observation_sources = self
+            .reader
+            .context_observations_by_ids(observation_hits.iter().map(|hit| hit.id).collect())
+            .await?;
+        let pages_by_id: HashMap<_, _> = page_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let observations_by_id: HashMap<_, _> = observation_sources
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let mut candidates = Vec::new();
+        for hit in page_hits {
+            if let Some(source) = pages_by_id.get(&hit.id)
+                && let Ok(candidate) = page_context_candidate(
+                    PageCandidateHit {
+                        id: hit.id,
+                        rank: hit.rank,
+                        snippet: hit.snippet,
+                        provenance: hit.provenance,
+                    },
+                    source,
+                )
+            {
+                candidates.push(candidate);
+            }
+        }
+        for hit in observation_hits {
+            if let Some(source) = observations_by_id.get(&hit.id)
+                && let Ok(candidate) = observation_context_candidate(hit, source)
+            {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn resolve_explicit_context_ref(
+        &self,
+        reference: ContextRef,
+    ) -> Result<ResolvedHandoffRef, McpError> {
+        let scope = match engram_store::lookup_existing_scope(
+            &self.reader,
+            reference.workspace(),
+            reference.project(),
+        )
+        .await
+        {
+            Ok(scope) => scope,
+            Err(engram_store::ScopeResolutionError::WorkspaceNotFound { .. })
+            | Err(engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. }) => {
+                return Ok(unresolved_ref(reference));
+            }
+            Err(error) => return Err(Self::scope_error(error)),
+        };
+        match reference.kind() {
+            ContextKind::WikiPage | ContextKind::SessionPage => {
+                self.resolve_explicit_page_ref(reference, scope).await
+            }
+            ContextKind::Observation => {
+                self.resolve_explicit_observation_ref(reference, scope)
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_explicit_page_ref(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<ResolvedHandoffRef, McpError> {
+        let Some(revision) = reference.page_revision() else {
+            return Ok(unresolved_ref(reference));
+        };
+        let Some(path) = reference.page_path().cloned() else {
+            return Ok(unresolved_ref(reference));
+        };
+        let sources = self
+            .reader
+            .context_pages_by_ids(vec![revision])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let Some(source) = sources.into_iter().next() else {
+            return Ok(unresolved_ref(reference));
+        };
+        if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
+            return Ok(unauthorized_ref(reference));
+        }
+        if source.path != path
+            || source.workspace_name != reference.workspace()
+            || source.project_name != reference.project()
+        {
+            return Ok(unauthorized_ref(reference));
+        }
+        let kind = if source.path.as_str().starts_with("sessions/") {
+            ContextKind::SessionPage
+        } else {
+            ContextKind::WikiPage
+        };
+        if kind != reference.kind() {
+            return Ok(unresolved_ref(reference));
+        }
+        match explicit_page_candidate(reference.clone(), &source) {
+            Ok(candidate) => Ok(ResolvedHandoffRef::Candidate(candidate)),
+            Err(_) => Ok(unresolved_ref(reference)),
+        }
+    }
+
+    async fn resolve_explicit_observation_ref(
+        &self,
+        reference: ContextRef,
+        scope: engram_store::ResolvedScope,
+    ) -> Result<ResolvedHandoffRef, McpError> {
+        let Some(identity) = reference.observation_id() else {
+            return Ok(unresolved_ref(reference));
+        };
+        let sources = self
+            .reader
+            .context_observations_by_ids(vec![identity])
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let Some(source) = sources.into_iter().next() else {
+            return Ok(unresolved_ref(reference));
+        };
+        if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
+            return Ok(unauthorized_ref(reference));
+        }
+        if source.workspace_name != reference.workspace()
+            || source.project_name != reference.project()
+        {
+            return Ok(unauthorized_ref(reference));
+        }
+        match explicit_observation_candidate(reference.clone(), &source) {
+            Ok(candidate) => Ok(ResolvedHandoffRef::Candidate(candidate)),
+            Err(_) => Ok(unresolved_ref(reference)),
+        }
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -2190,7 +2443,7 @@ impl EngramServer {
 
     /// Resolve exact full evidence from a stable ContextRef.
     #[tool(
-        description = "Resolve the exact full-evidence body for a stable ContextRef returned by `memory_query`. The reference carries its context kind, workspace/project scope, stable source identity, and exact revision without exposing an absolute storage path. Reads resolve only an existing encoded scope and fail closed if the source, revision, kind, or scope does not match. Returns the exact revision and full evidence; it never mutates wiki pages."
+        description = "Resolve the exact full-evidence body for a stable ContextRef returned by `memory_query` or `memory_handoff_claim`. The reference carries its context kind, workspace/project scope, stable source identity, and exact revision without exposing an absolute storage path. Reads resolve only an existing encoded scope and fail closed if the source, revision, kind, or scope does not match. Returns the exact revision and full evidence; it never mutates wiki pages."
     )]
     async fn memory_context_read(
         &self,
@@ -2393,8 +2646,13 @@ impl EngramServer {
         continuity. Omit `work_item_id` to create a WorkItem, supplying its \
         stable `objective` and acceptance criteria. Supply `work_item_id` to \
         continue that exact non-terminal WorkItem; ownership by authenticated \
-        actor and source Run is enforced. Returns WorkItem/Handoff identities \
-        and revisions. Publishing does not claim or acknowledge the handoff.")]
+        actor and source Run is enforced. Attach a bounded `brief` and \
+        revisioned ContextRefs rather than copying canonical bodies into the \
+        operational row. ContextRefs are validated for identity, revision, \
+        existing scope, and visibility at publish time. May also carry typed \
+        ArtifactRefs and explicit WorkItem relationships. Returns WorkItem/Handoff \
+        identities and revisions. Publishing does not claim or acknowledge the \
+        handoff.")]
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
@@ -2465,6 +2723,20 @@ impl EngramServer {
             "acceptance criterion",
             "handoff acceptance criteria",
         );
+        if args.context_refs.len() > HANDOFF_LIST_MAX_ITEMS {
+            return Err(McpError::invalid_params(
+                format!("handoff context_refs exceeds {HANDOFF_LIST_MAX_ITEMS}"),
+                None,
+            ));
+        }
+        for reference in &args.context_refs {
+            self.require_publishable_context_ref(reference).await?;
+        }
+        let brief = cap_text_with_marker(
+            &s.scrub(args.brief.as_deref().unwrap_or("")),
+            HANDOFF_SUMMARY_MAX_CHARS,
+            "handoff brief",
+        );
         let handoff = NewHandoff {
             work_item_id,
             workspace_id: ws,
@@ -2486,6 +2758,8 @@ impl EngramServer {
                 HANDOFF_SUMMARY_MAX_CHARS,
                 "handoff summary",
             ),
+            brief,
+            context_refs: args.context_refs,
             open_questions,
             next_steps,
             files_touched,
@@ -2549,9 +2823,15 @@ impl EngramServer {
 
     /// Claim a handoff using optimistic concurrency and a bounded lease.
     #[tool(description = "Claim one exact Handoff with its current revision, \
-        authenticated actor, receiver Run, caller-supplied Attempt, and bounded \
-        lease. Concurrent or stale claims fail closed. Retrying an identical \
-        Attempt returns the original claim and lease without extending it.")]
+        authenticated actor, receiver Run, caller-supplied Attempt, bounded \
+        lease, and `context_budget` in the same UTF-8-byte units as \
+        `memory_query`. Concurrent or stale claims fail closed and never return \
+        a ContextPackage. A successful claim returns the continuation envelope \
+        plus the shared ContextPackage and assembly trace (explicit refs first, \
+        then retrieval candidates, brief-before-depth). Retrying an identical \
+        Attempt returns the original claim and lease without extending it, then \
+        re-assembles. Assembly never marks the Handoff accepted; if assembly \
+        fails after the claim is recorded, the claim stays live and recoverable.")]
     async fn memory_handoff_claim(
         &self,
         Parameters(args): Parameters<HandoffClaimArgs>,
@@ -2584,7 +2864,22 @@ impl EngramServer {
             .claim_handoff(claim)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&claimed)
+        match self
+            .assemble_handoff_claim_context(
+                &claimed.handoff,
+                args.context_budget,
+                args.context_quotas,
+                args.already_used_context,
+            )
+            .await
+        {
+            Ok(assembled) => ok_json(&HandoffClaimEnvelope {
+                claimed,
+                package: assembled.package,
+                trace: assembled.trace,
+            }),
+            Err(error) => Err(assembly_failed_after_claim(&claimed, error)),
+        }
     }
 
     /// Release a live claim back to the open state.
@@ -3151,6 +3446,97 @@ struct ContextCandidateParts<'a> {
     body: &'a str,
 }
 
+enum ResolvedHandoffRef {
+    Candidate(ContextCandidate),
+    Omission(AssemblyOmission),
+}
+
+fn unresolved_ref(context_ref: ContextRef) -> ResolvedHandoffRef {
+    ResolvedHandoffRef::Omission(AssemblyOmission {
+        context_ref,
+        reason: AssemblyOmissionReason::UnresolvedContextRef,
+    })
+}
+
+fn unauthorized_ref(context_ref: ContextRef) -> ResolvedHandoffRef {
+    ResolvedHandoffRef::Omission(AssemblyOmission {
+        context_ref,
+        reason: AssemblyOmissionReason::UnauthorizedContextRef,
+    })
+}
+
+fn context_ref_omission_label(reason: AssemblyOmissionReason) -> &'static str {
+    match reason {
+        AssemblyOmissionReason::UnauthorizedContextRef => {
+            "unauthorized in its encoded scope (no silent scope substitution)"
+        }
+        AssemblyOmissionReason::UnresolvedContextRef => {
+            "missing, deleted, or stale in its encoded scope"
+        }
+        _ => "unresolved",
+    }
+}
+
+fn assembly_failed_after_claim(claimed: &HandoffClaimResult, error: McpError) -> McpError {
+    McpError::internal_error(
+        format!(
+            "handoff claimed but context assembly failed: {error}; \
+             claim remains live until release or lease expiry; \
+             handoff_id={} revision={} claim_id={} lease_expires_at={}",
+            claimed.handoff_id, claimed.revision, claimed.claim_id, claimed.lease_expires_at
+        ),
+        None,
+    )
+}
+
+fn handoff_retrieval_query(handoff: &Handoff) -> String {
+    let questions = handoff.open_questions.join(" ");
+    let steps = handoff.next_steps.join(" ");
+    let raw = [
+        handoff.brief.as_str(),
+        handoff.summary.as_str(),
+        &questions,
+        &steps,
+    ]
+    .into_iter()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+    prepare_fts5_query(&raw)
+}
+
+fn explicit_page_candidate(
+    context_ref: ContextRef,
+    source: &engram_store::PageContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: "",
+        score: -1.0,
+        deduplication_key: format!("sha256:{}", source.body_sha256),
+        retrieval_sources: vec!["handoff_explicit_ref".into()],
+        selection_reason: "handoff_explicit_ref",
+        body: &source.body,
+    }))
+}
+
+fn explicit_observation_candidate(
+    context_ref: ContextRef,
+    source: &engram_store::ObservationContextSource,
+) -> Result<ContextCandidate, engram_core::ContextRefError> {
+    Ok(context_candidate(ContextCandidateParts {
+        context_ref,
+        title: &source.title,
+        snippet: "",
+        score: -1.0,
+        deduplication_key: format!("sha256:{:x}", Sha256::digest(source.body.as_bytes())),
+        retrieval_sources: vec!["handoff_explicit_ref".into()],
+        selection_reason: "handoff_explicit_ref",
+        body: &source.body,
+    }))
+}
+
 fn context_candidate(parts: ContextCandidateParts<'_>) -> ContextCandidate {
     let clean_snippet = clean_search_snippet(parts.snippet);
     ContextCandidate {
@@ -3425,10 +3811,11 @@ fn test_parts_default() -> axum::http::request::Parts {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::str::FromStr;
 
     use engram_core::{
-        ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
-        PagePath, Tier,
+        ActorContext, AttemptId, AuthLevel, HandoffClaim, HandoffRelease, NewObservation, NewPage,
+        NewSession, NewUser, ObservationKind, PagePath, SessionId, Tier,
     };
     use engram_store::Store;
     use engram_wiki::{Wiki, WritePageRequest};
@@ -3727,6 +4114,12 @@ mod tests {
                     && lower.contains("acknowledgement")
                     && lower.contains("completion"),
                 "{label} must teach the recoverable claim/checkpoint lifecycle"
+            );
+            assert!(
+                prompt.contains("ContextPackage")
+                    && prompt.contains("context_budget")
+                    && prompt.contains("memory_handoff_claim"),
+                "{label} must share the ContextPackage contract on handoff claim"
             );
         });
     }
@@ -4343,6 +4736,545 @@ mod tests {
             text.contains("Sibling Note"),
             "project-only read must return the written page:\n{text}"
         );
+    }
+
+    async fn publish_page(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &str,
+        title: &str,
+        body: &str,
+    ) -> ContextRef {
+        let id = store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                title: title.into(),
+                body: body.into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let workspace = store
+            .reader
+            .workspace_name_by_id(ws)
+            .await
+            .unwrap()
+            .unwrap();
+        let project = store
+            .reader
+            .project_name_by_id(ws, proj)
+            .await
+            .unwrap()
+            .unwrap();
+        ContextRef::page(workspace, project, PagePath::new(path).unwrap(), id).unwrap()
+    }
+
+    fn claim_args(
+        handoff_id: &str,
+        run_id: SessionId,
+        expected_revision: u64,
+        budget: usize,
+    ) -> HandoffClaimArgs {
+        HandoffClaimArgs {
+            handoff_id: handoff_id.to_string(),
+            expected_revision,
+            run_id: run_id.to_string(),
+            attempt_id: AttemptId::new().to_string(),
+            context_budget: budget,
+            context_quotas: None,
+            already_used_context: Vec::new(),
+            lease_seconds: Some(30),
+            project: None,
+            workspace: None,
+        }
+    }
+
+    /// Issue #44 tracer 1: publish refs + brief, claim a budgeted package,
+    /// then resolve full evidence on demand. No LLM provider is configured.
+    #[tokio::test]
+    async fn handoff_claim_assembles_brief_first_package_without_copying_canonical_body() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let body = "CANONICAL_EVIDENCE_BODY ".repeat(80);
+        let context_ref =
+            publish_page(&store, ws, proj, "notes/evidence.md", "Evidence", &body).await;
+        let source_run = SessionId::new();
+        let published = call_tool_json(
+            server
+                .memory_handoff_begin(
+                    Parameters(HandoffBeginArgs {
+                        work_item_id: None,
+                        run_id: source_run.to_string(),
+                        objective: Some("Continue the evidence task".into()),
+                        acceptance_criteria: vec!["package stays budgeted".into()],
+                        summary: "Leave a compact continuation.".into(),
+                        brief: Some("Brief-first continuation for the receiver.".into()),
+                        context_refs: vec![context_ref.clone()],
+                        open_questions: vec!["What remains?".into()],
+                        next_steps: vec!["Read the evidence".into()],
+                        files_touched: vec![],
+                        artifacts: vec![],
+                        relationships: vec![],
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let handoff_id = published["handoff_id"].as_str().unwrap().to_string();
+        let stored = store
+            .reader
+            .handoff_by_id(HandoffId::from_str(&handoff_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.context_refs, vec![context_ref.clone()]);
+        assert!(stored.brief.contains("Brief-first"));
+        assert!(
+            !stored.brief.contains("CANONICAL_EVIDENCE_BODY")
+                && !stored.summary.contains("CANONICAL_EVIDENCE_BODY")
+                && serde_json::to_string(&stored.context_refs)
+                    .unwrap()
+                    .contains("engram-context-v1."),
+            "canonical body must stay out of the operational Handoff row: {stored:?}"
+        );
+
+        let claimed = call_tool_json(
+            server
+                .memory_handoff_claim(
+                    Parameters(claim_args(&handoff_id, SessionId::new(), 1, 180)),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(claimed["handoff"]["state"], "claimed");
+        assert_ne!(claimed["handoff"]["state"], "acknowledged");
+        assert!(claimed.get("package").is_some(), "{claimed}");
+        assert!(claimed.get("trace").is_some(), "{claimed}");
+        let entries = claimed["package"]["entries"].as_array().unwrap();
+        assert!(
+            entries.iter().any(|entry| {
+                entry["selection_reason"] == "handoff_explicit_ref"
+                    && entry["detail_tier"] != "full_evidence"
+                    && entry["context_ref"] == serde_json::to_value(&context_ref).unwrap()
+                    && !entry["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("CANONICAL_EVIDENCE_BODY")
+            }),
+            "claim package must give explicit-ref brief coverage before full evidence: {claimed}"
+        );
+        let evidence = call_tool_json(
+            server
+                .memory_context_read(
+                    Parameters(ReadContextArgs {
+                        context_ref: context_ref.clone(),
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            evidence["full_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("CANONICAL_EVIDENCE_BODY")
+        );
+    }
+
+    /// Issue #44 tracer 2: stale/deleted/unauthorized refs stay bounded and
+    /// never substitute another scope's body.
+    #[tokio::test]
+    async fn handoff_claim_reports_unresolved_refs_without_crossing_scope() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let local_ref = publish_page(
+            &store,
+            ws,
+            proj,
+            "notes/local.md",
+            "Local",
+            "local-only evidence",
+        )
+        .await;
+        let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+        let other_proj = store
+            .writer
+            .get_or_create_project(other_ws, "scratch", None)
+            .await
+            .unwrap();
+        publish_page(
+            &store,
+            other_ws,
+            other_proj,
+            "notes/local.md",
+            "Foreign",
+            "must-never-leak-across-scope",
+        )
+        .await;
+        let stolen = ContextRef::page(
+            "other",
+            "scratch",
+            local_ref.page_path().unwrap().clone(),
+            local_ref.page_revision().unwrap(),
+        )
+        .unwrap();
+        let begin_err = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    work_item_id: None,
+                    run_id: SessionId::new().to_string(),
+                    objective: Some("Reject unauthorized refs".into()),
+                    acceptance_criteria: vec![],
+                    summary: "Should fail closed.".into(),
+                    brief: None,
+                    context_refs: vec![stolen],
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    artifacts: vec![],
+                    relationships: vec![],
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("publish must reject unauthorized ContextRefs");
+        assert!(
+            begin_err
+                .to_string()
+                .contains("unauthorized in its encoded scope"),
+            "{begin_err}"
+        );
+
+        let source_run = SessionId::new();
+        let published = call_tool_json(
+            server
+                .memory_handoff_begin(
+                    Parameters(HandoffBeginArgs {
+                        work_item_id: None,
+                        run_id: source_run.to_string(),
+                        objective: Some("Recover after deletion".into()),
+                        acceptance_criteria: vec![],
+                        summary: "Valid at publish.".into(),
+                        brief: Some("Keep the locator, not the body.".into()),
+                        context_refs: vec![local_ref.clone()],
+                        open_questions: vec![],
+                        next_steps: vec![],
+                        files_touched: vec![],
+                        artifacts: vec![],
+                        relationships: vec![],
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("notes/local.md").unwrap())
+            .await
+            .unwrap();
+        let claimed = call_tool_json(
+            server
+                .memory_handoff_claim(
+                    Parameters(claim_args(
+                        published["handoff_id"].as_str().unwrap(),
+                        SessionId::new(),
+                        1,
+                        4_096,
+                    )),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let omissions = claimed["trace"]["omissions"].as_array().unwrap();
+        assert!(
+            omissions.iter().any(|omission| {
+                omission["context_ref"] == serde_json::to_value(&local_ref).unwrap()
+                    && omission["reason"] == "unresolved_context_ref"
+            }),
+            "deleted ContextRef must be an explicit bounded diagnostic: {claimed}"
+        );
+        let package_text = claimed.to_string();
+        assert!(
+            !package_text.contains("must-never-leak-across-scope"),
+            "missing refs must not be replaced by another scope: {claimed}"
+        );
+    }
+
+    /// Issue #44 tracer 3: small budgets truncate or omit oversized evidence.
+    #[tokio::test]
+    async fn handoff_claim_small_budget_truncates_or_omits_oversized_evidence() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let huge = "OVERSIZED_EVIDENCE_".repeat(200);
+        let context_ref = publish_page(
+            &store,
+            ws,
+            proj,
+            "notes/huge.md",
+            &"OVERSIZED_TITLE_".repeat(12),
+            &huge,
+        )
+        .await;
+        let published = call_tool_json(
+            server
+                .memory_handoff_begin(
+                    Parameters(HandoffBeginArgs {
+                        work_item_id: None,
+                        run_id: SessionId::new().to_string(),
+                        objective: Some("Fit a tiny budget".into()),
+                        acceptance_criteria: vec![],
+                        summary: "Huge evidence stays referenced.".into(),
+                        brief: Some("Tiny budget.".into()),
+                        context_refs: vec![context_ref],
+                        open_questions: vec![],
+                        next_steps: vec![],
+                        files_touched: vec![],
+                        artifacts: vec![],
+                        relationships: vec![],
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let claimed = call_tool_json(
+            server
+                .memory_handoff_claim(
+                    Parameters(claim_args(
+                        published["handoff_id"].as_str().unwrap(),
+                        SessionId::new(),
+                        1,
+                        24,
+                    )),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            claimed["package"]["estimated_consumption"]
+                .as_u64()
+                .unwrap()
+                <= 24
+        );
+        let truncated = claimed["package"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["truncation"] == "truncated");
+        let omitted = claimed["trace"]["omissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|omission| {
+                omission["reason"] == "oversized" || omission["reason"] == "budget_exhausted"
+            });
+        assert!(
+            truncated || omitted,
+            "small budget must truncate or omit oversized evidence: {claimed}"
+        );
+    }
+
+    /// Issue #44 tracer 4: assembly failure after CAS still leaves one live
+    /// claim that can be released; a second receiver cannot occupy it.
+    #[tokio::test]
+    async fn assembly_failure_after_claim_keeps_live_lease_without_second_owner() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let source_run = SessionId::new();
+        let published = store
+            .writer
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: source_run,
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "anonymous".into(),
+                to_agent: None,
+                cwd: None,
+                objective: "Survive assembly failure".into(),
+                acceptance_criteria: vec![],
+                summary: "Claim is recorded before assembly.".into(),
+                brief: String::new(),
+                context_refs: vec![],
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
+            })
+            .await
+            .unwrap();
+        let receiver = SessionId::new();
+        let claimed = store
+            .writer
+            .claim_handoff(HandoffClaim {
+                handoff_id: published.handoff_id,
+                workspace_id: ws,
+                project_id: proj,
+                expected_revision: 1,
+                run_id: receiver,
+                attempt_id: AttemptId::new(),
+                actor_key: "anonymous".into(),
+                lease_seconds: 30,
+            })
+            .await
+            .unwrap();
+        let failed = assembly_failed_after_claim(
+            &claimed,
+            McpError::internal_error("injected assembly failure", None),
+        );
+        let failed = failed.to_string();
+        assert!(failed.contains("handoff claimed but context assembly failed"));
+        assert!(!failed.contains("\"package\""));
+        assert!(failed.contains(&claimed.claim_id.to_string()));
+
+        let discovered = call_tool_json(
+            server
+                .memory_handoff_discover(
+                    Parameters(HandoffDiscoverArgs {
+                        cwd: None,
+                        include_claimed: true,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(discovered["handoff"]["state"], "claimed");
+        assert_eq!(
+            discovered["handoff"]["id"],
+            published.handoff_id.to_string()
+        );
+
+        let second = server
+            .memory_handoff_claim(
+                Parameters(claim_args(
+                    &published.handoff_id.to_string(),
+                    SessionId::new(),
+                    1,
+                    4_096,
+                )),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("a second receiver must not obtain the live claim");
+        let second = second.to_string();
+        assert!(
+            second.contains("stale handoff revision")
+                || second.contains("already has a live claim"),
+            "{second}"
+        );
+        assert!(!second.contains("\"package\""));
+
+        store
+            .writer
+            .release_handoff(HandoffRelease {
+                handoff_id: published.handoff_id,
+                claim_id: claimed.claim_id,
+                workspace_id: ws,
+                project_id: proj,
+                expected_revision: claimed.revision,
+                run_id: receiver,
+                attempt_id: AttemptId::new(),
+                actor_key: "anonymous".into(),
+            })
+            .await
+            .unwrap();
+        let recovered = call_tool_json(
+            server
+                .memory_handoff_claim(
+                    Parameters(claim_args(
+                        &published.handoff_id.to_string(),
+                        SessionId::new(),
+                        claimed.revision + 1,
+                        4_096,
+                    )),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(recovered["handoff"]["state"], "claimed");
+        assert!(recovered.get("package").is_some());
+    }
+
+    /// Issue #44 tracer 5: concurrent-style sequential CAS still yields one
+    /// owner; only the winner receives a ContextPackage.
+    #[tokio::test]
+    async fn concurrent_claim_winner_alone_receives_context_package() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let published = call_tool_json(
+            server
+                .memory_handoff_begin(
+                    Parameters(HandoffBeginArgs {
+                        work_item_id: None,
+                        run_id: SessionId::new().to_string(),
+                        objective: Some("One owner".into()),
+                        acceptance_criteria: vec![],
+                        summary: "Exactly one claim succeeds.".into(),
+                        brief: None,
+                        context_refs: vec![],
+                        open_questions: vec![],
+                        next_steps: vec![],
+                        files_touched: vec![],
+                        artifacts: vec![],
+                        relationships: vec![],
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let handoff_id = published["handoff_id"].as_str().unwrap().to_string();
+        let winner = call_tool_json(
+            server
+                .memory_handoff_claim(
+                    Parameters(claim_args(&handoff_id, SessionId::new(), 1, 4_096)),
+                    rmcp::handler::server::tool::Extension(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(winner.get("package").is_some(), "{winner}");
+        let loser = server
+            .memory_handoff_claim(
+                Parameters(claim_args(&handoff_id, SessionId::new(), 1, 4_096)),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("second same-revision claim must fail closed");
+        let loser = loser.to_string();
+        assert!(loser.contains("stale handoff revision"), "{loser}");
+        assert!(!loser.contains("\"package\""));
     }
 
     #[tokio::test]
@@ -6114,6 +7046,8 @@ mod tests {
                     objective: Some("fix omp CHECK".into()),
                     acceptance_criteria: vec![],
                     summary: "fix omp CHECK".into(),
+                    brief: None,
+                    context_refs: vec![],
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],

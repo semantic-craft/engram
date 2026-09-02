@@ -163,6 +163,12 @@ pub enum AssemblyOmissionReason {
     BudgetExhausted,
     /// Candidate larger than total budget.
     Oversized,
+    /// Explicit ContextRef is missing, deleted, or revision-stale in its
+    /// encoded existing scope.
+    UnresolvedContextRef,
+    /// Explicit ContextRef's encoded scope does not own the source. Another
+    /// scope was not substituted.
+    UnauthorizedContextRef,
 }
 
 /// Content-free omission marker.

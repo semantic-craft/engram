@@ -2537,7 +2537,7 @@ impl ReaderPool {
                 "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                         from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                         files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                        acknowledged_by_session \
+                        acknowledged_by_session, brief, context_refs \
                  FROM handoffs h \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND (state = 'open' OR (state = 'claimed' AND \
@@ -2577,7 +2577,7 @@ impl ReaderPool {
                     "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                             from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                             files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                            acknowledged_by_session \
+                            acknowledged_by_session, brief, context_refs \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
@@ -3052,7 +3052,7 @@ impl ReaderPool {
                     "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                             from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                             files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                            acknowledged_by_session \
+                            acknowledged_by_session, brief, context_refs \
                      FROM handoffs \
                      WHERE workspace_id = ?1 AND state = 'open' \
                      ORDER BY created_at DESC LIMIT 1",
@@ -5771,6 +5771,8 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let acknowledged_by: Option<String> = row.get(17)?;
     let acknowledged_at_us: Option<i64> = row.get(18)?;
     let acknowledged_by_session_bytes: Option<Vec<u8>> = row.get(19)?;
+    let brief: String = row.get(20)?;
+    let context_refs_json: String = row.get(21)?;
     Ok(materialise_handoff(
         id_bytes,
         work_item_bytes,
@@ -5783,6 +5785,8 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
         to_agent,
         cwd,
         summary,
+        brief,
+        context_refs_json,
         open_q_json,
         next_s_json,
         files_json,
@@ -5808,6 +5812,8 @@ fn materialise_handoff(
     to_agent: Option<String>,
     cwd: Option<String>,
     summary: String,
+    brief: String,
+    context_refs_json: String,
     open_q_json: String,
     next_s_json: String,
     files_json: String,
@@ -5841,6 +5847,8 @@ fn materialise_handoff(
         to_agent: to_agent.as_deref().map(parse_agent),
         cwd,
         summary,
+        brief,
+        context_refs: serde_json::from_str(&context_refs_json)?,
         open_questions,
         next_steps,
         files_touched,
@@ -6424,6 +6432,8 @@ mod tests {
             to_agent: None,
             cwd: cwd.map(str::to_string),
             summary: summary.to_string(),
+            brief: summary.to_string(),
+            context_refs: vec![],
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
@@ -6634,6 +6644,8 @@ mod tests {
                 objective: "wrong workspace".into(),
                 acceptance_criteria: vec![],
                 summary: "wrong workspace".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
@@ -6657,6 +6669,8 @@ mod tests {
                 objective: "right project".into(),
                 acceptance_criteria: vec![],
                 summary: "right project".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],

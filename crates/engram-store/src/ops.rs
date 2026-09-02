@@ -24,6 +24,9 @@ use crate::artifacts::{
 };
 use crate::error::{StoreError, StoreResult};
 
+/// Upper bound on revisioned ContextRefs stored on one Handoff row.
+const HANDOFF_CONTEXT_REFS_MAX: usize = 32;
+
 /// Summary returned by [`reorg_sessions`] and exposed via
 /// [`crate::writer::WriterHandle::reorg_sessions`].
 #[derive(Debug, Default, Clone)]
@@ -1115,6 +1118,17 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
     };
 
     let id = HandoffId::new();
+    if h.context_refs.len() > HANDOFF_CONTEXT_REFS_MAX {
+        return Err(StoreError::InvalidState(format!(
+            "handoff context_refs exceeds {HANDOFF_CONTEXT_REFS_MAX}"
+        )));
+    }
+    let brief = if h.brief.trim().is_empty() {
+        h.summary.clone()
+    } else {
+        h.brief.clone()
+    };
+    let context_refs = serde_json::to_string(&h.context_refs)?;
     let open_q = serde_json::to_string(&h.open_questions)?;
     let next_s = serde_json::to_string(&h.next_steps)?;
     let files = serde_json::to_string(&h.files_touched)?;
@@ -1139,8 +1153,8 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         "INSERT INTO handoffs \
          (id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, from_agent, \
           source_actor, to_agent, cwd, summary, open_questions, next_steps, files_touched, state, \
-          revision, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'open', 1, ?15)",
+          revision, created_at, brief, context_refs) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'open', 1, ?15, ?16, ?17)",
         params![
             id.as_bytes(),
             work_item_id.as_bytes(),
@@ -1157,6 +1171,8 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
             next_s,
             files,
             now,
+            brief,
+            context_refs,
         ],
     )?;
     let artifacts = persist_artifacts(
@@ -2223,7 +2239,7 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
             "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                 from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                 files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                acknowledged_by_session FROM handoffs WHERE id = ?1",
+                acknowledged_by_session, brief, context_refs FROM handoffs WHERE id = ?1",
             params![handoff_id.as_bytes()],
             |row| {
                 Ok((
@@ -2247,6 +2263,8 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, Option<i64>>(18)?,
                     row.get::<_, Option<Vec<u8>>>(19)?,
+                    row.get::<_, String>(20)?,
+                    row.get::<_, String>(21)?,
                 ))
             },
         )
@@ -2272,6 +2290,8 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
         acknowledged_by,
         acknowledged_at,
         acknowledged_by_session,
+        brief,
+        context_refs,
     )) = row
     else {
         return Ok(None);
@@ -2291,6 +2311,8 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
         to_agent: to_agent.map(|value| engram_core::AgentKind::from_wire(&value)),
         cwd,
         summary,
+        brief,
+        context_refs: serde_json::from_str(&context_refs)?,
         open_questions: serde_json::from_str(&open_questions)?,
         next_steps: serde_json::from_str(&next_steps)?,
         files_touched: serde_json::from_str(&files_touched)?,
@@ -3690,6 +3712,8 @@ mod tests {
                 objective: "Move continuity state with its project".into(),
                 acceptance_criteria: vec![],
                 summary: "continuity row".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
@@ -4430,6 +4454,8 @@ mod tests {
                 objective: "standalone".into(),
                 acceptance_criteria: vec![],
                 summary: "standalone".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
@@ -4577,6 +4603,8 @@ mod tests {
             objective: "stale".into(),
             acceptance_criteria: vec![],
             summary: "stale".into(),
+            brief: String::new(),
+            context_refs: vec![],
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],

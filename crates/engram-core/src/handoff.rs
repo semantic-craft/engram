@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AgentKind;
 use crate::artifact::{ArtifactInput, ArtifactRef};
+use crate::context::ContextRef;
 use crate::ids::{
     AttemptId, CheckpointId, ClaimId, HandoffId, ProjectId, SessionId, WorkItemId, WorkspaceId,
 };
@@ -145,6 +146,13 @@ pub struct NewHandoff {
     pub objective: String,
     pub acceptance_criteria: Vec<String>,
     pub summary: String,
+    /// Bounded continuation brief stored on the Handoff. Empty means the
+    /// publisher omitted a distinct brief; persist `summary` instead. Never a
+    /// copy of a referenced canonical page body.
+    pub brief: String,
+    /// Revisioned locators for canonical or derived evidence. Bodies stay in
+    /// their source rows and are assembled at claim time.
+    pub context_refs: Vec<ContextRef>,
     pub open_questions: Vec<String>,
     pub next_steps: Vec<String>,
     pub files_touched: Vec<String>,
@@ -168,6 +176,10 @@ pub struct Handoff {
     pub to_agent: Option<AgentKind>,
     pub cwd: Option<String>,
     pub summary: String,
+    /// Bounded continuation brief. Distinct from referenced canonical bodies.
+    pub brief: String,
+    /// Revisioned evidence locators published with this transfer.
+    pub context_refs: Vec<ContextRef>,
     pub open_questions: Vec<String>,
     pub next_steps: Vec<String>,
     pub files_touched: Vec<String>,

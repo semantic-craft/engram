@@ -335,6 +335,51 @@ mod tests {
         assert_eq!(applied, 1);
     }
 
+    /// Issue #44 stores bounded briefs and revisioned ContextRefs on Handoffs.
+    /// V103 (ArtifactRefs, #42) is already on main; this layer is V104 and must
+    /// not invent a V105 that would slot ahead of an unreleased V104.
+    #[test]
+    fn v104_adds_handoff_context_columns_after_v103() {
+        let versions: Vec<u32> = migrations::runner()
+            .get_migrations()
+            .iter()
+            .map(Migration::version)
+            .collect();
+        assert!(
+            versions.contains(&103),
+            "V103 ArtifactRefs must remain embedded"
+        );
+        assert!(versions.contains(&104), "issue #44 must embed V104");
+        assert!(
+            !versions.contains(&105),
+            "do not invent V105 ahead of unreleased V104"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("memory.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 103).unwrap();
+        run(&mut conn).expect("V104 must apply after V103");
+        let cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('handoffs') \
+                 WHERE name IN ('brief', 'context_refs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 2);
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 104",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        run(&mut conn).expect("V104 must be idempotent on reopen");
+    }
+
     /// Tripwire for the incident class itself: every embedded migration
     /// numbered below the released high-water mark must be part of a shipped
     /// release. A new migration slotted into a historical gap (the V28

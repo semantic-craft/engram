@@ -124,7 +124,9 @@ priors are at the [bottom](#influences-and-prior-art).
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, artifact evidence, and a session summary. Grok
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
-  `memory_handoff_discover`, then claim the exact revision before resuming.
+  `memory_handoff_discover`, then claim the exact revision with a
+  `context_budget` before resuming. The claim returns the same ContextPackage
+  contract as `memory_query`; use `memory_context_read` for exact full evidence.
 - **"What did we decide about X six weeks ago?"** Type
   `memory_query` with the question and a context budget from the agent (or
   `engram search X` from a terminal). Existing FTS/vector/link retrieval feeds

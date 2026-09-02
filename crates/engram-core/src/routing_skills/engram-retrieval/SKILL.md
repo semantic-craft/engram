@@ -10,8 +10,8 @@ Use this skill for read-only engram lookups, catch-up, and applying remembered p
 
 ## Tools in this cluster
 
-- `memory_query` searches existing FTS/vector/link candidates and assembles them into a caller-budgeted ContextPackage with stable ContextRefs and a decision trace. Always pass `context_budget`; its deterministic unit is selected-content UTF-8 bytes.
-- `memory_context_read` resolves one returned ContextRef to the exact full-evidence source revision.
+- `memory_query` searches existing FTS/vector/link candidates and assembles them into a caller-budgeted ContextPackage with stable ContextRefs and a decision trace. Always pass `context_budget`; its deterministic unit is selected-content UTF-8 bytes. Claimed continuations reuse this same package contract.
+- `memory_context_read` resolves one ContextRef from a budgeted package to the exact full-evidence source revision.
 - `memory_recent` lists the most recently updated pages when the user wants a light activity check.
 - `memory_read_page` fetches a full page body after a search hit or direct path lookup.
 - `memory_status` reports whether engram is healthy and how large the knowledge base is.
