@@ -61,6 +61,10 @@ below start from the fork.
   explicit budgets and maps navigable page entries from the package instead of
   parsing the removed flat hit arrays.
 
+- Replaced the geometric `e` / node-mark branding with the original Paper
+  Muse spark across the README, embedded web UI and favicon, and Tauri desktop
+  bundles. The canonical SVG and its MIT provenance are preserved in `docs/`.
+
 ## Desktop 0.2.0 - 2026-08-01
 
 ### Added

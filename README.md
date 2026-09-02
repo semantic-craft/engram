@@ -1,5 +1,9 @@
 # Engram
 
+<p align="center">
+  <img src="docs/logo.png" width="160" height="160" alt="Engram spark logo">
+</p>
+
 > Long-term memory for AI coding agents — engine + desktop workbench.
 > Quit Claude Code mid-task, start OpenAI Codex in the same directory,
 > continue without re-explaining the architecture, the failed
@@ -18,6 +22,10 @@ the source of truth — and adds a first-class desktop app
 actually browse, search in natural language, and edit. Upstream
 changelog up to the fork point is preserved verbatim in
 [`docs/upstream-changelog.md`](docs/upstream-changelog.md).
+
+The Engram spark logo is preserved from the original Paper Muse artwork; its
+source and license provenance are recorded in
+[`docs/logo-NOTICE.md`](docs/logo-NOTICE.md).
 
 ## Support Matrix
 
