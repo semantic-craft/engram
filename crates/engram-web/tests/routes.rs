@@ -50,6 +50,8 @@ fn new_handoff(
 ) -> NewHandoff {
     NewHandoff {
         work_item_id: None,
+        expected_work_item_revision: None,
+        expected_checkpoint_revision: None,
         workspace_id: ws,
         project_id: proj,
         from_session_id: None,
@@ -1319,6 +1321,10 @@ async fn api_workspace_overview_includes_open_handoff() {
     store
         .writer
         .publish_handoff(NewHandoff {
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            brief: String::new(),
+            context_refs: Vec::new(),
             open_questions: vec!["open_question_marker".into()],
             next_steps: vec!["next_step_marker".into()],
             ..new_handoff(
@@ -2209,7 +2215,7 @@ async fn api_sessions_lists_timeline_with_counts() {
 }
 
 #[tokio::test]
-async fn api_handoffs_lists_open_and_expired_history() {
+async fn api_handoffs_lists_open_and_cancelled_history() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -2226,6 +2232,10 @@ async fn api_handoffs_lists_open_and_expired_history() {
     let first = store
         .writer
         .publish_handoff(NewHandoff {
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            brief: String::new(),
+            context_refs: Vec::new(),
             source_run_id: first_run,
             ..new_handoff(ws, proj, AgentKind::ClaudeCode, None, "first handoff")
         })
@@ -2244,6 +2254,7 @@ async fn api_handoffs_lists_open_and_expired_history() {
         .unwrap();
     // Cancel the first one so the read-only history covers a terminal
     // Handoff state without reviving the removed accept-on-read path.
+    // Cancellation is its own state, distinct from a lapsed offer.
     store
         .writer
         .cancel_handoff(HandoffCancel {
@@ -2270,15 +2281,16 @@ async fn api_handoffs_lists_open_and_expired_history() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 2, "expired handoffs stay in history: {json}");
+    assert_eq!(rows.len(), 2, "cancelled handoffs stay in history: {json}");
 
-    let expired = rows
+    let cancelled = rows
         .iter()
         .find(|h| h["summary"] == "first handoff")
         .expect("first handoff present");
-    assert_eq!(expired["state"], "expired");
-    assert_eq!(expired["revision"], 2);
-    assert!(expired["acknowledged_at"].is_null());
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["revision"], 2);
+    assert!(cancelled["acknowledged_at"].is_null());
+    assert!(cancelled["superseded_by_handoff_id"].is_null());
 
     let open = rows
         .iter()

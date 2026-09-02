@@ -66,6 +66,13 @@ impl std::str::FromStr for WorkItemState {
 
 /// State of a transfer offer. `Acknowledged` means the claimant persisted its
 /// first receiving checkpoint; it says nothing about WorkItem completion.
+///
+/// `Acknowledged`, `Expired`, `Cancelled`, and `Superseded` are terminal and
+/// immutable: a transfer that reached one of them stays readable as history and
+/// is never revived. The four ways a transfer can end are distinct on purpose —
+/// `Cancelled` is the source owner discarding its own offer, `Expired` is the
+/// offer lapsing, `Superseded` is a successor replacing an unclaimed offer, and
+/// a released Claim returns the transfer to `Open` rather than ending it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffState {
@@ -73,6 +80,8 @@ pub enum HandoffState {
     Claimed,
     Acknowledged,
     Expired,
+    Cancelled,
+    Superseded,
 }
 
 impl HandoffState {
@@ -83,6 +92,8 @@ impl HandoffState {
             Self::Claimed => "claimed",
             Self::Acknowledged => "acknowledged",
             Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -96,6 +107,8 @@ impl std::str::FromStr for HandoffState {
             "claimed" => Ok(Self::Claimed),
             "acknowledged" => Ok(Self::Acknowledged),
             "expired" => Ok(Self::Expired),
+            "cancelled" => Ok(Self::Cancelled),
+            "superseded" => Ok(Self::Superseded),
             other => Err(crate::MemoryError::MalformedRecord(format!(
                 "unknown handoff state: {other}"
             ))),
@@ -130,11 +143,21 @@ pub struct WorkItem {
     pub child_results: Vec<ParentResult>,
 }
 
-/// Publish input. `work_item_id = None` creates a new WorkItem; `Some` appends
-/// a transfer offer to that exact existing WorkItem.
+/// Publish input. `work_item_id = None` creates a new WorkItem; `Some`
+/// publishes a successor transfer for that exact existing WorkItem.
+///
+/// A successor asserts the state it was constructed from:
+/// `expected_work_item_revision` is required, and
+/// `expected_checkpoint_revision` must equal the `work_item_revision` of the
+/// WorkItem's latest Checkpoint (or be absent when it has none). Either being
+/// stale is a conflict that mutates nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewHandoff {
     pub work_item_id: Option<WorkItemId>,
+    #[serde(default)]
+    pub expected_work_item_revision: Option<u64>,
+    #[serde(default)]
+    pub expected_checkpoint_revision: Option<u64>,
     pub workspace_id: WorkspaceId,
     pub project_id: ProjectId,
     pub from_session_id: Option<SessionId>,
@@ -196,8 +219,72 @@ pub struct Handoff {
     pub acknowledged_by: Option<String>,
     pub acknowledged_at: Option<Timestamp>,
     pub acknowledged_by_session: Option<SessionId>,
+    /// The transfer this one continues, when it is not the first.
+    #[serde(default)]
+    pub predecessor_handoff_id: Option<HandoffId>,
+    /// Exact Checkpoint this successor was constructed from.
+    #[serde(default)]
+    pub source_checkpoint_id: Option<CheckpointId>,
+    /// `work_item_revision` of [`Self::source_checkpoint_id`].
+    #[serde(default)]
+    pub source_checkpoint_revision: Option<u64>,
+    /// Set on a still-unclaimed transfer that a successor replaced.
+    #[serde(default)]
+    pub superseded_by_handoff_id: Option<HandoffId>,
+    #[serde(default)]
+    pub superseded_at: Option<Timestamp>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
+}
+
+/// The durable progress fact a successor is published from.
+///
+/// Carries the acceptance-criterion status a receiver needs to see what is
+/// still outstanding, plus the exact `work_item_revision` that
+/// `NewHandoff::expected_checkpoint_revision` must assert. Large canonical
+/// bodies stay in the wiki; this is the envelope, not the evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub id: CheckpointId,
+    pub work_item_id: WorkItemId,
+    pub sequence: u64,
+    pub work_item_revision: u64,
+    pub work_item_state: WorkItemState,
+    pub summary: String,
+    pub acceptance_criteria: Vec<AcceptanceCriterionStatus>,
+    pub actor_key: String,
+    pub run_id: SessionId,
+    pub handoff_id: Option<HandoffId>,
+    pub created_at: Timestamp,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRef>,
+}
+
+/// One transfer in a WorkItem's ordered predecessor-to-successor chain.
+///
+/// Provenance keeps the dimensions apart: `source_actor` is the authenticated
+/// publisher, `source_run_id` its Run, `from_agent` the execution agent,
+/// `to_agent` the target selector, and the `receiving_*` fields the claimant
+/// that took the transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffChainEntry {
+    pub handoff_id: HandoffId,
+    pub state: HandoffState,
+    pub revision: u64,
+    pub created_at: Timestamp,
+    pub predecessor_handoff_id: Option<HandoffId>,
+    pub superseded_by_handoff_id: Option<HandoffId>,
+    pub source_checkpoint_id: Option<CheckpointId>,
+    pub source_checkpoint_revision: Option<u64>,
+    pub source_actor: String,
+    pub source_run_id: SessionId,
+    pub source_session_id: Option<SessionId>,
+    pub from_agent: AgentKind,
+    pub to_agent: Option<AgentKind>,
+    pub receiving_actor: Option<String>,
+    pub receiving_run_id: Option<SessionId>,
+    pub receiving_claim_state: Option<String>,
+    pub acknowledged_at: Option<Timestamp>,
 }
 
 /// Result of publishing a new transfer offer.
@@ -207,6 +294,15 @@ pub struct PublishedHandoff {
     pub handoff_id: HandoffId,
     pub work_item_revision: u64,
     pub handoff_revision: u64,
+    #[serde(default)]
+    pub predecessor_handoff_id: Option<HandoffId>,
+    #[serde(default)]
+    pub source_checkpoint_id: Option<CheckpointId>,
+    #[serde(default)]
+    pub source_checkpoint_revision: Option<u64>,
+    /// Unclaimed transfers this successor atomically superseded.
+    #[serde(default)]
+    pub superseded_handoff_ids: Vec<HandoffId>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
     #[serde(default)]

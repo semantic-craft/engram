@@ -155,7 +155,7 @@ backpressure, or single-writer SQLite actor.
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
 | `work_items` | Stable user objectives, acceptance criteria, owner Run/actor, explicit state, and revision. |
-| `handoffs` | Revisioned transfer offers (open / claimed / acknowledged / expired). |
+| `handoffs` | Revisioned transfer offers (open / claimed / acknowledged / expired / cancelled / superseded), chained by `predecessor_handoff_id` + `superseded_by_handoff_id` and stamped with the `source_checkpoint_id` a successor was built from. |
 | `handoff_claims` | Opaque, actor/Run-bound receiver leases and their resolution state. |
 | `checkpoints` | Append-only ordered WorkItem progress and acceptance-criterion status. |
 | `artifacts` | Shared ArtifactRef identity (file/git/worktree/external). Git identity is repository plus revision; file identity is repository or `scope:{project_id}` plus a relative locator. No project-level CASCADE — deleting the first writer's project must not remove another scope's evidence. |
@@ -242,12 +242,12 @@ invariants below.
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
-| `memory_handoff_begin` | write | Create a WorkItem and open Handoff, or publish a continuation for an exact owned WorkItem. Accepts a bounded brief and revisioned ContextRefs; does not copy canonical bodies. Only new WorkItems use the create-capable scope path. May carry typed ArtifactRefs and explicit WorkItem relationships. |
-| `memory_handoff_discover` | read-only | Fetch the latest claimable Handoff without consuming or acknowledging it. Expired leases are claimable again. Exposes ArtifactRefs and relationships with stable identities. |
+| `memory_handoff_begin` | write | Create a WorkItem and open Handoff, or publish a successor for an exact owned WorkItem under its expected WorkItem and latest-Checkpoint revisions. Accepts a bounded brief and revisioned ContextRefs; does not copy canonical bodies. Only new WorkItems use the create-capable scope path. May carry typed ArtifactRefs and explicit WorkItem relationships. |
+| `memory_handoff_discover` | read-only | Fetch the latest non-superseded claimable Handoff without consuming or acknowledging it, plus the WorkItem's latest Checkpoint and its ordered transfer chain. Expired leases are claimable again. Exposes ArtifactRefs and relationships with stable identities. |
 | `memory_handoff_claim` | write | Compare-and-set one exact Handoff revision to `claimed` for an authenticated actor and receiver Run under a bounded lease. Requires `context_budget` and returns the same ContextPackage + trace contract as `memory_query`. Attempt-idempotent. Assembly never accepts the Handoff. A child WorkItem cannot claim its parent. |
 | `memory_handoff_release` | write | Return one exact live Claim to `open`. Attempt-idempotent. |
 | `memory_checkpoint_write` | write | Append ordered WorkItem progress plus typed ArtifactRefs, explicit WorkItem relationships, and optional parent-result evidence; optionally acknowledge the exact receiving Claim in the same transaction. The first receiver may attach relationships on that ack checkpoint. Records status and performs no Git or external mutation. Responses expose ArtifactRefs and relationships with stable identities and revisions. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
-| `memory_handoff_cancel` | write | Let the source actor and source Run expire an exact open Handoff revision. |
+| `memory_handoff_cancel` | write | Let the source actor and source Run cancel an exact open Handoff revision into the terminal `cancelled` state. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
@@ -279,9 +279,18 @@ single writer actor; Markdown remains the durable knowledge source of truth.
 All reads and transitions use no-create `ScopeResolver` paths, while only a
 new WorkItem publish may create an explicit scope. Authenticated actor identity
 is distinct from agent and Run identity. `memory_handoff_cancel` is the
-source-owner safety valve for mistaken Handoff creation. The narrow-surface
-discipline still holds — every new tool has to earn its slot — but the current
-count is 20, not 10.
+source-owner safety valve for mistaken Handoff creation. A WorkItem crosses
+many agents by *appending* successor Handoffs rather than rewriting the one in
+flight, so every earlier transfer stays readable; supersession, cancellation,
+claim release, and lease expiry are four separately audited outcomes, and a
+terminal WorkItem takes follow-up work only through an explicit new WorkItem
+relationship. The continuation envelope — the `GET /handoff` SessionStart
+injection and the `memory_handoff_discover` response — carries the current
+objective, the acceptance criteria still outstanding per the latest Checkpoint,
+a non-`active` WorkItem state, ArtifactRef evidence, explicit relationships, and
+the predecessor it continues, without copying canonical wiki bodies. The
+narrow-surface discipline still holds — every new tool has to earn its slot —
+but the current count is 20, not 10.
 
 ### Context assembly contract
 

@@ -260,21 +260,32 @@ the conversation calls for them:\n\
   the current session and you want to ensure the next agent has context \
   (the SessionEnd hook also auto-captures this). Supply the source `run_id`; \
   omit `work_item_id` and supply an objective to create a WorkItem, or pass \
-  the exact owned WorkItem id to continue it. Attach a bounded `brief` and \
-  revisioned ContextRefs; do not copy canonical page bodies into the Handoff. \
-  Attach typed `artifacts` (file/git/worktree/external) and explicit \
-  `depends_on`/`derived_from`/`child_of` relationships; absolute cwd is never \
-  artifact or WorkItem identity. Engram records observed status and does not \
-  run Git checkout, commit, push, merge, release, or deploy. Related work \
-  creates a new WorkItem and never inherits the prior claim or blockers. DO \
-  NOT use this to summarize work mid-session, check project status, or answer \
-  a request for a briefing. Keep the summary terse (2-3 sentences); put detail \
-  in open_questions + next_steps bullets. Pass `workspace` + `project` \
+  the exact owned WorkItem id to publish a successor for it. A successor also \
+  needs `expected_work_item_revision` and `expected_checkpoint_revision` (the \
+  latest Checkpoint's `work_item_revision`, omitted while there is none); a \
+  stale value is a conflict that changes nothing. The successor records its \
+  predecessor and source Checkpoint and supersedes only the still-unclaimed \
+  transfer it replaces — claimed and terminal transfers stay readable history. \
+  A `completed` or `abandoned` WorkItem refuses new handoffs: create a \
+  distinct WorkItem with an explicit relationship instead. Attach a bounded \
+  `brief` and revisioned ContextRefs; do not copy canonical page bodies into \
+  the Handoff. Attach typed `artifacts` (file/git/worktree/external) and \
+  explicit `depends_on`/`derived_from`/`child_of` relationships; absolute cwd \
+  is never artifact or WorkItem identity. Engram records observed status and \
+  does not run Git checkout, commit, push, merge, release, or deploy. Related \
+  work creates a new WorkItem and never inherits the prior claim or blockers. \
+  DO NOT use this to summarize work mid-session, check project status, or \
+  answer a request for a briefing. Keep the summary terse (2-3 sentences); put \
+  detail in open_questions + next_steps bullets. Pass `workspace` + `project` \
   together only when leaving a handoff for a named sibling workspace/project.\n\
 - `memory_handoff_discover` — when the user asks where work left off and \
   no SessionStart block is visible. This read is non-destructive: it never \
-  consumes or acknowledges a Handoff. Responses include ArtifactRefs and \
-  WorkItem relationships with stable identities and revisions.\n\
+  consumes or acknowledges a Handoff, and superseded, cancelled, and expired \
+  transfers are never delivered. Responses include ArtifactRefs, WorkItem \
+  relationships, `latest_checkpoint` (outstanding acceptance criteria plus the \
+  revision a successor must assert), and `chain`: the WorkItem\'s ordered \
+  predecessor-to-successor transfer history with source and receiving \
+  Run/Session provenance.\n\
 - `memory_handoff_claim` — before acting as receiver, claim the exact \
   Handoff revision with the current Run, a fresh caller-supplied \
   `attempt_id`, and the same `context_budget` contract as `memory_query`. \
@@ -301,7 +312,9 @@ the conversation calls for them:\n\
 - `memory_handoff_cancel` — when you realize you mistakenly called \
   `memory_handoff_begin`, or the user explicitly asks to discard a \
   pending handoff. Requires its exact `handoff_id`, current revision, and source Run; \
-  only the source owner can expire an open Handoff.\n\
+  only the source owner can cancel an open Handoff. Cancellation, claim \
+  release, lease expiry, and successor supersession are four distinct, \
+  separately audited outcomes.\n\
 - `memory_consolidate` — when the user asks to compile session \
   observations into wiki pages. Also runs on PreCompact, and at \
   session end only when ENGRAM_CONSOLIDATE_ON_SESSION_END is set.\n\
@@ -645,9 +658,19 @@ struct AutoImproveArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffBeginArgs {
-    /// Existing WorkItem to continue. Omit to create a new WorkItem.
+    /// Existing WorkItem to publish a successor for. Omit to create a new
+    /// WorkItem.
     #[serde(default)]
     work_item_id: Option<String>,
+    /// Current WorkItem revision. Required with `work_item_id`; a stale value
+    /// is a conflict that changes nothing.
+    #[serde(default)]
+    expected_work_item_revision: Option<u64>,
+    /// `work_item_revision` of the WorkItem's latest Checkpoint — the state the
+    /// successor is constructed from. Required with `work_item_id` once the
+    /// WorkItem has any Checkpoint; omit it while it has none.
+    #[serde(default)]
+    expected_checkpoint_revision: Option<u64>,
     /// Source Run/Session identity.
     run_id: String,
     /// Stable objective. Required when creating a WorkItem.
@@ -2633,8 +2656,17 @@ impl EngramServer {
     #[tool(description = "Publish a handoff for recoverable cross-agent task \
         continuity. Omit `work_item_id` to create a WorkItem, supplying its \
         stable `objective` and acceptance criteria. Supply `work_item_id` to \
-        continue that exact non-terminal WorkItem; ownership by authenticated \
-        actor and source Run is enforced. Attach a bounded `brief` and \
+        publish a successor for that exact non-terminal WorkItem; ownership by \
+        authenticated actor and source Run is enforced, and a successor must \
+        also carry `expected_work_item_revision` plus \
+        `expected_checkpoint_revision` (the `work_item_revision` of the latest \
+        Checkpoint, omitted while the WorkItem has none). Either being stale is \
+        a conflict that changes nothing. A successor records its predecessor \
+        and source Checkpoint and atomically supersedes the still-unclaimed \
+        transfer it replaces; claimed and terminal transfers stay immutable \
+        history. A completed or abandoned WorkItem rejects new handoffs — \
+        create a distinct WorkItem with a `depends_on` / `derived_from` / \
+        `child_of` relationship instead. Attach a bounded `brief` and \
         revisioned ContextRefs rather than copying canonical bodies into the \
         operational row. ContextRefs are validated for identity, revision, \
         existing scope, and visibility at publish time. May also carry typed \
@@ -2728,6 +2760,8 @@ impl EngramServer {
         );
         let handoff = NewHandoff {
             work_item_id,
+            expected_work_item_revision: args.expected_work_item_revision,
+            expected_checkpoint_revision: args.expected_checkpoint_revision,
             workspace_id: ws,
             project_id: proj,
             from_session_id: None,
@@ -2766,10 +2800,15 @@ impl EngramServer {
     /// Discover a handoff without changing continuity state.
     #[tool(description = "Read the latest claimable handoff for this project \
         without consuming, claiming, acknowledging, or otherwise mutating it. \
+        Superseded, cancelled, and expired transfers are never delivered. \
         Expired leases become discoverable again. Set `include_claimed` only \
         for inspection of a live claim. Returns exact WorkItem/Handoff ids, \
-        ArtifactRefs, WorkItem relationships, and the current revision \
-        required by `memory_handoff_claim`. Absolute cwd is never identity. \
+        ArtifactRefs, WorkItem relationships, the current revision required by \
+        `memory_handoff_claim`, `latest_checkpoint` (outstanding acceptance \
+        criteria plus the `work_item_revision` that `memory_handoff_begin` \
+        needs as `expected_checkpoint_revision`), and `chain`: the WorkItem's \
+        ordered predecessor-to-successor transfer history with source and \
+        receiving Run/Session provenance. Absolute cwd is never identity. \
         Engram records observed status and performs no Git or external \
         mutation.")]
     async fn memory_handoff_discover(
@@ -2786,29 +2825,23 @@ impl EngramServer {
                 &aps_actor,
             )
             .await?;
-        let handoff = self
+        let envelope = self
             .reader
-            .latest_claimable_handoff(ws, proj, args.cwd, args.include_claimed)
+            .discover_continuation(ws, proj, args.cwd, args.include_claimed)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        match handoff {
-            Some(handoff) => {
-                let work_item = self
-                    .reader
-                    .work_item_by_id(handoff.work_item_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                    .ok_or_else(|| {
-                        McpError::internal_error("discovered handoff has no WorkItem", None)
-                    })?;
-                ok_json(&serde_json::json!({
-                    "handoff": handoff,
-                    "work_item": work_item,
-                }))
-            }
+        match envelope {
+            Some(envelope) => ok_json(&serde_json::json!({
+                "handoff": envelope.handoff,
+                "work_item": envelope.work_item,
+                "latest_checkpoint": envelope.latest_checkpoint,
+                "chain": envelope.chain,
+            })),
             None => ok_json(&serde_json::json!({
                 "handoff": null,
                 "work_item": null,
+                "latest_checkpoint": null,
+                "chain": [],
             })),
         }
     }
@@ -3028,11 +3061,14 @@ impl EngramServer {
 
     /// Cancel a mistaken open handoff by exact id.
     #[tool(description = "Cancel/discard a mistakenly-created OPEN handoff by \
-        exact `handoff_id` returned from `memory_handoff_begin`. Use this ONLY \
+        exact `handoff_id` returned from `memory_handoff_begin`. The handoff \
+        becomes `cancelled`, a terminal state distinct from lease expiry, \
+        claim release, and successor supersession. Use this ONLY \
         when you realize you called `memory_handoff_begin` by mistake or the \
         user explicitly asks to discard a pending handoff. This is a cleanup \
-        tool, not a status/briefing tool. It marks the handoff expired so the \
-        next SessionStart hook will not discover it. Omit project/workspace \
+        tool, not a status/briefing tool. The cancelled handoff stays readable \
+        history, but the next SessionStart hook will not discover it. Omit \
+        project/workspace \
         unless the user names a different project; when provided, workspace \
         and project must be supplied together.")]
     async fn memory_handoff_cancel(
@@ -4971,6 +5007,8 @@ mod tests {
             server
                 .memory_handoff_begin(
                     Parameters(HandoffBeginArgs {
+                        expected_work_item_revision: None,
+                        expected_checkpoint_revision: None,
                         work_item_id: None,
                         run_id: source_run.to_string(),
                         objective: Some("Continue the evidence task".into()),
@@ -5094,6 +5132,8 @@ mod tests {
         let begin_err = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    expected_work_item_revision: None,
+                    expected_checkpoint_revision: None,
                     work_item_id: None,
                     run_id: SessionId::new().to_string(),
                     objective: Some("Reject unauthorized refs".into()),
@@ -5126,6 +5166,8 @@ mod tests {
             server
                 .memory_handoff_begin(
                     Parameters(HandoffBeginArgs {
+                        expected_work_item_revision: None,
+                        expected_checkpoint_revision: None,
                         work_item_id: None,
                         run_id: source_run.to_string(),
                         objective: Some("Recover after deletion".into()),
@@ -5199,6 +5241,8 @@ mod tests {
             server
                 .memory_handoff_begin(
                     Parameters(HandoffBeginArgs {
+                        expected_work_item_revision: None,
+                        expected_checkpoint_revision: None,
                         work_item_id: None,
                         run_id: SessionId::new().to_string(),
                         objective: Some("Fit a tiny budget".into()),
@@ -5267,6 +5311,8 @@ mod tests {
         let published = store
             .writer
             .publish_handoff(NewHandoff {
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
@@ -5395,6 +5441,8 @@ mod tests {
             server
                 .memory_handoff_begin(
                     Parameters(HandoffBeginArgs {
+                        expected_work_item_revision: None,
+                        expected_checkpoint_revision: None,
                         work_item_id: None,
                         run_id: SessionId::new().to_string(),
                         objective: Some("One owner".into()),
@@ -7204,6 +7252,8 @@ mod tests {
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
                     work_item_id: None,
+                    expected_work_item_revision: None,
+                    expected_checkpoint_revision: None,
                     run_id: SessionId::new().to_string(),
                     objective: Some("fix omp CHECK".into()),
                     acceptance_criteria: vec![],

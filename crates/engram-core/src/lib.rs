@@ -52,9 +52,9 @@ pub use context::{
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{
-    AcceptanceCriterionStatus, CheckpointWrite, CheckpointWriteResult, Handoff, HandoffCancel,
-    HandoffClaim, HandoffClaimResult, HandoffRelease, HandoffReleaseResult, HandoffState,
-    NewHandoff, PublishedHandoff, WorkItem, WorkItemState,
+    AcceptanceCriterionStatus, Checkpoint, CheckpointWrite, CheckpointWriteResult, Handoff,
+    HandoffCancel, HandoffChainEntry, HandoffClaim, HandoffClaimResult, HandoffRelease,
+    HandoffReleaseResult, HandoffState, NewHandoff, PublishedHandoff, WorkItem, WorkItemState,
 };
 pub use ids::{
     AgentKind, ArtifactId, AttemptId, AutoImproveProposalId, AutoImproveRunId, BackgroundJobId,

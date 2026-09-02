@@ -1499,6 +1499,8 @@ async fn work_item_relationships_fail_closed_and_do_not_inherit_claims() {
         serde_json::json!({
             "work_item_id": parent_id,
             "run_id": parent_run,
+            "expected_work_item_revision": parent_after.revision,
+            "expected_checkpoint_revision": parent_after.revision,
             "summary": "Self-link should fail.",
             "relationships": [{"kind": "depends_on", "target_work_item_id": parent_id}]
         }),
@@ -1617,6 +1619,7 @@ async fn work_item_relationships_fail_closed_and_do_not_inherit_claims() {
         serde_json::json!({
             "work_item_id": cycle_a["work_item_id"],
             "run_id": "019f0042-0000-7000-8000-000000000030",
+            "expected_work_item_revision": cycle_a["work_item_revision"],
             "summary": "A depends on B would cycle.",
             "relationships": [{
                 "kind": "depends_on",
@@ -2908,4 +2911,623 @@ async fn worktree_locator_rejects_absolute_path_git_identity_ignores_cwd_hint() 
         machine_b["artifacts"][0]["local_path_hint"],
         "/Users/other/machine-b/engram"
     );
+}
+
+/// Issue #43 tracer: one WorkItem crosses three Runs. Each hop publishes a
+/// successor from the state it actually received, the transfer it replaces
+/// becomes readable history instead of being overwritten, discovery only ever
+/// offers the newest non-superseded transfer, and a terminal WorkItem refuses
+/// further transfers.
+#[tokio::test]
+async fn successor_handoffs_chain_across_three_runs_without_overwriting_history() {
+    let tmp = TempDir::new().unwrap();
+    let alice = ActorContext {
+        agent: Some("claude-code".into()),
+        user: Some("alice".into()),
+        ..ActorContext::default()
+    };
+    let (router_a, store) = make_router_for_actor(&tmp, false, alice).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let router_b = router_for_store(
+        &store,
+        ws,
+        proj,
+        ActorContext {
+            agent: Some("codex".into()),
+            user: Some("bob".into()),
+            ..ActorContext::default()
+        },
+        false,
+    );
+    let router_c = router_for_store(
+        &store,
+        ws,
+        proj,
+        ActorContext {
+            agent: Some("cursor".into()),
+            user: Some("cara".into()),
+            ..ActorContext::default()
+        },
+        false,
+    );
+
+    let run_a = "019f0043-0000-7000-8000-000000000001";
+    let run_b = "019f0043-0000-7000-8000-000000000002";
+    let run_c = "019f0043-0000-7000-8000-000000000003";
+    let first_objective = "Chain successors without losing history";
+
+    let first = call_tool(
+        &router_a,
+        100,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": run_a,
+            "objective": first_objective,
+            "acceptance_criteria": ["chain is readable", "history is immutable"],
+            "summary": "Alice opened the work."
+        }),
+    )
+    .await;
+    let work_item_id = first["work_item_id"].as_str().unwrap().to_string();
+    let h1 = first["handoff_id"].as_str().unwrap().to_string();
+    assert_eq!(first["work_item_revision"], 1);
+    assert!(first["predecessor_handoff_id"].is_null());
+    assert_eq!(first["superseded_handoff_ids"], serde_json::json!([]));
+
+    // Alice replaces her own still-unclaimed offer. The successor names its
+    // predecessor and supersedes exactly that one transfer.
+    let second = call_tool(
+        &router_a,
+        101,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_a,
+            "expected_work_item_revision": 1,
+            "summary": "Alice re-scoped before anyone claimed."
+        }),
+    )
+    .await;
+    let h2 = second["handoff_id"].as_str().unwrap().to_string();
+    assert_eq!(second["work_item_revision"], 2);
+    assert_eq!(second["predecessor_handoff_id"], serde_json::json!(h1));
+    assert!(
+        second["source_checkpoint_id"].is_null(),
+        "no checkpoint yet"
+    );
+    assert_eq!(
+        second["superseded_handoff_ids"],
+        serde_json::json!([h1]),
+        "the unclaimed predecessor is superseded, not overwritten"
+    );
+
+    let bob_sees = call_tool(
+        &router_b,
+        102,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        bob_sees["handoff"]["id"], h2,
+        "discovery never offers a superseded transfer"
+    );
+    let chain = bob_sees["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 2, "{chain:?}");
+    assert_eq!(chain[0]["handoff_id"], serde_json::json!(h1));
+    assert_eq!(chain[0]["state"], "superseded");
+    assert_eq!(chain[0]["superseded_by_handoff_id"], serde_json::json!(h2));
+    assert_eq!(chain[1]["state"], "open");
+
+    let bob_claim = call_tool(
+        &router_b,
+        103,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": h2,
+            "expected_revision": 1,
+            "run_id": run_b,
+            "attempt_id": "019f0043-0000-7000-8000-000000000010",
+            "lease_seconds": 60,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    let bob_checkpoint = call_tool(
+        &router_b,
+        104,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_b,
+            "attempt_id": "019f0043-0000-7000-8000-000000000011",
+            "expected_work_item_revision": 2,
+            "handoff_id": h2,
+            "claim_id": bob_claim["claim_id"],
+            "expected_handoff_revision": 2,
+            "summary": "Bob durably received and advanced the work.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "chain is readable", "satisfied": true},
+                {"criterion": "history is immutable", "satisfied": false}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(bob_checkpoint["handoff_state"], "acknowledged");
+    assert_eq!(bob_checkpoint["work_item_revision"], 3);
+
+    let third = call_tool(
+        &router_b,
+        105,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_b,
+            "expected_work_item_revision": 3,
+            "expected_checkpoint_revision": 3,
+            "summary": "Bob handed the rest to Cara."
+        }),
+    )
+    .await;
+    let h3 = third["handoff_id"].as_str().unwrap().to_string();
+    assert_eq!(third["predecessor_handoff_id"], serde_json::json!(h2));
+    assert_eq!(
+        third["source_checkpoint_id"],
+        bob_checkpoint["checkpoint_id"]
+    );
+    assert_eq!(third["source_checkpoint_revision"], 3);
+    assert_eq!(
+        third["superseded_handoff_ids"],
+        serde_json::json!([]),
+        "an acknowledged predecessor is history, never superseded"
+    );
+
+    // A stale Checkpoint revision must not mutate anything.
+    let stale = call_tool_failure(
+        &router_b,
+        106,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_b,
+            "expected_work_item_revision": 4,
+            "expected_checkpoint_revision": 2,
+            "summary": "Constructed from a Checkpoint that is no longer latest."
+        }),
+    )
+    .await;
+    assert!(stale.contains("stale checkpoint revision"), "{stale}");
+
+    // Retention runs; a predecessor referenced by a successor survives it.
+    call_tool(
+        &router_c,
+        107,
+        "memory_forget_sweep",
+        serde_json::json!({ "dry_run": false }),
+    )
+    .await;
+
+    let cara_sees = call_tool(
+        &router_c,
+        108,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        cara_sees["handoff"]["id"], h3,
+        "stale publish changed nothing"
+    );
+    // The envelope carries what is still outstanding and the exact revision a
+    // further successor must assert, without copying canonical bodies.
+    assert_eq!(cara_sees["work_item"]["objective"], first_objective);
+    assert_eq!(cara_sees["latest_checkpoint"]["work_item_revision"], 3);
+    assert_eq!(
+        cara_sees["latest_checkpoint"]["acceptance_criteria"],
+        serde_json::json!([
+            {"criterion": "chain is readable", "satisfied": true},
+            {"criterion": "history is immutable", "satisfied": false}
+        ])
+    );
+    let chain = cara_sees["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 3, "predecessors survive retention: {chain:?}");
+    let ids: Vec<&str> = chain
+        .iter()
+        .map(|e| e["handoff_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![h1.as_str(), h2.as_str(), h3.as_str()]);
+    assert_eq!(chain[2]["predecessor_handoff_id"], serde_json::json!(h2));
+    // Target selector, authenticated actor, Run, and execution agent stay
+    // separate dimensions on every hop.
+    assert_eq!(chain[1]["source_actor"], "user:alice");
+    assert_eq!(chain[1]["source_run_id"], run_a);
+    assert_eq!(chain[1]["from_agent"], "claude-code");
+    assert!(chain[1]["to_agent"].is_null());
+    assert_eq!(chain[1]["receiving_actor"], "user:bob");
+    assert_eq!(chain[1]["receiving_run_id"], run_b);
+    assert_eq!(chain[1]["receiving_claim_state"], "acknowledged");
+    assert!(chain[2]["receiving_actor"].is_null(), "h3 is unclaimed");
+
+    let cara_claim = call_tool(
+        &router_c,
+        109,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": h3,
+            "expected_revision": 1,
+            "run_id": run_c,
+            "attempt_id": "019f0043-0000-7000-8000-000000000012",
+            "lease_seconds": 60,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    let completed = call_tool(
+        &router_c,
+        110,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_c,
+            "attempt_id": "019f0043-0000-7000-8000-000000000013",
+            "expected_work_item_revision": 4,
+            "handoff_id": h3,
+            "claim_id": cara_claim["claim_id"],
+            "expected_handoff_revision": 2,
+            "summary": "Cara finished the work.",
+            "work_item_state": "completed",
+            "acceptance_criteria": [
+                {"criterion": "chain is readable", "satisfied": true},
+                {"criterion": "history is immutable", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(completed["work_item_state"], "completed");
+
+    // Terminal is terminal: the WorkItem cannot be checkpointed back to
+    // `active` to route around the publish-side rejection below.
+    let reopen = call_tool_failure(
+        &router_c,
+        113,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_c,
+            "attempt_id": "019f0043-0000-7000-8000-000000000014",
+            "expected_work_item_revision": completed["work_item_revision"],
+            "summary": "Reopening finished work.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "chain is readable", "satisfied": true},
+                {"criterion": "history is immutable", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        reopen.contains("terminal work item state"),
+        "a completed WorkItem must not be reopened: {reopen}"
+    );
+
+    let terminal = call_tool_failure(
+        &router_c,
+        111,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_c,
+            "expected_work_item_revision": completed["work_item_revision"],
+            "expected_checkpoint_revision": completed["work_item_revision"],
+            "summary": "Follow-up work on a finished WorkItem."
+        }),
+    )
+    .await;
+    assert!(
+        terminal.contains("terminal work item state"),
+        "follow-up must create a related WorkItem instead: {terminal}"
+    );
+
+    // The explicit relationship contract is the supported follow-up path.
+    let follow_up = call_tool(
+        &router_c,
+        112,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": run_c,
+            "objective": "Follow-up derived from the finished work",
+            "summary": "New WorkItem, explicit relationship.",
+            "relationships": [
+                {"kind": "derived_from", "target_work_item_id": work_item_id}
+            ]
+        }),
+    )
+    .await;
+    assert_ne!(follow_up["work_item_id"], serde_json::json!(work_item_id));
+    assert_eq!(follow_up["relationships"][0]["kind"], "derived_from");
+}
+
+/// Issue #43 tracer: two Runs publishing a successor at the same revision
+/// produce exactly one successor and one explicit conflict, and the four ways
+/// a transfer can end stay distinguishable in `audit_log`.
+#[tokio::test]
+async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let owner = ActorContext {
+        agent: Some("claude-code".into()),
+        user: Some("owner".into()),
+        ..ActorContext::default()
+    };
+    let (router, store) = make_router_for_actor(&tmp, false, owner).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let receiver = router_for_store(
+        &store,
+        ws,
+        proj,
+        ActorContext {
+            agent: Some("codex".into()),
+            user: Some("receiver".into()),
+            ..ActorContext::default()
+        },
+        false,
+    );
+
+    let owner_run = "019f0043-0000-7000-8000-000000000020";
+    let receiver_run = "019f0043-0000-7000-8000-000000000021";
+    let published = call_tool(
+        &router,
+        120,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": owner_run,
+            "objective": "Race two successors",
+            "acceptance_criteria": ["exactly one successor wins"],
+            "summary": "Owner opened the work."
+        }),
+    )
+    .await;
+    let work_item_id = published["work_item_id"].as_str().unwrap().to_string();
+    let first_handoff = published["handoff_id"].as_str().unwrap().to_string();
+
+    call_tool(
+        &router,
+        121,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000022",
+            "expected_work_item_revision": 1,
+            "summary": "Owner recorded durable progress.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "exactly one successor wins", "satisfied": false}
+            ]
+        }),
+    )
+    .await;
+
+    let successor_args = |marker: &str| {
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "expected_work_item_revision": 2,
+            "expected_checkpoint_revision": 2,
+            "summary": format!("Successor attempt {marker}.")
+        })
+    };
+    let (left, right) = tokio::join!(
+        call_tool_outcome(&router, 122, "memory_handoff_begin", successor_args("left")),
+        call_tool_outcome(
+            &router,
+            123,
+            "memory_handoff_begin",
+            successor_args("right")
+        ),
+    );
+    let (winner, conflict) = match (left, right) {
+        (Ok(winner), Err(conflict)) | (Err(conflict), Ok(winner)) => (winner, conflict),
+        outcomes => panic!("same-revision successors must yield one of each: {outcomes:?}"),
+    };
+    assert!(conflict.contains("stale work item revision"), "{conflict}");
+    assert_eq!(
+        winner["superseded_handoff_ids"],
+        serde_json::json!([first_handoff])
+    );
+    let successor = winner["handoff_id"].as_str().unwrap().to_string();
+
+    let missing = call_tool_failure(
+        &router,
+        124,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "summary": "No expected revisions at all."
+        }),
+    )
+    .await;
+    assert!(missing.contains("expected_work_item_revision"), "{missing}");
+
+    // Claim, let the lease lapse, reclaim (lease expiry), then release.
+    call_tool(
+        &receiver,
+        125,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": successor,
+            "expected_revision": 1,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000023",
+            "lease_seconds": 1,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let reclaimed = call_tool(
+        &receiver,
+        126,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": successor,
+            "expected_revision": 2,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000024",
+            "lease_seconds": 60,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    let released = call_tool(
+        &receiver,
+        127,
+        "memory_handoff_release",
+        serde_json::json!({
+            "handoff_id": successor,
+            "claim_id": reclaimed["claim_id"],
+            "expected_revision": reclaimed["revision"],
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000025"
+        }),
+    )
+    .await;
+    assert_eq!(released["state"], "open");
+
+    let cancelled = call_tool(
+        &router,
+        128,
+        "memory_handoff_cancel",
+        serde_json::json!({
+            "handoff_id": successor,
+            "expected_revision": released["revision"],
+            "run_id": owner_run
+        }),
+    )
+    .await;
+    assert_eq!(
+        cancelled["state"], "cancelled",
+        "cancellation is its own terminal state, not a lapsed offer"
+    );
+
+    // Completing the WorkItem retires whatever transfer is still live — open or
+    // claimed — so nothing stays discoverable against finished work. A held
+    // transfer is the trap: once its lease lapsed it would be discoverable
+    // again while claim, release, and cancel all refused it.
+    let final_open = call_tool(
+        &router,
+        129,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "expected_work_item_revision": 3,
+            "expected_checkpoint_revision": 2,
+            "summary": "Still outstanding when the work finishes."
+        }),
+    )
+    .await;
+    call_tool(
+        &receiver,
+        133,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": final_open["handoff_id"],
+            "expected_revision": 1,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000028",
+            "lease_seconds": 1,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    call_tool(
+        &router,
+        130,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000026",
+            "expected_work_item_revision": 4,
+            "summary": "Owner finished the work.",
+            "work_item_state": "completed",
+            "acceptance_criteria": [
+                {"criterion": "exactly one successor wins", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    let nothing_pending = call_tool(
+        &router,
+        131,
+        "memory_handoff_discover",
+        serde_json::json!({ "include_claimed": true }),
+    )
+    .await;
+    assert!(
+        nothing_pending["handoff"].is_null(),
+        "a finished WorkItem leaves nothing claimable: {nothing_pending}"
+    );
+    let claim_terminal = call_tool_failure(
+        &receiver,
+        132,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": final_open["handoff_id"],
+            "expected_revision": 3,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000027",
+            "lease_seconds": 60,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    assert!(
+        claim_terminal.contains("work item is completed"),
+        "{claim_terminal}"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT op, detail FROM audit_log WHERE op LIKE 'handoff%'")
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (op, outcome) in [
+        ("handoff_supersede", "superseded"),
+        ("handoff_cancel", "cancelled"),
+        ("handoff_release", "released"),
+        ("handoff_claim_expire", "expired"),
+        ("handoff_expire_terminal", "expired"),
+    ] {
+        assert!(
+            rows.iter().any(|(logged_op, detail)| logged_op == op
+                && detail.contains(&format!("\"outcome\":\"{outcome}\""))),
+            "audit must distinguish {op}/{outcome}: {rows:?}"
+        );
+    }
 }

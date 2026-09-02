@@ -60,7 +60,9 @@ retrieval, handoffs, durable pages, learning maintenance,
 project-instruction maintenance, and routing install or refresh work.
 Memory retrieval uses caller-budgeted context packages with stable,
 revisioned references; load the retrieval skill for the exact package and
-full-evidence workflow.
+full-evidence workflow. Handoffs chain: a receiver publishes a successor
+from the latest Checkpoint, earlier transfers stay readable history, and a
+finished WorkItem takes follow-up work as a new related WorkItem.
 
 ### When you write a project rule, write it here
 
@@ -131,7 +133,7 @@ mod tests {
             );
         }
         assert!(
-            SNIPPET_BODY.lines().count() <= 70,
+            SNIPPET_BODY.lines().count() <= 73,
             "the always-loaded block must remain concise"
         );
     }

@@ -48,9 +48,30 @@ work uses `depends_on`, `derived_from`, or `child_of` and creates a new
 WorkItem instead of inheriting a claim or blocker. Engram records these facts;
 it does not run Git checkout, commit, push, merge, release, or deploy.
 
+When the receiver has advanced the work and wants to pass it on again, it
+publishes a *successor* Handoff for the same WorkItem rather than editing the
+one it received. Supply the exact `work_item_id`, `expected_work_item_revision`,
+and `expected_checkpoint_revision` — the `work_item_revision` of the WorkItem's
+latest Checkpoint, omitted only while it has none. Both come back from the
+preceding transition or from `memory_handoff_discover`'s `work_item.revision`
+and `latest_checkpoint.work_item_revision`. A stale value is a conflict that
+changes nothing; two Runs publishing at the same revision produce exactly one
+successor and one conflict.
+
+A successor records the predecessor Handoff, the Checkpoint it was built from,
+and its own source Run/Session, and supersedes only a predecessor still sitting
+at `open`. Acknowledged, expired, cancelled, and superseded transfers stay
+readable: `memory_handoff_discover` returns the WorkItem's whole `chain`,
+oldest to newest, with source and receiving provenance on every hop, while only
+ever offering the newest non-superseded transfer. A `completed` or `abandoned`
+WorkItem refuses further Handoffs — create a new WorkItem and link it with
+`depends_on`, `derived_from`, or `child_of`.
+
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` with the id, revision, and source Run returned by
-`memory_handoff_begin`. Only that source owner can expire an open Handoff.
+`memory_handoff_begin`. Only that source owner can cancel an open Handoff, and
+`cancelled` is a distinct outcome from a released Claim, a lapsed lease, and a
+superseded predecessor.
 
 Claims, releases, and checkpoints require a fresh caller-supplied `attempt_id`.
 If a response is lost, retry the identical request with the same Attempt id;
