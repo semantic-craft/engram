@@ -58,13 +58,29 @@ INSERT INTO artifact_attachments_new (
     fact_changed, fact_verified, fact_committed, fact_pushed, fact_reviewed, fact_merged,
     fact_released, fact_deployed, fact_submitted, fact_approved
 )
+-- Scope comes from each attachment's own owner, never from the shared
+-- identity row. One identity can already be attached in several projects, and
+-- taking the identity's (first writer's) scope would leave every other
+-- project's attachment cascading off that project -- the exact loss this
+-- migration exists to stop. The identity's scope is only a last-resort default
+-- for an attachment whose owner row is already gone.
 SELECT t.id, t.artifact_id, t.owner_kind, t.owner_id, t.source_run_id, t.observed_at,
        t.provenance, a.content_hash, a.git_ref, a.tree_hash, t.dirty, t.local_path_hint,
-       a.workspace_id, a.project_id, t.fact_changed, t.fact_verified, t.fact_committed,
+       COALESCE(h.workspace_id, c.workspace_id, pc.workspace_id, a.workspace_id),
+       COALESCE(h.project_id, c.project_id, pc.project_id, a.project_id),
+       t.fact_changed, t.fact_verified, t.fact_committed,
        t.fact_pushed, t.fact_reviewed, t.fact_merged, t.fact_released, t.fact_deployed,
        t.fact_submitted, t.fact_approved
 FROM artifact_attachments t
-JOIN artifacts a ON a.id = t.artifact_id;
+JOIN artifacts a ON a.id = t.artifact_id
+LEFT JOIN handoffs h
+       ON t.owner_kind = 'handoff' AND h.id = t.owner_id
+LEFT JOIN checkpoints c
+       ON t.owner_kind = 'checkpoint' AND c.id = t.owner_id
+LEFT JOIN parent_results p
+       ON t.owner_kind = 'parent_result' AND p.id = t.owner_id
+LEFT JOIN checkpoints pc
+       ON pc.id = p.checkpoint_id;
 
 CREATE TABLE artifact_verification_new (
     id                  BLOB PRIMARY KEY NOT NULL,

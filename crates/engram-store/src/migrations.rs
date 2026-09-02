@@ -434,6 +434,107 @@ mod tests {
         run(&mut conn).expect("V105 must be idempotent on reopen");
     }
 
+    /// A populated V104 store: one Git identity attached in two projects.
+    /// The upgrade must give each attachment its own owner's scope, or purging
+    /// the first writer's project still takes the second project's evidence
+    /// with it — the loss V105 exists to stop.
+    #[test]
+    fn v105_upgrade_gives_each_attachment_its_owner_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("memory.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 104).unwrap();
+
+        let ws = b"ws______________".to_vec();
+        let project_a = b"projecta________".to_vec();
+        let project_b = b"projectb________".to_vec();
+        let artifact = b"artifact________".to_vec();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'default', 0)",
+            params![ws],
+        )
+        .unwrap();
+        for (id, name) in [(&project_a, "scratch"), (&project_b, "sibling")] {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, 0)",
+                params![id, ws, name],
+            )
+            .unwrap();
+        }
+        // The shared identity row carries project A: the first writer.
+        conn.execute(
+            "INSERT INTO artifacts \
+             (id, identity_hash, kind, locator, observed_revision, content_hash, \
+              repository_identity, git_ref, commit_id, tree_hash, workspace_id, project_id) \
+             VALUES (?1, ?2, 'git', 'origin', 'share123', NULL, \
+                     'github.com/semantic-craft/engram', 'main', 'share123', 'tree-a', ?3, ?4)",
+            params![artifact, vec![7u8; 32], ws, project_a],
+        )
+        .unwrap();
+        for (index, project) in [(1i64, &project_a), (2, &project_b)] {
+            let owner = vec![index as u8; 16];
+            let work_item = vec![100 + index as u8; 16];
+            conn.execute(
+                "INSERT INTO work_items \
+                 (id, workspace_id, project_id, objective, owner_actor, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'objective', 'actor', 0, 0)",
+                params![work_item, ws, project],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO handoffs \
+                 (id, work_item_id, workspace_id, project_id, source_run_id, from_agent, \
+                  source_actor, summary, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?1, 'claude-code', 'actor', 'summary', 0)",
+                params![owner, work_item, ws, project],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO artifact_attachments \
+                 (artifact_id, owner_kind, owner_id, source_run_id, observed_at, provenance) \
+                 VALUES (?1, 'handoff', ?2, ?2, 0, ?3)",
+                params![artifact, owner, format!("writer {index}")],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).expect("V105 must apply to a populated V104 store");
+
+        let scoped: Vec<(String, Vec<u8>)> = conn
+            .prepare("SELECT provenance, project_id FROM artifact_attachments ORDER BY provenance")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scoped,
+            vec![
+                ("writer 1".to_string(), project_a.clone()),
+                ("writer 2".to_string(), project_b.clone()),
+            ],
+            "each migrated attachment keeps its own owner's project"
+        );
+
+        // Purging the first writer's project must leave the second intact.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![project_a])
+            .unwrap();
+        let survivors: Vec<String> = conn
+            .prepare("SELECT provenance FROM artifact_attachments")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(survivors, vec!["writer 2".to_string()]);
+        let identities: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(identities, 1, "the shared identity row must survive");
+    }
+
     /// Tripwire for the incident class itself: every embedded migration
     /// numbered below the released high-water mark must be part of a shipped
     /// release. A new migration slotted into a historical gap (the V28
