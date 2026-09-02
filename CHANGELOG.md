@@ -70,9 +70,10 @@ below start from the fork.
   without copying canonical bodies into operational Handoff rows.
   `memory_handoff_claim` requires the same `context_budget` unit as
   `memory_query` and returns the continuation envelope plus that shared
-  ContextPackage and assembly trace. Explicit refs are combined with retrieval
-  candidates, missing or unauthorized refs stay bounded diagnostics, and
-  assembly never marks a Handoff accepted. Compare-and-set failure does not
+  ContextPackage and assembly trace. Explicit refs carry a selection priority
+  that puts them ahead of every retrieval candidate for quota and budget,
+  whatever the retrieval rank; missing or unauthorized refs stay bounded
+  diagnostics, and assembly never marks a Handoff accepted. Compare-and-set failure does not
   return a package; assembly failure after a recorded claim leaves the live
   lease recoverable.
 

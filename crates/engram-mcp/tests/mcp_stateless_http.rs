@@ -2042,3 +2042,227 @@ async fn artifact_observations_are_per_attachment_and_do_not_collide() {
     assert_eq!(dirty_a["artifacts"][0]["dirty"], true);
     assert_eq!(dirty_b["artifacts"][0]["dirty"], true);
 }
+
+/// Tracer for the claim-side ordering contract (#44): a publisher-selected
+/// `context_ref` is assembled before any retrieval candidate.
+///
+/// The server has no embedder, so the claim's retrieval leg is pure FTS5.
+/// Six wiki pages match the handoff text strongly enough that their bm25
+/// ranks fall well below -1 — which is exactly why a synthetic "-1.0 score"
+/// cannot express precedence. The explicit reference points at a seventh page
+/// whose vocabulary retrieval never surfaces, and the budget is tight enough
+/// that only the first couple of candidates fit.
+#[tokio::test]
+async fn explicit_handoff_context_refs_precede_retrieval_candidates_at_claim() {
+    use engram_core::{NewPage, PagePath, Tier};
+
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+
+    let seed = |path: String, title: String, body: String| NewPage {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(path).unwrap(),
+        title,
+        body,
+        tier: Tier::Semantic,
+        frontmatter_json: serde_json::json!({}),
+        pinned: false,
+        links: Vec::new(),
+        author_id: None,
+    };
+
+    // Filler corpus: keeps the shared terms selective, so FTS5 bm25 gives the
+    // six matching pages ranks far beyond the old synthetic -1.0.
+    let mut pages = Vec::new();
+    for index in 0..24 {
+        pages.push(seed(
+            format!("notes/filler-{index:02}.md"),
+            format!("Filler {index:02}"),
+            format!("Unrelated maintenance chatter number {index} about packaging and icons."),
+        ));
+    }
+    for index in 0..6 {
+        pages.push(seed(
+            format!("notes/peregrine-{index:02}.md"),
+            format!("Peregrine Ledger Rehearsal {index:02}"),
+            format!(
+                "peregrine ledger rehearsal notes {index}. Peregrine ledger rehearsal keeps \
+                 peregrine ledger rehearsal ordering stable across every peregrine ledger \
+                 rehearsal replay, variant {index}."
+            ),
+        ));
+    }
+    pages.push(seed(
+        "notes/quicksilver.md".to_string(),
+        "Quicksilver Decision".to_string(),
+        "Quicksilver decision, carried forward verbatim by publisher choice.".to_string(),
+    ));
+    store.writer.upsert_pages_batch(pages).await.unwrap();
+
+    let router = router_for_store(&store, ws, proj, ActorContext::anonymous(), false);
+
+    // Acquire the reference through the public query seam, not by hand.
+    let queried = call_tool(
+        &router,
+        200,
+        "memory_query",
+        serde_json::json!({ "query": "quicksilver", "context_budget": 4096 }),
+    )
+    .await;
+    assert_eq!(
+        queried["package"]["entries"][0]["page_path"], "notes/quicksilver.md",
+        "fixture must isolate the explicitly referenced page: {queried}"
+    );
+    let explicit_ref = queried["package"]["entries"][0]["context_ref"].clone();
+
+    let published = call_tool(
+        &router,
+        201,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0044-0000-7000-8000-000000000001",
+            "objective": "Carry the quicksilver decision forward",
+            "summary": "peregrine ledger rehearsal mid-flight",
+            "next_steps": ["finish peregrine ledger rehearsal"],
+            "context_refs": [explicit_ref],
+        }),
+    )
+    .await;
+
+    let claimed = call_tool(
+        &router,
+        202,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": published["handoff_id"],
+            "expected_revision": 1,
+            "run_id": "019f0044-0000-7000-8000-000000000002",
+            "attempt_id": "019f0044-0000-7000-8000-000000000003",
+            "context_budget": 260,
+            "lease_seconds": 30
+        }),
+    )
+    .await;
+
+    let entries = claimed["package"]["entries"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["context_ref"], explicit_ref,
+        "the publisher-selected reference must be entry zero: {claimed}"
+    );
+    assert_eq!(
+        entries[0]["selection_reason"], "handoff_explicit_ref",
+        "entry zero must be the explicit reference, not a retrieval hit: {claimed}"
+    );
+    assert!(
+        claimed["trace"]["candidate_count"].as_u64().unwrap() >= 7,
+        "retrieval must actually have competed with the explicit reference: {claimed}"
+    );
+    assert_eq!(
+        claimed["trace"]["deduplicated_count"], 0,
+        "the six retrieval candidates must be distinct competitors: {claimed}"
+    );
+    assert!(
+        entries
+            .iter()
+            .skip(1)
+            .any(|entry| entry["score"].as_f64().unwrap() < -1.0),
+        "a retrieval candidate must outrank -1.0, so only an explicit priority \
+         dimension can order the reference first: {claimed}"
+    );
+    assert!(
+        claimed["package"]["estimated_consumption"]
+            .as_u64()
+            .unwrap()
+            <= 260,
+        "the tight budget must still be respected: {claimed}"
+    );
+}
+
+/// Tracer for the claim-side retrieval query (#44): the handoff text reaches
+/// the store as raw prose so `route_fts_query` normalizes it exactly once.
+///
+/// Pre-quoting it here would look like explicit FTS5 syntax to the router,
+/// which then skips term routing — and a 1–2 character CJK term, the most
+/// common shape of a Chinese query, has no unicode61 leg that can match it.
+#[tokio::test]
+async fn cjk_handoff_text_still_routes_to_the_like_leg_at_claim() {
+    use engram_core::{NewPage, PagePath, Tier};
+
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/continuity.md").unwrap(),
+            title: "交接契约".to_string(),
+            // One glued unicode61 token: only the LIKE leg can match a
+            // two-character term inside it.
+            body: "本次交接契约回归验收的结论与后续步骤。".to_string(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        })
+        .await
+        .unwrap();
+
+    let router = router_for_store(&store, ws, proj, ActorContext::anonymous(), false);
+    let published = call_tool(
+        &router,
+        210,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0044-0000-7000-8000-000000000011",
+            "objective": "继续交接契约回归",
+            "summary": "契约 回归",
+        }),
+    )
+    .await;
+    let claimed = call_tool(
+        &router,
+        211,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": published["handoff_id"],
+            "expected_revision": 1,
+            "run_id": "019f0044-0000-7000-8000-000000000012",
+            "attempt_id": "019f0044-0000-7000-8000-000000000013",
+            "context_budget": 4096,
+            "lease_seconds": 30
+        }),
+    )
+    .await;
+
+    assert!(
+        claimed["package"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["page_path"] == "notes/continuity.md"),
+        "a multi-term CJK handoff must still find continuation candidates: {claimed}"
+    );
+}

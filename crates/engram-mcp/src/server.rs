@@ -1,6 +1,6 @@
 //! [`EngramServer`] — the MCP server skeleton + tool router.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -12,16 +12,16 @@ use engram_core::{
     AcceptanceCriterionStatus, ActiveProject, AgentKind, ArtifactInput, AssemblyOmission,
     AssemblyOmissionReason, AttemptId, AuthLevel, Capability, CheckpointWrite, ClaimId,
     ContextAssembler, ContextAssemblyRequest, ContextAssemblyResult, ContextCandidate, ContextKind,
-    ContextProvenance, ContextQuota, ContextRef, ContextRepresentations, Handoff, HandoffCancel,
-    HandoffClaim, HandoffClaimResult, HandoffId, HandoffRelease, NewHandoff, PageId, PagePath,
-    ParentResultInput, ProjectId, RelationshipInput, SessionId, Tier, WorkItemId,
-    WorkItemRelationshipKind, WorkItemState, WorkspaceId,
+    ContextPriority, ContextProvenance, ContextQuota, ContextRef, ContextRepresentations, Handoff,
+    HandoffCancel, HandoffClaim, HandoffClaimResult, HandoffId, HandoffRelease, NewHandoff,
+    ObservationId, PageId, PagePath, ParentResultInput, ProjectId, RelationshipInput, SessionId,
+    Tier, WorkItemId, WorkItemRelationshipKind, WorkItemState, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider};
 use engram_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
 use engram_store::{
     DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    WriterHandle, lookup_existing_scope, prepare_fts5_query,
+    WriterHandle, lookup_existing_scope,
 };
 use engram_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -1391,21 +1391,26 @@ impl EngramServer {
         ))
     }
 
-    async fn require_publishable_context_ref(
+    /// Every published reference must resolve exactly in its own encoded
+    /// scope. Resolved as one batch so a 20-reference handoff does not cost
+    /// 40 sequential store round trips.
+    async fn require_publishable_context_refs(
         &self,
-        reference: &ContextRef,
+        references: &[ContextRef],
     ) -> Result<(), McpError> {
-        match self.resolve_explicit_context_ref(reference.clone()).await? {
-            ResolvedHandoffRef::Candidate(_) => Ok(()),
-            ResolvedHandoffRef::Omission(omission) => Err(McpError::invalid_params(
-                format!(
-                    "context_ref is {}: {}",
-                    context_ref_omission_label(omission.reason),
-                    omission.context_ref
-                ),
-                None,
-            )),
+        for resolved in self.resolve_explicit_context_refs(references).await? {
+            if let ResolvedHandoffRef::Omission(omission) = resolved {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "context_ref is {}: {}",
+                        context_ref_omission_label(omission.reason),
+                        omission.context_ref
+                    ),
+                    None,
+                ));
+            }
         }
+        Ok(())
     }
 
     async fn assemble_handoff_claim_context(
@@ -1417,8 +1422,11 @@ impl EngramServer {
     ) -> Result<ContextAssemblyResult, McpError> {
         let mut omissions = Vec::new();
         let mut candidates = Vec::new();
-        for reference in &handoff.context_refs {
-            match self.resolve_explicit_context_ref(reference.clone()).await? {
+        for resolved in self
+            .resolve_explicit_context_refs(&handoff.context_refs)
+            .await?
+        {
+            match resolved {
                 ResolvedHandoffRef::Candidate(candidate) => candidates.push(candidate),
                 ResolvedHandoffRef::Omission(omission) => omissions.push(omission),
             }
@@ -1513,105 +1521,97 @@ impl EngramServer {
         Ok(candidates)
     }
 
-    async fn resolve_explicit_context_ref(
+    /// Resolve every publisher-selected reference against its own encoded
+    /// scope, batching the work into one lookup per distinct scope plus one
+    /// read per source table. Returns one outcome per input, in input order.
+    async fn resolve_explicit_context_refs(
         &self,
-        reference: ContextRef,
-    ) -> Result<ResolvedHandoffRef, McpError> {
-        let scope = match engram_store::lookup_existing_scope(
-            &self.reader,
-            reference.workspace(),
-            reference.project(),
-        )
-        .await
-        {
-            Ok(scope) => scope,
-            Err(engram_store::ScopeResolutionError::WorkspaceNotFound { .. })
-            | Err(engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. }) => {
-                return Ok(unresolved_ref(reference));
-            }
-            Err(error) => return Err(Self::scope_error(error)),
-        };
-        match reference.kind() {
-            ContextKind::WikiPage | ContextKind::SessionPage => {
-                self.resolve_explicit_page_ref(reference, scope).await
-            }
-            ContextKind::Observation => {
-                self.resolve_explicit_observation_ref(reference, scope)
-                    .await
+        references: &[ContextRef],
+    ) -> Result<Vec<ResolvedHandoffRef>, McpError> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scopes = self.batch_lookup_context_scopes(references).await?;
+        let mut page_revisions = HashSet::new();
+        let mut observation_ids = HashSet::new();
+        for reference in references {
+            match reference.kind() {
+                ContextKind::WikiPage | ContextKind::SessionPage => {
+                    if let Some(revision) = reference.page_revision() {
+                        page_revisions.insert(revision);
+                    }
+                }
+                ContextKind::Observation => {
+                    if let Some(identity) = reference.observation_id() {
+                        observation_ids.insert(identity);
+                    }
+                }
             }
         }
+        let pages_by_id: HashMap<_, _> = self
+            .reader
+            .context_pages_by_ids(page_revisions.into_iter().collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        let observations_by_id: HashMap<_, _> = self
+            .reader
+            .context_observations_by_ids(observation_ids.into_iter().collect())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .into_iter()
+            .map(|source| (source.id, source))
+            .collect();
+        Ok(references
+            .iter()
+            .map(|reference| {
+                let scope = scopes.get(&scope_key(reference)).copied().flatten();
+                match (scope, reference.kind()) {
+                    (None, _) => unresolved_ref(reference.clone()),
+                    (Some(scope), ContextKind::WikiPage | ContextKind::SessionPage) => {
+                        resolve_page_ref(reference.clone(), scope, &pages_by_id)
+                    }
+                    (Some(scope), ContextKind::Observation) => {
+                        resolve_observation_ref(reference.clone(), scope, &observations_by_id)
+                    }
+                }
+            })
+            .collect())
     }
 
-    async fn resolve_explicit_page_ref(
+    /// One `lookup_existing_scope` per distinct encoded workspace/project.
+    /// A missing scope maps to `None` so the reference is omitted, never
+    /// substituted with another scope.
+    async fn batch_lookup_context_scopes(
         &self,
-        reference: ContextRef,
-        scope: engram_store::ResolvedScope,
-    ) -> Result<ResolvedHandoffRef, McpError> {
-        let Some(revision) = reference.page_revision() else {
-            return Ok(unresolved_ref(reference));
-        };
-        let Some(path) = reference.page_path().cloned() else {
-            return Ok(unresolved_ref(reference));
-        };
-        let sources = self
-            .reader
-            .context_pages_by_ids(vec![revision])
+        references: &[ContextRef],
+    ) -> Result<HashMap<(String, String), Option<engram_store::ResolvedScope>>, McpError> {
+        let mut scopes: HashMap<(String, String), Option<engram_store::ResolvedScope>> =
+            HashMap::new();
+        for reference in references {
+            let key = scope_key(reference);
+            if scopes.contains_key(&key) {
+                continue;
+            }
+            let resolved = match engram_store::lookup_existing_scope(
+                &self.reader,
+                reference.workspace(),
+                reference.project(),
+            )
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let Some(source) = sources.into_iter().next() else {
-            return Ok(unresolved_ref(reference));
-        };
-        if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
-            return Ok(unauthorized_ref(reference));
+            {
+                Ok(scope) => Some(scope),
+                Err(engram_store::ScopeResolutionError::WorkspaceNotFound { .. })
+                | Err(engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. }) => {
+                    None
+                }
+                Err(error) => return Err(Self::scope_error(error)),
+            };
+            scopes.insert(key, resolved);
         }
-        if source.path != path
-            || source.workspace_name != reference.workspace()
-            || source.project_name != reference.project()
-        {
-            return Ok(unauthorized_ref(reference));
-        }
-        let kind = if source.path.as_str().starts_with("sessions/") {
-            ContextKind::SessionPage
-        } else {
-            ContextKind::WikiPage
-        };
-        if kind != reference.kind() {
-            return Ok(unresolved_ref(reference));
-        }
-        match explicit_page_candidate(reference.clone(), &source) {
-            Ok(candidate) => Ok(ResolvedHandoffRef::Candidate(candidate)),
-            Err(_) => Ok(unresolved_ref(reference)),
-        }
-    }
-
-    async fn resolve_explicit_observation_ref(
-        &self,
-        reference: ContextRef,
-        scope: engram_store::ResolvedScope,
-    ) -> Result<ResolvedHandoffRef, McpError> {
-        let Some(identity) = reference.observation_id() else {
-            return Ok(unresolved_ref(reference));
-        };
-        let sources = self
-            .reader
-            .context_observations_by_ids(vec![identity])
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let Some(source) = sources.into_iter().next() else {
-            return Ok(unresolved_ref(reference));
-        };
-        if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
-            return Ok(unauthorized_ref(reference));
-        }
-        if source.workspace_name != reference.workspace()
-            || source.project_name != reference.project()
-        {
-            return Ok(unauthorized_ref(reference));
-        }
-        match explicit_observation_candidate(reference.clone(), &source) {
-            Ok(candidate) => Ok(ResolvedHandoffRef::Candidate(candidate)),
-            Err(_) => Ok(unresolved_ref(reference)),
-        }
+        Ok(scopes)
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -2729,9 +2729,8 @@ impl EngramServer {
                 None,
             ));
         }
-        for reference in &args.context_refs {
-            self.require_publishable_context_ref(reference).await?;
-        }
+        self.require_publishable_context_refs(&args.context_refs)
+            .await?;
         let brief = cap_text_with_marker(
             &s.scrub(args.brief.as_deref().unwrap_or("")),
             HANDOFF_SUMMARY_MAX_CHARS,
@@ -3439,6 +3438,7 @@ struct ContextCandidateParts<'a> {
     context_ref: ContextRef,
     title: &'a str,
     snippet: &'a str,
+    priority: ContextPriority,
     score: f64,
     deduplication_key: String,
     retrieval_sources: Vec<String>,
@@ -3449,6 +3449,74 @@ struct ContextCandidateParts<'a> {
 enum ResolvedHandoffRef {
     Candidate(ContextCandidate),
     Omission(AssemblyOmission),
+}
+
+fn scope_key(reference: &ContextRef) -> (String, String) {
+    (
+        reference.workspace().to_owned(),
+        reference.project().to_owned(),
+    )
+}
+
+fn resolve_page_ref(
+    reference: ContextRef,
+    scope: engram_store::ResolvedScope,
+    pages_by_id: &HashMap<PageId, engram_store::PageContextSource>,
+) -> ResolvedHandoffRef {
+    let Some(revision) = reference.page_revision() else {
+        return unresolved_ref(reference);
+    };
+    let Some(path) = reference.page_path().cloned() else {
+        return unresolved_ref(reference);
+    };
+    let Some(source) = pages_by_id.get(&revision) else {
+        return unresolved_ref(reference);
+    };
+    if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
+        return unauthorized_ref(reference);
+    }
+    if source.path != path
+        || source.workspace_name != reference.workspace()
+        || source.project_name != reference.project()
+    {
+        return unauthorized_ref(reference);
+    }
+    let kind = if source.path.as_str().starts_with("sessions/") {
+        ContextKind::SessionPage
+    } else {
+        ContextKind::WikiPage
+    };
+    if kind != reference.kind() {
+        return unresolved_ref(reference);
+    }
+    match explicit_page_candidate(reference.clone(), source) {
+        Ok(candidate) => ResolvedHandoffRef::Candidate(candidate),
+        Err(_) => unresolved_ref(reference),
+    }
+}
+
+fn resolve_observation_ref(
+    reference: ContextRef,
+    scope: engram_store::ResolvedScope,
+    observations_by_id: &HashMap<ObservationId, engram_store::ObservationContextSource>,
+) -> ResolvedHandoffRef {
+    let Some(identity) = reference.observation_id() else {
+        return unresolved_ref(reference);
+    };
+    let Some(source) = observations_by_id.get(&identity) else {
+        return unresolved_ref(reference);
+    };
+    if source.workspace_id != scope.workspace_id || source.project_id != scope.project_id {
+        return unauthorized_ref(reference);
+    }
+    if source.workspace_name != reference.workspace() || source.project_name != reference.project()
+    {
+        return unauthorized_ref(reference);
+    }
+    match explicit_observation_candidate(reference.clone(), source) {
+        Ok(candidate) => ResolvedHandoffRef::Candidate(candidate),
+        Err(_) => unresolved_ref(reference),
+    }
 }
 
 fn unresolved_ref(context_ref: ContextRef) -> ResolvedHandoffRef {
@@ -3502,7 +3570,12 @@ fn handoff_retrieval_query(handoff: &Handoff) -> String {
     .filter(|part| !part.trim().is_empty())
     .collect::<Vec<_>>()
     .join(" ");
-    prepare_fts5_query(&raw)
+    // Raw on purpose: `search_pages_for_project` /
+    // `search_observations_for_project` run `route_fts_query`, which
+    // normalizes once and routes CJK terms to the trigram and LIKE legs.
+    // Pre-injecting `OR`/quotes here would make the router treat the text as
+    // explicit FTS5 syntax and skip that routing.
+    raw
 }
 
 fn explicit_page_candidate(
@@ -3513,7 +3586,8 @@ fn explicit_page_candidate(
         context_ref,
         title: &source.title,
         snippet: "",
-        score: -1.0,
+        priority: ContextPriority::Explicit,
+        score: 0.0,
         deduplication_key: format!("sha256:{}", source.body_sha256),
         retrieval_sources: vec!["handoff_explicit_ref".into()],
         selection_reason: "handoff_explicit_ref",
@@ -3529,7 +3603,8 @@ fn explicit_observation_candidate(
         context_ref,
         title: &source.title,
         snippet: "",
-        score: -1.0,
+        priority: ContextPriority::Explicit,
+        score: 0.0,
         deduplication_key: format!("sha256:{:x}", Sha256::digest(source.body.as_bytes())),
         retrieval_sources: vec!["handoff_explicit_ref".into()],
         selection_reason: "handoff_explicit_ref",
@@ -3550,6 +3625,7 @@ fn context_candidate(parts: ContextCandidateParts<'_>) -> ContextCandidate {
             .collect(),
         context_ref: parts.context_ref,
         title: parts.title.to_string(),
+        priority: parts.priority,
         score: parts.score,
         deduplication_key: parts.deduplication_key,
         selection_reason: parts.selection_reason.to_string(),
@@ -3575,6 +3651,7 @@ fn page_context_candidate(
         context_ref,
         title: &source.title,
         snippet: &hit.snippet,
+        priority: ContextPriority::Retrieved,
         score: hit.rank,
         deduplication_key: format!("sha256:{}", source.body_sha256),
         retrieval_sources: hit.provenance,
@@ -3596,6 +3673,7 @@ fn observation_context_candidate(
         context_ref,
         title: &source.title,
         snippet: &hit.snippet,
+        priority: ContextPriority::Retrieved,
         score: hit.rank,
         deduplication_key: format!("sha256:{:x}", Sha256::digest(source.body.as_bytes())),
         retrieval_sources: hit.provenance,

@@ -299,9 +299,13 @@ content.
 
 Handoff publish stores only the bounded brief and revisioned ContextRefs.
 Claim assembly uses that same assembler: explicit Handoff refs are combined
-with retrieval candidates under the same quotas, unresolved or unauthorized
-refs become bounded diagnostics without substituting another scope, and the
-package plus trace are returned on a successful claim. Rendering or assembling
+with retrieval candidates under the same quotas but carry a selection priority
+compared before the retrieval score, so a publisher-selected source enters
+quota and budget ahead of any rank; unresolved or unauthorized refs become
+bounded diagnostics without substituting another scope, and the package plus
+trace are returned on a successful claim. The retrieval leg receives the
+handoff text raw so the store's routed search normalizes it once and keeps
+its CJK legs. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
 Checkpoint accepts it. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.
