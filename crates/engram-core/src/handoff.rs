@@ -271,6 +271,8 @@ pub struct CheckpointWrite {
     #[serde(default)]
     pub artifacts: Vec<ArtifactInput>,
     #[serde(default)]
+    pub relationships: Vec<RelationshipInput>,
+    #[serde(default)]
     pub parent_result: Option<ParentResultInput>,
 }
 
@@ -286,6 +288,8 @@ pub struct CheckpointWriteResult {
     pub handoff_state: Option<HandoffState>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub relationships: Vec<WorkItemRelationship>,
     #[serde(default)]
     pub parent_result: Option<ParentResult>,
 }

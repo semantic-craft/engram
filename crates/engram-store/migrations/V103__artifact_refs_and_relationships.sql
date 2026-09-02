@@ -12,11 +12,6 @@ CREATE TABLE artifacts (
     git_ref             TEXT,
     commit_id           TEXT,
     tree_hash           TEXT,
-    dirty               INTEGER CHECK (dirty IS NULL OR dirty IN (0,1)),
-    local_path_hint     TEXT,
-    provenance          TEXT NOT NULL,
-    source_run_id       BLOB NOT NULL,
-    observed_at         INTEGER NOT NULL,
     workspace_id        BLOB NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     project_id          BLOB NOT NULL REFERENCES projects(id) ON DELETE CASCADE
 );
@@ -29,6 +24,11 @@ CREATE TABLE artifact_attachments (
     artifact_id     BLOB NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
     owner_kind      TEXT NOT NULL CHECK (owner_kind IN ('handoff','checkpoint','parent_result')),
     owner_id        BLOB NOT NULL,
+    source_run_id   BLOB NOT NULL,
+    observed_at     INTEGER NOT NULL,
+    provenance      TEXT NOT NULL,
+    dirty           INTEGER CHECK (dirty IS NULL OR dirty IN (0,1)),
+    local_path_hint TEXT,
     fact_changed    INTEGER NOT NULL DEFAULT 0 CHECK (fact_changed IN (0,1)),
     fact_verified   INTEGER NOT NULL DEFAULT 0 CHECK (fact_verified IN (0,1)),
     fact_committed  INTEGER NOT NULL DEFAULT 0 CHECK (fact_committed IN (0,1)),

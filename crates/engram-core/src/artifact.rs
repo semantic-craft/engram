@@ -13,7 +13,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::MemoryError;
-use crate::ids::{ArtifactId, SessionId};
+use crate::ids::{ArtifactId, ProjectId, SessionId};
 
 /// Kind of verifiable object a Handoff or Checkpoint can point at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -257,16 +257,24 @@ impl ArtifactInput {
         }
 
         let identity_key = match self.kind {
-            ArtifactKind::File => format!("file|{locator}"),
+            ArtifactKind::File => format!(
+                "file|{}|{locator}",
+                repository_identity.as_deref().unwrap_or("")
+            ),
             ArtifactKind::Git => format!(
                 "git|{}|{}",
                 repository_identity.as_deref().unwrap_or(""),
                 observed_revision.as_deref().unwrap_or("")
             ),
             ArtifactKind::Worktree => format!(
-                "worktree|{}|{}",
+                "worktree|{}|{}|{locator}|{}",
                 repository_identity.as_deref().unwrap_or(""),
-                observed_revision.as_deref().unwrap_or("")
+                observed_revision.as_deref().unwrap_or(""),
+                worktree_identity_fingerprint(
+                    self.dirty,
+                    tree_hash.as_deref(),
+                    content_hash.as_deref()
+                )
             ),
             ArtifactKind::External => format!(
                 "external|{locator}|{}",
@@ -312,6 +320,23 @@ pub struct NormalizedArtifact {
     pub identity_key: String,
 }
 
+impl NormalizedArtifact {
+    /// Stable identity including repository or project coordinates for files.
+    #[must_use]
+    pub fn identity_key_for_scope(&self, project_id: ProjectId) -> String {
+        if self.kind == ArtifactKind::File
+            && self
+                .repository_identity
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            format!("file|scope:{project_id}|{}", self.locator)
+        } else {
+            self.identity_key.clone()
+        }
+    }
+}
+
 /// Materialized artifact attached to a Handoff, Checkpoint, or parent result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
@@ -332,6 +357,22 @@ pub struct ArtifactRef {
     pub observed_at: Timestamp,
     pub delivery: DeliveryFacts,
     pub verification: Vec<VerificationEvidence>,
+}
+
+fn worktree_identity_fingerprint(
+    dirty: Option<bool>,
+    tree_hash: Option<&str>,
+    content_hash: Option<&str>,
+) -> String {
+    if dirty == Some(true) {
+        tree_hash
+            .filter(|value| !value.is_empty())
+            .or_else(|| content_hash.filter(|value| !value.is_empty()))
+            .unwrap_or("dirty")
+            .to_string()
+    } else {
+        "clean".to_string()
+    }
 }
 
 fn nonempty_opt(value: Option<&str>) -> Option<String> {
@@ -414,6 +455,50 @@ mod tests {
             ..empty_input()
         };
         assert!(input.normalized().is_err());
+    }
+
+    #[test]
+    fn file_identity_includes_repository_not_just_relative_path() {
+        let left = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/lib.rs".into(),
+            repository_identity: Some("github.com/org/repo-a".into()),
+            ..empty_input()
+        };
+        let right = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/lib.rs".into(),
+            repository_identity: Some("github.com/org/repo-b".into()),
+            ..empty_input()
+        };
+        assert_ne!(left.identity_key().unwrap(), right.identity_key().unwrap());
+        assert!(left.identity_key().unwrap().contains("repo-a"));
+    }
+
+    #[test]
+    fn dirty_worktrees_at_the_same_commit_have_distinct_identities() {
+        let left = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            tree_hash: Some("dirty-tree-a".into()),
+            dirty: Some(true),
+            local_path_hint: Some("/tmp/wt-a".into()),
+            ..empty_input()
+        };
+        let right = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt-b".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            tree_hash: Some("dirty-tree-b".into()),
+            dirty: Some(true),
+            local_path_hint: Some("/tmp/wt-b".into()),
+            ..empty_input()
+        };
+        assert_ne!(left.identity_key().unwrap(), right.identity_key().unwrap());
+        assert!(!left.identity_key().unwrap().contains("/tmp/wt-a"));
     }
 
     #[test]

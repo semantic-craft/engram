@@ -278,10 +278,12 @@ the conversation calls for them:\n\
   `attempt_id`. Identical retries replay the original result; a changed \
   request must use a new Attempt. A child WorkItem cannot claim its parent.\n\
 - `memory_checkpoint_write` — append durable progress for the exact \
-  WorkItem, including typed artifacts and optional parent_result evidence. \
-  The first receiver checkpoint supplies its live Claim and \
-  acknowledges the Handoff transactionally. Record `active`, `blocked`, \
-  `completed`, or `abandoned` explicitly; acknowledgement is not completion. \
+  WorkItem, including typed artifacts, explicit WorkItem relationships, \
+  and optional parent_result evidence. Responses expose ArtifactRefs and \
+  relationships with stable identities and revisions. The first receiver \
+  checkpoint supplies its live Claim and acknowledges the Handoff \
+  transactionally. Record `active`, `blocked`, `completed`, or \
+  `abandoned` explicitly; acknowledgement is not completion. \
   Changed/verified/committed/pushed/reviewed/merged/released/deployed/\
   submitted/approved facts stay independent and are never inferred. \
   A child cannot complete, abandon, claim, or supersede its parent.\n\
@@ -777,6 +779,8 @@ struct CheckpointWriteArgs {
     acceptance_criteria: Vec<AcceptanceCriterionArg>,
     #[serde(default)]
     artifacts: Vec<ArtifactInput>,
+    #[serde(default)]
+    relationships: Vec<RelationshipArg>,
     #[serde(default)]
     parent_result: Option<ParentResultInput>,
     #[serde(default)]
@@ -2632,7 +2636,9 @@ impl EngramServer {
         Handoff/Claim/revision triple on the first receiving checkpoint to \
         acknowledge that Handoff transactionally. A checkpoint explicitly \
         records WorkItem state and every acceptance criterion's satisfaction; \
-        acknowledgment is distinct from completion.")]
+        acknowledgment is distinct from completion. Attach typed ArtifactRefs \
+        and explicit WorkItem relationships; the response returns both with \
+        stable identities and revisions.")]
     async fn memory_checkpoint_write(
         &self,
         Parameters(args): Parameters<CheckpointWriteArgs>,
@@ -2661,6 +2667,9 @@ impl EngramServer {
             })
             .collect();
         let artifacts = Self::scrub_artifacts(s, args.artifacts);
+        let relationships = self
+            .parse_relationships(args.relationships, workspace_id, project_id)
+            .await?;
         let parent_result = args.parent_result.map(|result| ParentResultInput {
             summary: cap_text_with_marker(
                 &s.scrub(&result.summary),
@@ -2704,6 +2713,7 @@ impl EngramServer {
             attempt_id: AttemptId::from_str(&args.attempt_id)
                 .map_err(|e| McpError::invalid_params(format!("invalid attempt_id: {e}"), None))?,
             artifacts,
+            relationships,
             parent_result,
         };
         let result = self

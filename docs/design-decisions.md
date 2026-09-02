@@ -175,8 +175,13 @@ checkpoint Attempts bind actor, scope, exact identities, expected revisions,
 Run, and canonical request digest so a lost-response retry returns the original
 result while changed reuse fails closed. Claim secrets and checkpoint payloads
 are excluded from audit detail. Handoffs and Checkpoints may carry typed
-ArtifactRefs: files use repository-relative locators, Git/worktree refs use
-repository identity plus revision, and absolute paths stay local-path hints.
+ArtifactRefs: files use repository or project coordinates plus a
+repository-relative locator, Git refs use repository identity plus revision,
+worktrees distinguish dirty checkouts at the same commit, and absolute paths
+stay local-path hints. Observation metadata (source Run, timestamp, provenance,
+dirty, local-path hint) is stored per attachment so a later observer does not
+inherit the first writer's facts. Both Handoff and Checkpoint responses expose
+ArtifactRefs and relationships with stable identities and revisions.
 Changed, verified, committed, pushed, reviewed, merged, released, deployed,
 submitted, and approved facts are stored independently and never inferred from
 one another. Related work uses `depends_on`, `derived_from`, or `child_of`

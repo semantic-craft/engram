@@ -27,14 +27,19 @@ below start from the fork.
 
 - Handoffs and Checkpoints can carry typed ArtifactRefs (file, git, worktree,
   external) and explicit WorkItem relationships (`depends_on`, `derived_from`,
-  `child_of`). Artifact identity uses repository-relative locators or repository
-  identity plus revision; absolute cwd is only a local-path hint. Delivery facts
+  `child_of`). Both write responses expose ArtifactRefs and relationships with
+  stable identities and revisions. Artifact identity uses repository or project
+  coordinates plus a repository-relative locator, or repository identity plus
+  revision; dirty worktrees at the same commit stay distinct; absolute cwd is
+  only a local-path hint. Observation metadata (source Run, timestamp,
+  provenance, dirty, local-path hint) is stored per attachment. Delivery facts
   such as changed, verified, committed, pushed, reviewed, merged, released,
   deployed, submitted, and approved are recorded independently and never
   inferred from one another. Related work creates a new WorkItem and does not
-  inherit the prior claim or blockers. A child can return structured evidence
-  for its parent but cannot complete, abandon, claim, or supersede it. Engram
-  records observed status and performs no Git or external mutation.
+  inherit the prior claim or blockers. Relationship creation rejects
+  unauthorized actors. A child can return structured evidence for its parent
+  but cannot complete, abandon, claim, or supersede it. Engram records observed
+  status and performs no Git or external mutation.
 
 ### Changed
 

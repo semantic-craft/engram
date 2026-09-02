@@ -18,8 +18,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::artifacts::{
-    CHILD_MUTATION_FORBIDDEN, actor_run_is_child_of, audit_artifact_ids, load_owner_artifacts,
-    load_work_item_relationships, persist_artifacts, persist_parent_result, persist_relationships,
+    CHILD_MUTATION_FORBIDDEN, RELATIONSHIP_UNAUTHORIZED, actor_run_is_child_of, audit_artifact_ids,
+    load_owner_artifacts, load_work_item_relationships, persist_artifacts, persist_parent_result,
+    persist_relationships,
 };
 use crate::error::{StoreError, StoreResult};
 
@@ -1052,6 +1053,16 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
                 "cannot publish from terminal work item state {state}"
             )));
         }
+        if actor_run_is_child_of(&tx, id, &h.source_actor, h.source_run_id)? {
+            return Err(StoreError::InvalidState(
+                CHILD_MUTATION_FORBIDDEN.to_string(),
+            ));
+        }
+        if !h.relationships.is_empty() && owner_actor != h.source_actor {
+            return Err(StoreError::InvalidState(
+                RELATIONSHIP_UNAUTHORIZED.to_string(),
+            ));
+        }
         let owner_run_matches = owner_run
             .as_deref()
             .is_some_and(|bytes| bytes == h.source_run_id.as_bytes());
@@ -1668,6 +1679,7 @@ pub fn write_checkpoint(
         "work_item_state": input.work_item_state,
         "acceptance_criteria": input.acceptance_criteria,
         "artifacts": input.artifacts,
+        "relationships": input.relationships,
         "parent_result": input.parent_result,
     }))?;
     if let Some(replayed) = replay_attempt::<CheckpointWriteResult>(
@@ -1696,6 +1708,8 @@ pub fn write_checkpoint(
     let mut validation =
         if actor_run_is_child_of(&tx, input.work_item_id, &input.actor_key, input.run_id)? {
             Some(CHILD_MUTATION_FORBIDDEN.to_string())
+        } else if !input.relationships.is_empty() && owner_actor != input.actor_key {
+            Some(RELATIONSHIP_UNAUTHORIZED.to_string())
         } else if ws.as_slice() != input.workspace_id.as_bytes()
             || project.as_slice() != input.project_id.as_bytes()
         {
@@ -1939,6 +1953,16 @@ pub fn write_checkpoint(
         now,
         &input.artifacts,
     )?;
+    let relationships = persist_relationships(
+        &tx,
+        input.work_item_id,
+        input.workspace_id,
+        input.project_id,
+        &input.actor_key,
+        input.run_id,
+        now,
+        &input.relationships,
+    )?;
     let parent_result = match &input.parent_result {
         Some(result) => Some(persist_parent_result(
             &tx,
@@ -1961,6 +1985,7 @@ pub fn write_checkpoint(
         handoff_revision,
         handoff_state,
         artifacts,
+        relationships,
         parent_result,
     };
     record_attempt_success(
@@ -1992,7 +2017,11 @@ pub fn write_checkpoint(
         input.work_item_state.as_str(),
         now,
         &audit_artifact_ids(&result.artifacts),
-        &[],
+        &result
+            .relationships
+            .iter()
+            .map(|rel| rel.id.to_string())
+            .collect::<Vec<_>>(),
     )?;
     if matches!(
         input.work_item_state,
@@ -3701,6 +3730,7 @@ mod tests {
                 actor_key: "receiver".into(),
                 attempt_id: AttemptId::new(),
                 artifacts: vec![],
+                relationships: vec![],
                 parent_result: None,
             },
         )

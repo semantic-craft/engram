@@ -13,6 +13,8 @@ use crate::error::{StoreError, StoreResult};
 
 pub(crate) const CHILD_MUTATION_FORBIDDEN: &str =
     "child WorkItem cannot complete, abandon, claim, or supersede its parent";
+pub(crate) const RELATIONSHIP_UNAUTHORIZED: &str =
+    "unauthorized actor cannot create work item relationship";
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_artifacts(
@@ -53,7 +55,8 @@ fn persist_one_artifact(
     input: &ArtifactInput,
 ) -> StoreResult<ArtifactRef> {
     let normalized = input.normalized().map_err(StoreError::from)?;
-    let identity_hash = Sha256::digest(normalized.identity_key.as_bytes());
+    let identity_key = normalized.identity_key_for_scope(project_id);
+    let identity_hash = Sha256::digest(identity_key.as_bytes());
     let identity_hash: [u8; 32] = identity_hash.into();
     let artifact_id = artifact_id_from_hash(&identity_hash);
 
@@ -83,44 +86,44 @@ fn persist_one_artifact(
         }
     } else {
         tx.execute(
-                "INSERT INTO artifacts \
+            "INSERT INTO artifacts \
                  (id, identity_hash, kind, locator, observed_revision, content_hash, \
-                  repository_identity, git_ref, commit_id, tree_hash, dirty, local_path_hint, \
-                  provenance, source_run_id, observed_at, workspace_id, project_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                params![
-                    artifact_id.as_bytes(),
-                    identity_hash.as_slice(),
-                    normalized.kind.as_str(),
-                    normalized.locator,
-                    normalized.observed_revision,
-                    normalized.content_hash,
-                    normalized.repository_identity,
-                    normalized.git_ref,
-                    normalized.commit_id,
-                    normalized.tree_hash,
-                    normalized.dirty.map(i64::from),
-                    normalized.local_path_hint,
-                    normalized.provenance,
-                    source_run_id.as_bytes(),
-                    observed_at,
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                ],
-            )?;
+                  repository_identity, git_ref, commit_id, tree_hash, workspace_id, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                artifact_id.as_bytes(),
+                identity_hash.as_slice(),
+                normalized.kind.as_str(),
+                normalized.locator,
+                normalized.observed_revision,
+                normalized.content_hash,
+                normalized.repository_identity,
+                normalized.git_ref,
+                normalized.commit_id,
+                normalized.tree_hash,
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )?;
     }
 
     let facts = &normalized.delivery;
     tx.execute(
         "INSERT OR IGNORE INTO artifact_attachments \
-         (artifact_id, owner_kind, owner_id, fact_changed, fact_verified, fact_committed, \
-          fact_pushed, fact_reviewed, fact_merged, fact_released, fact_deployed, \
-          fact_submitted, fact_approved) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         (artifact_id, owner_kind, owner_id, source_run_id, observed_at, provenance, dirty, \
+          local_path_hint, fact_changed, fact_verified, fact_committed, fact_pushed, \
+          fact_reviewed, fact_merged, fact_released, fact_deployed, fact_submitted, \
+          fact_approved) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             artifact_id.as_bytes(),
             owner_kind,
             owner_id.as_slice(),
+            source_run_id.as_bytes(),
+            observed_at,
+            normalized.provenance,
+            normalized.dirty.map(i64::from),
+            normalized.local_path_hint,
             i64::from(facts.changed),
             i64::from(facts.verified),
             i64::from(facts.committed),
@@ -205,8 +208,8 @@ fn load_attachment(conn: &Connection, attachment_id: i64) -> StoreResult<Option<
     let row = conn
         .query_row(
             "SELECT a.id, a.kind, a.locator, a.observed_revision, a.content_hash, \
-                    a.repository_identity, a.git_ref, a.commit_id, a.tree_hash, a.dirty, \
-                    a.local_path_hint, a.provenance, a.source_run_id, a.observed_at, \
+                    a.repository_identity, a.git_ref, a.commit_id, a.tree_hash, t.dirty, \
+                    t.local_path_hint, t.provenance, t.source_run_id, t.observed_at, \
                     t.fact_changed, t.fact_verified, t.fact_committed, t.fact_pushed, \
                     t.fact_reviewed, t.fact_merged, t.fact_released, t.fact_deployed, \
                     t.fact_submitted, t.fact_approved \
@@ -383,6 +386,26 @@ fn persist_one_relationship(
         return Err(StoreError::InvalidState(
             "work item relationship cannot be a self-link".into(),
         ));
+    }
+    let from_owner: Option<String> = tx
+        .query_row(
+            "SELECT owner_actor FROM work_items WHERE id = ?1",
+            params![from_work_item_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match from_owner {
+        Some(owner) if owner == actor_key => {}
+        Some(_) => {
+            return Err(StoreError::InvalidState(
+                RELATIONSHIP_UNAUTHORIZED.to_string(),
+            ));
+        }
+        None => {
+            return Err(StoreError::NotFound(format!(
+                "related work item {from_work_item_id}"
+            )));
+        }
     }
     let target: Option<(Vec<u8>, Vec<u8>)> = tx
         .query_row(
