@@ -233,6 +233,11 @@ impl ArtifactInput {
                     ));
                 }
             }
+            ArtifactKind::Worktree if is_absolute_path(&locator) => {
+                return Err(MemoryError::MalformedRecord(
+                    "worktree artifact locator must not be an absolute filesystem path; put absolute paths in local_path_hint".into(),
+                ));
+            }
             ArtifactKind::Git | ArtifactKind::Worktree => {
                 if repository_identity
                     .as_ref()
@@ -455,6 +460,32 @@ mod tests {
             ..empty_input()
         };
         assert!(input.normalized().is_err());
+    }
+
+    #[test]
+    fn worktree_locator_rejects_absolute_paths() {
+        let input = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "/tmp/machine-a/engram".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("/tmp/machine-a/engram".into()),
+            ..empty_input()
+        };
+        let error = input.normalized().unwrap_err().to_string();
+        assert!(error.contains("local_path_hint"), "{error}");
+        assert!(!error.contains("https://"));
+    }
+
+    #[test]
+    fn external_locator_allows_https_url() {
+        let input = ArtifactInput {
+            kind: ArtifactKind::External,
+            locator: "https://github.com/semantic-craft/engram/issues/42".into(),
+            observed_revision: Some("open".into()),
+            ..empty_input()
+        };
+        assert!(input.normalized().is_ok());
     }
 
     #[test]

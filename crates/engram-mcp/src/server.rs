@@ -288,8 +288,10 @@ the conversation calls for them:\n\
   and optional parent_result evidence. Responses expose ArtifactRefs and \
   relationships with stable identities and revisions. The first receiver \
   checkpoint supplies its live Claim and acknowledges the Handoff \
-  transactionally. Record `active`, `blocked`, `completed`, or \
-  `abandoned` explicitly; acknowledgement is not completion. \
+  transactionally; that ack checkpoint may attach relationships. \
+  Records status, performs no Git or external mutation. Record \
+  `active`, `blocked`, `completed`, or `abandoned` explicitly; \
+  acknowledgement is not completion. \
   Changed/verified/committed/pushed/reviewed/merged/released/deployed/\
   submitted/approved facts stay independent and are never inferred. \
   A child cannot complete, abandon, claim, or supersede its parent.\n\
@@ -2636,9 +2638,11 @@ impl EngramServer {
         revisioned ContextRefs rather than copying canonical bodies into the \
         operational row. ContextRefs are validated for identity, revision, \
         existing scope, and visibility at publish time. May also carry typed \
-        ArtifactRefs and explicit WorkItem relationships. Returns WorkItem/Handoff \
-        identities and revisions. Publishing does not claim or acknowledge the \
-        handoff.")]
+        ArtifactRefs and explicit WorkItem relationships; absolute cwd is \
+        never identity. Engram records observed status and performs no Git or \
+        external mutation. Returns WorkItem/Handoff identities, ArtifactRefs, \
+        relationships, and revisions. Publishing does not claim or acknowledge \
+        the handoff.")]
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
@@ -2763,8 +2767,11 @@ impl EngramServer {
     #[tool(description = "Read the latest claimable handoff for this project \
         without consuming, claiming, acknowledging, or otherwise mutating it. \
         Expired leases become discoverable again. Set `include_claimed` only \
-        for inspection of a live claim. Returns exact WorkItem/Handoff ids and \
-        the current revision required by `memory_handoff_claim`.")]
+        for inspection of a live claim. Returns exact WorkItem/Handoff ids, \
+        ArtifactRefs, WorkItem relationships, and the current revision \
+        required by `memory_handoff_claim`. Absolute cwd is never identity. \
+        Engram records observed status and performs no Git or external \
+        mutation.")]
     async fn memory_handoff_discover(
         &self,
         Parameters(args): Parameters<HandoffDiscoverArgs>,
@@ -2927,11 +2934,13 @@ impl EngramServer {
     #[tool(description = "Append one checkpoint to an exact WorkItem using \
         optimistic WorkItem revision and a caller-supplied Attempt. Supply the \
         Handoff/Claim/revision triple on the first receiving checkpoint to \
-        acknowledge that Handoff transactionally. A checkpoint explicitly \
-        records WorkItem state and every acceptance criterion's satisfaction; \
-        acknowledgment is distinct from completion. Attach typed ArtifactRefs \
-        and explicit WorkItem relationships; the response returns both with \
-        stable identities and revisions.")]
+        acknowledge that Handoff transactionally. The first receiver may attach \
+        typed ArtifactRefs and explicit WorkItem relationships on that ack \
+        checkpoint. A checkpoint explicitly records WorkItem state and every \
+        acceptance criterion's satisfaction; acknowledgment is distinct from \
+        completion. Records status, performs no Git or external mutation. \
+        The response returns artifacts and relationships with stable \
+        identities and revisions.")]
     async fn memory_checkpoint_write(
         &self,
         Parameters(args): Parameters<CheckpointWriteArgs>,

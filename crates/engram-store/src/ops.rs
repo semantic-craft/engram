@@ -1730,10 +1730,16 @@ pub fn write_checkpoint(
         .iter()
         .map(|status| status.criterion.as_str())
         .collect();
+    let acknowledgement_attempted = input.handoff_id.is_some()
+        && input.claim_id.is_some()
+        && input.expected_handoff_revision.is_some();
     let mut validation =
         if actor_run_is_child_of(&tx, input.work_item_id, &input.actor_key, input.run_id)? {
             Some(CHILD_MUTATION_FORBIDDEN.to_string())
-        } else if !input.relationships.is_empty() && owner_actor != input.actor_key {
+        } else if !input.relationships.is_empty()
+            && owner_actor != input.actor_key
+            && !acknowledgement_attempted
+        {
             Some(RELATIONSHIP_UNAUTHORIZED.to_string())
         } else if ws.as_slice() != input.workspace_id.as_bytes()
             || project.as_slice() != input.project_id.as_bytes()
@@ -2768,7 +2774,7 @@ pub fn move_project_workspace(
         params![&to[..], &pid[..]],
     )? as u64;
     tx.execute(
-        "UPDATE artifacts SET workspace_id = ?1 WHERE project_id = ?2",
+        "UPDATE artifact_attachments SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )?;
     tx.execute(

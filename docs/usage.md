@@ -30,17 +30,23 @@ recover the task if the first disappears.
 
 `memory_handoff_begin` and `memory_checkpoint_write` can attach typed
 ArtifactRefs and explicit WorkItem relationships, and both responses return
-those refs and relationships with stable identities and revisions. File identity
-is repository (or project) coordinates plus a repository-relative locator; Git
-identity is repository plus revision; worktree identity distinguishes dirty
-checkouts at the same commit. Absolute cwd is a hint, not identity. Observation
-metadata (source Run, timestamp, provenance, dirty, local-path hint) belongs to
-the attachment, not the shared identity. Delivery facts stay independent:
-committed does not imply pushed, and verified evidence that names an older
-revision is stale. Related work uses `depends_on`, `derived_from`, or `child_of`
-and creates a new WorkItem instead of inheriting a claim or blocker. Engram
-records these facts; it does not run Git checkout, commit, push, merge, release,
-or deploy.
+those refs and relationships with stable identities and revisions. The first
+receiving checkpoint with a live Claim may attach artifacts and relationships
+while acknowledging the Handoff. File identity is repository (or project)
+coordinates plus a repository-relative locator; Git identity is repository plus
+revision; worktree identity distinguishes dirty checkouts at the same commit.
+Absolute cwd is a hint, not identity, and is rejected as a worktree locator.
+Observation metadata (source Run, timestamp, provenance, dirty, local-path
+hint, git ref, content hash, tree hash) belongs to the attachment, not the
+shared identity. Deleting the first writer's project does not CASCADE through
+the shared identity into another project's attachments. SessionStart
+pending-handoff markdown lists artifacts (kind, locator, repository/revision,
+id) and relationships (kind, from/to ids) without copying claim ids or treating
+cwd as identity. Delivery facts stay independent: committed does not imply
+pushed, and verified evidence that names an older revision is stale. Related
+work uses `depends_on`, `derived_from`, or `child_of` and creates a new
+WorkItem instead of inheriting a claim or blocker. Engram records these facts;
+it does not run Git checkout, commit, push, merge, release, or deploy.
 
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` with the id, revision, and source Run returned by

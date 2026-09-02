@@ -158,6 +158,11 @@ backpressure, or single-writer SQLite actor.
 | `handoffs` | Revisioned transfer offers (open / claimed / acknowledged / expired). |
 | `handoff_claims` | Opaque, actor/Run-bound receiver leases and their resolution state. |
 | `checkpoints` | Append-only ordered WorkItem progress and acceptance-criterion status. |
+| `artifacts` | Shared ArtifactRef identity (file/git/worktree/external). Git identity is repository plus revision; file identity is repository or `scope:{project_id}` plus a relative locator. No project-level CASCADE — deleting the first writer's project must not remove another scope's evidence. |
+| `artifact_attachments` | Per-observation attachment of an artifact to a Handoff, Checkpoint, or parent result. Scope, CASCADE, and observation fields (source Run, time, provenance, dirty, local-path hint, git_ref, content/tree hash) live here. |
+| `artifact_verification` | Verification evidence for one attachment, including the revision it applies to. Stale evidence is retained. |
+| `work_item_relationships` | Explicit `depends_on` / `derived_from` / `child_of` edges with complete from/to workspace and project scopes. |
+| `parent_results` | Structured child evidence for a parent WorkItem. Does not mutate the parent's state. |
 | `continuity_attempts` | Transactional replay outcomes bound to exact mutation inputs. |
 | `page_embeddings` | Optional vector rows for latest pages, one row per document chunk (`(page_id, chunk_index)` PK; long pages split on markdown boundaries, short pages are a single chunk 0). `(provider, model, dim)` is denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. The vector leg max-pools chunk scores per page. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
@@ -241,7 +246,7 @@ invariants below.
 | `memory_handoff_discover` | read-only | Fetch the latest claimable Handoff without consuming or acknowledging it. Expired leases are claimable again. Exposes ArtifactRefs and relationships with stable identities. |
 | `memory_handoff_claim` | write | Compare-and-set one exact Handoff revision to `claimed` for an authenticated actor and receiver Run under a bounded lease. Requires `context_budget` and returns the same ContextPackage + trace contract as `memory_query`. Attempt-idempotent. Assembly never accepts the Handoff. A child WorkItem cannot claim its parent. |
 | `memory_handoff_release` | write | Return one exact live Claim to `open`. Attempt-idempotent. |
-| `memory_checkpoint_write` | write | Append ordered WorkItem progress plus typed ArtifactRefs, explicit WorkItem relationships, and optional parent-result evidence; optionally acknowledge the exact receiving Claim in the same transaction. Responses expose ArtifactRefs and relationships with stable identities and revisions. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
+| `memory_checkpoint_write` | write | Append ordered WorkItem progress plus typed ArtifactRefs, explicit WorkItem relationships, and optional parent-result evidence; optionally acknowledge the exact receiving Claim in the same transaction. The first receiver may attach relationships on that ack checkpoint. Records status and performs no Git or external mutation. Responses expose ArtifactRefs and relationships with stable identities and revisions. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
 | `memory_handoff_cancel` | write | Let the source actor and source Run expire an exact open Handoff revision. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |

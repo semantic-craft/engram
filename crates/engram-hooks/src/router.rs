@@ -804,6 +804,34 @@ fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
             buf.push_str(&format!("- `{f}`\n"));
         }
     }
+    if !h.artifacts.is_empty() {
+        buf.push_str("\n**Artifacts**\n");
+        for artifact in &h.artifacts {
+            buf.push_str(&format!(
+                "- `{}` `{}`",
+                artifact.kind.as_str(),
+                artifact.locator
+            ));
+            if let Some(repository) = artifact.repository_identity.as_deref() {
+                buf.push_str(&format!(" · repository `{repository}`"));
+            }
+            if let Some(revision) = artifact.observed_revision.as_deref() {
+                buf.push_str(&format!(" · revision `{revision}`"));
+            }
+            buf.push_str(&format!(" · id `{}`\n", artifact.id));
+        }
+    }
+    if !work_item.relationships.is_empty() {
+        buf.push_str("\n**Relationships**\n");
+        for relationship in &work_item.relationships {
+            buf.push_str(&format!(
+                "- `{}` from `{}` to `{}`\n",
+                relationship.kind.as_str(),
+                relationship.from_work_item_id,
+                relationship.to_work_item_id
+            ));
+        }
+    }
 
     // Summary last, as reference prose. Models reading top-down
     // see the action items first; the summary is detail.
@@ -4299,6 +4327,133 @@ mod tests {
         assert!(
             rendered.contains("`context_budget`"),
             "the injected claim instruction must name every required argument: {rendered}"
+        );
+    }
+
+    /// SessionStart pending-handoff markdown lists hydrated ArtifactRefs and
+    /// WorkItem relationships. Absolute cwd is not identity.
+    #[tokio::test]
+    async fn session_start_handoff_markdown_lists_artifacts_and_relationships() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/artifact-repo";
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &engram_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        let target = state
+            .writer
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: SessionId::new(),
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "upstream evidence".into(),
+                acceptance_criteria: Vec::new(),
+                summary: "upstream evidence".into(),
+                brief: String::new(),
+                context_refs: Vec::new(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                artifacts: vec![],
+                relationships: vec![],
+            })
+            .await
+            .unwrap();
+
+        let published = state
+            .writer
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: SessionId::new(),
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "test".into(),
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "resume with evidence".into(),
+                acceptance_criteria: Vec::new(),
+                summary: "resume with evidence".into(),
+                brief: String::new(),
+                context_refs: Vec::new(),
+                open_questions: Vec::new(),
+                next_steps: vec!["claim then checkpoint".into()],
+                files_touched: Vec::new(),
+                artifacts: vec![engram_core::ArtifactInput {
+                    kind: engram_core::ArtifactKind::Git,
+                    locator: "origin".into(),
+                    observed_revision: Some("def456".into()),
+                    content_hash: None,
+                    repository_identity: Some("github.com/semantic-craft/engram".into()),
+                    git_ref: Some("main".into()),
+                    commit_id: Some("def456".into()),
+                    tree_hash: Some("tree-a".into()),
+                    dirty: Some(false),
+                    local_path_hint: Some("/tmp/machine-a/engram".into()),
+                    provenance: "source observation".into(),
+                    delivery: engram_core::DeliveryFacts::default(),
+                    verification: Vec::new(),
+                }],
+                relationships: vec![engram_core::RelationshipInput {
+                    kind: engram_core::WorkItemRelationshipKind::DependsOn,
+                    target_work_item_id: target.work_item_id,
+                    target_workspace_id: ws,
+                    target_project_id: proj,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let rendered = fetch_handoff_context(
+            &state,
+            HandoffQuery {
+                cwd: Some(cwd.into()),
+                workspace: None,
+                project: None,
+                project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
+            },
+            &ActorKey::default(),
+        )
+        .await
+        .unwrap()
+        .expect("pending handoff must render");
+
+        assert!(
+            rendered.contains("**Artifacts**")
+                && rendered.contains("`git`")
+                && rendered.contains("`origin`")
+                && rendered.contains("github.com/semantic-craft/engram")
+                && rendered.contains("def456")
+                && rendered.contains(&published.artifacts[0].id.to_string()),
+            "envelope must list artifact kind, locator, repository/revision, and id: {rendered}"
+        );
+        assert!(
+            rendered.contains("**Relationships**")
+                && rendered.contains("`depends_on`")
+                && rendered.contains(&published.work_item_id.to_string())
+                && rendered.contains(&target.work_item_id.to_string()),
+            "envelope must list relationship kind and from/to ids: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/tmp/machine-a/engram"),
+            "absolute cwd must not appear as artifact identity: {rendered}"
         );
     }
 

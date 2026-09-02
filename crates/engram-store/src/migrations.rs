@@ -336,8 +336,8 @@ mod tests {
     }
 
     /// Issue #44 stores bounded briefs and revisioned ContextRefs on Handoffs.
-    /// V103 (ArtifactRefs, #42) is already on main; this layer is V104 and must
-    /// not invent a V105 that would slot ahead of an unreleased V104.
+    /// V103 (ArtifactRefs, #42) is already on main; this layer is V104, and the
+    /// #42 follow-up stacks V105 strictly above it.
     #[test]
     fn v104_adds_handoff_context_columns_after_v103() {
         let versions: Vec<u32> = migrations::runner()
@@ -351,8 +351,8 @@ mod tests {
         );
         assert!(versions.contains(&104), "issue #44 must embed V104");
         assert!(
-            !versions.contains(&105),
-            "do not invent V105 ahead of unreleased V104"
+            !versions.contains(&106),
+            "do not invent V106 ahead of the unreleased V105"
         );
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -378,6 +378,60 @@ mod tests {
             .unwrap();
         assert_eq!(applied, 1);
         run(&mut conn).expect("V104 must be idempotent on reopen");
+    }
+
+    /// The #42 follow-up moves scope and per-observation fields off the shared
+    /// artifact identity row so purging one project cannot CASCADE through it
+    /// into another project's evidence.
+    #[test]
+    fn v105_moves_artifact_scope_onto_attachments_after_v104() {
+        let versions: Vec<u32> = migrations::runner()
+            .get_migrations()
+            .iter()
+            .map(Migration::version)
+            .collect();
+        assert!(versions.contains(&105), "the #42 follow-up must embed V105");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = Connection::open(tmp.path().join("memory.sqlite")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 104).unwrap();
+        run(&mut conn).expect("V105 must apply after V104");
+
+        let scope_on_identity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('artifacts') \
+                 WHERE name IN ('workspace_id', 'project_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scope_on_identity, 0,
+            "a shared identity row must carry no project scope to CASCADE from"
+        );
+        let scope_on_attachment: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('artifact_attachments') \
+                 WHERE name IN ('workspace_id', 'project_id', 'content_hash', \
+                                'git_ref', 'tree_hash')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scope_on_attachment, 5,
+            "scope and per-observation fields belong to the attachment"
+        );
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 105",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        run(&mut conn).expect("V105 must be idempotent on reopen");
     }
 
     /// Tripwire for the incident class itself: every embedded migration
