@@ -815,9 +815,11 @@ fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
         "\n---\n\
          _**To the receiving agent:** rendering this envelope did not claim or \
          acknowledge it. Call `memory_handoff_claim` with the exact Handoff id, \
-         revision, Run/Session id, and a fresh Attempt id before continuing. \
-         Persist `memory_checkpoint_write` to acknowledge it; release the claim \
-         if you cannot proceed._\n",
+         revision, Run/Session id, a fresh Attempt id, and a `context_budget` \
+         in selected-content UTF-8 bytes before continuing. The claim returns \
+         the continuation ContextPackage assembled within that budget. Persist \
+         `memory_checkpoint_write` to acknowledge it; release the claim if you \
+         cannot proceed._\n",
     );
     buf
 }
@@ -4290,6 +4292,13 @@ mod tests {
         assert!(
             handoff_pos < brief_pos,
             "pending handoff must precede the brief"
+        );
+        // `context_budget` is a required claim argument: an injected call
+        // shape without it is rejected during argument deserialization,
+        // before the claim runs.
+        assert!(
+            rendered.contains("`context_budget`"),
+            "the injected claim instruction must name every required argument: {rendered}"
         );
     }
 
