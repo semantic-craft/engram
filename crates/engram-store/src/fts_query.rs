@@ -119,24 +119,38 @@ fn quote_fts5_token(token: &str) -> String {
 /// fail to parse. Callers that know their input is prose run it through here
 /// first.
 ///
-/// Every ASCII punctuation character becomes a space and the four bare
-/// operator words are lower-cased (unicode61 folds case, so they still match
-/// their occurrences). What remains is barewords and CJK runs, which the
-/// router then term-splits and quotes on its own. A hyphenated token is split
-/// into its words rather than phrase-matched — for prose that widens recall
-/// instead of narrowing it.
+/// Every punctuation character becomes a separator and the four bare operator
+/// words are lower-cased (unicode61 folds case, so they still match their
+/// occurrences). Punctuation is judged by Unicode, not ASCII: Chinese prose
+/// is written with `，`, `。` and `（）`, and leaving those inside a term would
+/// glue a whole clause into one CJK run that only an exact trigram phrase can
+/// match — the search terms are there, but nothing finds them separately.
+///
+/// The exception is `/`, `_` and `-`, which the page tokenizer keeps *inside*
+/// a token (`tokenchars '/_-'`). Splitting those would stop `ui-refresh` from
+/// matching the content token it indexes as; kept whole, the router's own
+/// token pipeline emits both that token and its split form. A term left with
+/// no letters or digits at all is dropped, since it can only produce an empty
+/// phrase.
 #[must_use]
 pub fn natural_language_terms(raw: &str) -> String {
     raw.chars()
-        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .map(|c| if is_prose_separator(c) { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
+        .filter(|term| term.chars().any(char::is_alphanumeric))
         .map(|term| match term {
             "OR" | "AND" | "NOT" | "NEAR" => term.to_lowercase(),
             _ => term.to_owned(),
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Anything that is neither a letter, a digit, nor one of the characters the
+/// page tokenizer keeps inside a token.
+fn is_prose_separator(c: char) -> bool {
+    !(c.is_alphanumeric() || matches!(c, '/' | '_' | '-'))
 }
 
 /// Per-leg MATCH/LIKE inputs for CJK-aware routed search (#14).
@@ -264,6 +278,8 @@ mod tests {
             terms,
             "not ready the context package 44 needs review and a rerun"
         );
+        // A term with no letters or digits would only make an empty phrase.
+        assert_eq!(natural_language_terms("a - b / c"), "a b c");
         let routed = route_fts_query(&terms, CjkIndex::Trigram);
         assert!(routed.trigram.is_empty());
         assert!(routed.like_terms.is_empty());
@@ -272,18 +288,27 @@ mod tests {
             "not OR ready OR the OR context OR package OR 44 OR needs OR review OR and OR a OR rerun"
         );
 
-        // CJK runs survive: only ASCII punctuation is stripped, so full-width
-        // punctuation stays inside its term (it is not FTS5 grammar), and a
-        // 1-2 character term still reaches the LIKE fallback it depends on.
-        let routed = route_fts_query(&natural_language_terms("契约（回归）"), CjkIndex::Trigram);
-        assert_eq!(routed.trigram, "\"契约（回归）\"");
-        assert!(routed.like_terms.is_empty());
-        let routed = route_fts_query(&natural_language_terms("(契约) 回归!"), CjkIndex::Trigram);
+        // Chinese prose is punctuated with full-width marks. They must split
+        // terms too, or a whole clause becomes one CJK run that only an exact
+        // trigram phrase can match, and each 1-2 character term loses the LIKE
+        // fallback it depends on.
+        for prose in ["契约，回归。", "契约（回归）", "(契约) 回归!"] {
+            let routed = route_fts_query(&natural_language_terms(prose), CjkIndex::Trigram);
+            assert_eq!(
+                routed.like_terms,
+                vec!["契约".to_string(), "回归".to_string()],
+                "{prose}"
+            );
+            assert!(routed.trigram.is_empty(), "{prose}");
+            assert!(routed.unicode.is_empty(), "{prose}");
+        }
+
+        // `/ _ -` live inside content tokens (`tokenchars '/_-'`), so they are
+        // kept and the router emits both the whole token and its split form.
         assert_eq!(
-            routed.like_terms,
-            vec!["契约".to_string(), "回归".to_string()]
+            natural_language_terms("touched crates/engram-store/src/ops.rs — see ui_refresh"),
+            "touched crates/engram-store/src/ops rs see ui_refresh"
         );
-        assert!(routed.unicode.is_empty());
 
         assert_eq!(natural_language_terms("*** (\"\") ***"), "");
     }
