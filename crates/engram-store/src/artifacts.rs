@@ -60,49 +60,35 @@ fn persist_one_artifact(
     let identity_hash: [u8; 32] = identity_hash.into();
     let artifact_id = artifact_id_from_hash(&identity_hash);
 
-    let existing: Option<(Vec<u8>, Option<String>, Option<String>)> = tx
+    let existing: Option<Vec<u8>> = tx
         .query_row(
-            "SELECT id, content_hash, tree_hash FROM artifacts WHERE identity_hash = ?1",
+            "SELECT id FROM artifacts WHERE identity_hash = ?1",
             params![identity_hash.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .optional()?;
 
-    if let Some((existing_id, content_hash, tree_hash)) = existing {
+    if let Some(existing_id) = existing {
         if existing_id.as_slice() != artifact_id.as_bytes() {
             return Err(StoreError::MalformedRecord(
                 "artifact identity hash collided with a different id".into(),
             ));
         }
-        if hashes_conflict(content_hash.as_deref(), normalized.content_hash.as_deref()) {
-            return Err(StoreError::InvalidState(
-                "artifact content-hash mismatch for the same identity".into(),
-            ));
-        }
-        if hashes_conflict(tree_hash.as_deref(), normalized.tree_hash.as_deref()) {
-            return Err(StoreError::InvalidState(
-                "artifact tree-hash mismatch for the same identity".into(),
-            ));
-        }
+        reject_content_hash_conflict(tx, artifact_id, normalized.content_hash.as_deref())?;
     } else {
         tx.execute(
             "INSERT INTO artifacts \
-                 (id, identity_hash, kind, locator, observed_revision, content_hash, \
-                  repository_identity, git_ref, commit_id, tree_hash, workspace_id, project_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (id, identity_hash, kind, locator, observed_revision, \
+                  repository_identity, commit_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 artifact_id.as_bytes(),
                 identity_hash.as_slice(),
                 normalized.kind.as_str(),
                 normalized.locator,
                 normalized.observed_revision,
-                normalized.content_hash,
                 normalized.repository_identity,
-                normalized.git_ref,
                 normalized.commit_id,
-                normalized.tree_hash,
-                workspace_id.as_bytes(),
-                project_id.as_bytes(),
             ],
         )?;
     }
@@ -110,11 +96,13 @@ fn persist_one_artifact(
     let facts = &normalized.delivery;
     tx.execute(
         "INSERT OR IGNORE INTO artifact_attachments \
-         (artifact_id, owner_kind, owner_id, source_run_id, observed_at, provenance, dirty, \
-          local_path_hint, fact_changed, fact_verified, fact_committed, fact_pushed, \
+         (artifact_id, owner_kind, owner_id, source_run_id, observed_at, provenance, \
+          content_hash, git_ref, tree_hash, dirty, local_path_hint, workspace_id, project_id, \
+          fact_changed, fact_verified, fact_committed, fact_pushed, \
           fact_reviewed, fact_merged, fact_released, fact_deployed, fact_submitted, \
           fact_approved) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                 ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             artifact_id.as_bytes(),
             owner_kind,
@@ -122,8 +110,13 @@ fn persist_one_artifact(
             source_run_id.as_bytes(),
             observed_at,
             normalized.provenance,
+            normalized.content_hash,
+            normalized.git_ref,
+            normalized.tree_hash,
             normalized.dirty.map(i64::from),
             normalized.local_path_hint,
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
             i64::from(facts.changed),
             i64::from(facts.verified),
             i64::from(facts.committed),
@@ -207,8 +200,8 @@ pub(crate) fn load_owner_artifacts(
 fn load_attachment(conn: &Connection, attachment_id: i64) -> StoreResult<Option<ArtifactRef>> {
     let row = conn
         .query_row(
-            "SELECT a.id, a.kind, a.locator, a.observed_revision, a.content_hash, \
-                    a.repository_identity, a.git_ref, a.commit_id, a.tree_hash, t.dirty, \
+            "SELECT a.id, a.kind, a.locator, a.observed_revision, t.content_hash, \
+                    a.repository_identity, t.git_ref, a.commit_id, t.tree_hash, t.dirty, \
                     t.local_path_hint, t.provenance, t.source_run_id, t.observed_at, \
                     t.fact_changed, t.fact_verified, t.fact_committed, t.fact_pushed, \
                     t.fact_reviewed, t.fact_merged, t.fact_released, t.fact_deployed, \
@@ -677,8 +670,29 @@ pub(crate) fn audit_artifact_ids(artifacts: &[ArtifactRef]) -> Vec<String> {
         .collect()
 }
 
-fn hashes_conflict(existing: Option<&str>, incoming: Option<&str>) -> bool {
-    matches!((existing, incoming), (Some(left), Some(right)) if left != right)
+fn reject_content_hash_conflict(
+    tx: &rusqlite::Transaction<'_>,
+    artifact_id: ArtifactId,
+    incoming: Option<&str>,
+) -> StoreResult<()> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let mut stmt = tx.prepare(
+        "SELECT content_hash FROM artifact_attachments \
+         WHERE artifact_id = ?1 AND content_hash IS NOT NULL",
+    )?;
+    let hashes = stmt.query_map(params![artifact_id.as_bytes()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for hash in hashes {
+        if hash? != incoming {
+            return Err(StoreError::InvalidState(
+                "artifact content-hash mismatch for the same identity".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn artifact_id_from_hash(hash: &[u8; 32]) -> ArtifactId {

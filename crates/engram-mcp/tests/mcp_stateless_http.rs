@@ -1923,6 +1923,7 @@ async fn artifact_observations_are_per_attachment_and_do_not_collide() {
             "summary": "Second project attaches the same git object.",
             "workspace": "default",
             "project": "sibling",
+            "cwd": "/tmp/project-b/engram",
             "artifacts": [{
                 "kind": "git",
                 "locator": "origin",
@@ -1936,7 +1937,11 @@ async fn artifact_observations_are_per_attachment_and_do_not_collide() {
         }),
     )
     .await;
-    assert_eq!(first["artifacts"][0]["id"], second["artifacts"][0]["id"]);
+    assert_eq!(
+        first["artifacts"][0]["id"], second["artifacts"][0]["id"],
+        "one repository at one revision is one identity, whatever absolute \
+         checkout observed it"
+    );
     assert_eq!(
         second["artifacts"][0]["source_run_id"],
         "019f0042-0000-7000-8000-000000000071"
@@ -2372,5 +2377,535 @@ async fn handoff_text_routes_as_prose_at_claim() {
     assert_eq!(
         awkward_claim["handoff"]["state"], "claimed",
         "the claim must survive prose that looks like query syntax: {awkward_claim}"
+    );
+}
+
+/// Issue #42: a live Claim's first receiving checkpoint may attach
+/// ArtifactRefs and WorkItem relationships. A stranger without a claim is
+/// still independently unauthorized and must not mutate the graph.
+#[tokio::test]
+async fn receiver_first_checkpoint_can_attach_artifacts_and_relationships() {
+    let tmp = TempDir::new().unwrap();
+    let owner = ActorContext {
+        agent: Some("claude-code".into()),
+        user: Some("owner-user".into()),
+        ..ActorContext::default()
+    };
+    let receiver = ActorContext {
+        agent: Some("codex".into()),
+        user: Some("receiver-user".into()),
+        ..ActorContext::default()
+    };
+    let stranger = ActorContext {
+        agent: Some("opencode".into()),
+        user: Some("stranger-user".into()),
+        ..ActorContext::default()
+    };
+    let (owner_router, store) = make_router_for_actor(&tmp, false, owner).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let receiver_router = router_for_store(&store, ws, proj, receiver, false);
+    let stranger_router = router_for_store(&store, ws, proj, stranger, false);
+
+    let owner_run = "019f0042-0000-7000-8000-000000000080";
+    let receiving_run = "019f0042-0000-7000-8000-000000000081";
+    let published = call_tool(
+        &owner_router,
+        200,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": owner_run,
+            "objective": "Receiver ack with evidence",
+            "acceptance_criteria": ["first checkpoint carries relationships"],
+            "summary": "Owner published work for another agent to claim."
+        }),
+    )
+    .await;
+    let dependency = call_tool(
+        &owner_router,
+        201,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000082",
+            "objective": "Upstream evidence",
+            "summary": "Target of the receiver's depends_on link."
+        }),
+    )
+    .await;
+    let claimed = call_tool(
+        &receiver_router,
+        202,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": published["handoff_id"],
+            "expected_revision": 1,
+            "run_id": receiving_run,
+            "attempt_id": "019f0042-0000-7000-8000-000000000083",
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let count_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_item_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_before, 0);
+
+    let stranger_error = call_tool_failure(
+        &stranger_router,
+        203,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": published["work_item_id"],
+            "run_id": "019f0042-0000-7000-8000-000000000084",
+            "attempt_id": "019f0042-0000-7000-8000-000000000085",
+            "expected_work_item_revision": 1,
+            "summary": "Stranger tried to attach a relationship without a claim.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "first checkpoint carries relationships", "satisfied": false}
+            ],
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": dependency["work_item_id"]
+            }]
+        }),
+    )
+    .await;
+    assert!(
+        stranger_error.to_lowercase().contains("unauthorized"),
+        "{stranger_error}"
+    );
+    let count_after_stranger: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_item_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_after_stranger, count_before);
+
+    let checkpoint = call_tool(
+        &receiver_router,
+        204,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": published["work_item_id"],
+            "run_id": receiving_run,
+            "attempt_id": "019f0042-0000-7000-8000-000000000086",
+            "expected_work_item_revision": 1,
+            "handoff_id": published["handoff_id"],
+            "claim_id": claimed["claim_id"],
+            "expected_handoff_revision": claimed["revision"],
+            "summary": "Receiver acknowledged with artifact and relationship evidence.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "first checkpoint carries relationships", "satisfied": false}
+            ],
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "ack123",
+                "commit_id": "ack123",
+                "git_ref": "feature",
+                "provenance": "receiver ack",
+                "local_path_hint": "/tmp/receiver/engram"
+            }],
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": dependency["work_item_id"]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(checkpoint["handoff_state"], "acknowledged");
+    assert_eq!(checkpoint["artifacts"][0]["kind"], "git");
+    assert_eq!(checkpoint["artifacts"][0]["git_ref"], "feature");
+    assert_eq!(checkpoint["artifacts"][0]["provenance"], "receiver ack");
+    assert_eq!(checkpoint["relationships"][0]["kind"], "depends_on");
+    assert_eq!(
+        checkpoint["relationships"][0]["from_work_item_id"],
+        published["work_item_id"]
+    );
+    assert_eq!(
+        checkpoint["relationships"][0]["to_work_item_id"],
+        dependency["work_item_id"]
+    );
+    let count_after_receiver: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_item_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_after_receiver, 1);
+}
+
+/// Issue #42: shared artifact identity survives purging the first writer's
+/// project; the remaining project's attachment and observation stay intact.
+///
+/// Identity is repository plus revision, so the two projects observe the same
+/// object from two different absolute checkouts and must land on one id. That
+/// shared row is what made the project-level CASCADE dangerous: deleting the
+/// first writer's project would have taken the second project's evidence with
+/// it.
+#[tokio::test]
+async fn purging_first_writer_project_keeps_shared_artifact_for_other_scope() {
+    let tmp = TempDir::new().unwrap();
+    let (router, store) = make_router(&tmp, false).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project_a = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let project_b = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    // A lifecycle observation in the surviving project: the purge must not
+    // reach it through the shared identity row either.
+    let session_b = engram_core::SessionId::new();
+    store
+        .writer
+        .begin_session(engram_core::NewSession {
+            id: session_b,
+            workspace_id: ws,
+            project_id: project_b,
+            agent_kind: engram_core::AgentKind::Codex,
+            cwd: Some("/tmp/project-b/engram".into()),
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(engram_core::NewObservation {
+            session_id: session_b,
+            workspace_id: ws,
+            project_id: project_b,
+            kind: engram_core::ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "sibling ledger".into(),
+            body: "sibling ledger evidence recorded before the purge".into(),
+            importance: 5,
+        })
+        .await
+        .unwrap();
+
+    let first = call_tool(
+        &router,
+        210,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000090",
+            "objective": "Project A writer",
+            "summary": "First project attaches the shared git object.",
+            "cwd": "/tmp/project-a/engram",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "share123",
+                "commit_id": "share123",
+                "git_ref": "main",
+                "tree_hash": "tree-a",
+                "dirty": false,
+                "local_path_hint": "/tmp/project-a/engram",
+                "provenance": "project a"
+            }]
+        }),
+    )
+    .await;
+    let second = call_tool(
+        &router,
+        211,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000091",
+            "objective": "Project B writer",
+            "summary": "Second project attaches the same git object.",
+            "workspace": "default",
+            "project": "sibling",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "share123",
+                "commit_id": "share123",
+                "git_ref": "feature",
+                "tree_hash": "tree-b",
+                "dirty": true,
+                "local_path_hint": "/tmp/project-b/engram",
+                "provenance": "project b"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(first["artifacts"][0]["id"], second["artifacts"][0]["id"]);
+
+    store
+        .writer
+        .purge_project(ws, project_a, "default/scratch")
+        .await
+        .unwrap();
+
+    let rediscovered = call_tool(
+        &router,
+        212,
+        "memory_handoff_discover",
+        serde_json::json!({
+            "workspace": "default",
+            "project": "sibling"
+        }),
+    )
+    .await;
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["id"],
+        second["artifacts"][0]["id"]
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["provenance"],
+        "project b"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["git_ref"],
+        "feature"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["tree_hash"],
+        "tree-b"
+    );
+    assert_eq!(rediscovered["handoff"]["artifacts"][0]["dirty"], true);
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["local_path_hint"],
+        "/tmp/project-b/engram"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["source_run_id"],
+        "019f0042-0000-7000-8000-000000000091"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let attachments: i64 = conn
+        .query_row("SELECT COUNT(*) FROM artifact_attachments", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(attachments, 1);
+    let identities: i64 = conn
+        .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(identities, 1);
+
+    let recalled = call_tool(
+        &router,
+        213,
+        "memory_query",
+        serde_json::json!({
+            "query": "sibling ledger",
+            "workspace": "default",
+            "project": "sibling",
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    assert!(
+        recalled["package"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["title"] == "sibling ledger"),
+        "the surviving project's observation must still be readable: {recalled}"
+    );
+}
+
+/// Issue #42: git_ref / tree_hash / content_hash are per observation. A later
+/// observer must not inherit the first writer's branch or hashes.
+#[tokio::test]
+async fn later_git_observer_does_not_inherit_first_writer_ref_or_hash() {
+    let tmp = TempDir::new().unwrap();
+    let (router, store) = make_router(&tmp, false).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let _sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+
+    let first = call_tool(
+        &router,
+        220,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-0000000000a0",
+            "objective": "First git observer",
+            "summary": "Observed main at tree A.",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "obs123",
+                "commit_id": "obs123",
+                "git_ref": "main",
+                "tree_hash": "tree-a",
+                "local_path_hint": "/tmp/machine-a/engram",
+                "provenance": "first observer"
+            }]
+        }),
+    )
+    .await;
+    let second = call_tool(
+        &router,
+        221,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-0000000000a1",
+            "objective": "Second git observer",
+            "summary": "Observed feature at tree B.",
+            "workspace": "default",
+            "project": "sibling",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "obs123",
+                "commit_id": "obs123",
+                "git_ref": "feature",
+                "tree_hash": "tree-b",
+                "local_path_hint": "/Users/other/machine-b/engram",
+                "provenance": "second observer"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(first["artifacts"][0]["id"], second["artifacts"][0]["id"]);
+    assert_eq!(second["artifacts"][0]["git_ref"], "feature");
+    assert_eq!(second["artifacts"][0]["tree_hash"], "tree-b");
+    assert_eq!(
+        second["artifacts"][0]["local_path_hint"],
+        "/Users/other/machine-b/engram"
+    );
+    assert_eq!(first["artifacts"][0]["git_ref"], "main");
+    assert_eq!(first["artifacts"][0]["tree_hash"], "tree-a");
+
+    let rediscovered = call_tool(
+        &router,
+        222,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(rediscovered["handoff"]["artifacts"][0]["git_ref"], "main");
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["tree_hash"],
+        "tree-a"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["local_path_hint"],
+        "/tmp/machine-a/engram"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["provenance"],
+        "first observer"
+    );
+}
+
+/// Issue #42: worktree locators reject absolute filesystem paths; git identity
+/// still ignores differing cwd hints.
+#[tokio::test]
+async fn worktree_locator_rejects_absolute_path_git_identity_ignores_cwd_hint() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let absolute = call_tool_failure(
+        &router,
+        230,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-0000000000b0",
+            "objective": "Absolute worktree locator",
+            "summary": "Absolute cwd must not become worktree identity.",
+            "artifacts": [{
+                "kind": "worktree",
+                "locator": "/tmp/machine-a/engram",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "abc123",
+                "local_path_hint": "/tmp/machine-a/engram"
+            }]
+        }),
+    )
+    .await;
+    assert!(
+        absolute.to_lowercase().contains("absolute")
+            || absolute.to_lowercase().contains("local_path_hint"),
+        "{absolute}"
+    );
+
+    let machine_a = call_tool(
+        &router,
+        231,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-0000000000b1",
+            "objective": "Git hint A",
+            "summary": "First cwd hint.",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "cwd123",
+                "commit_id": "cwd123",
+                "local_path_hint": "/tmp/machine-a/engram"
+            }]
+        }),
+    )
+    .await;
+    let machine_b = call_tool(
+        &router,
+        232,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-0000000000b2",
+            "objective": "Git hint B",
+            "summary": "Second cwd hint.",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "cwd123",
+                "commit_id": "cwd123",
+                "local_path_hint": "/Users/other/machine-b/engram"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        machine_a["artifacts"][0]["id"],
+        machine_b["artifacts"][0]["id"]
+    );
+    assert_eq!(
+        machine_a["artifacts"][0]["local_path_hint"],
+        "/tmp/machine-a/engram"
+    );
+    assert_eq!(
+        machine_b["artifacts"][0]["local_path_hint"],
+        "/Users/other/machine-b/engram"
     );
 }
