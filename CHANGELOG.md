@@ -73,7 +73,9 @@ below start from the fork.
   ContextPackage and assembly trace. Explicit refs carry a selection priority
   that puts them ahead of every retrieval candidate for quota and budget,
   whatever the retrieval rank; missing or unauthorized refs stay bounded
-  diagnostics, and assembly never marks a Handoff accepted. Compare-and-set failure does not
+  diagnostics, and assembly never marks a Handoff accepted. The claim's
+  assembly options are part of its Attempt identity, so only a byte-identical
+  request replays. Compare-and-set failure does not
   return a package; assembly failure after a recorded claim leaves the live
   lease recoverable.
 

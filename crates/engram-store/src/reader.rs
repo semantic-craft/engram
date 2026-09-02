@@ -6,7 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -4683,6 +4683,71 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| WorkspaceId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Resolve many `(workspace_name, project_name)` pairs to ids in one
+    /// query, without creating anything.
+    ///
+    /// A pair that names a missing workspace or a missing project inside an
+    /// existing workspace is simply absent from the result: callers that must
+    /// fail closed check for its absence. This exists so batch paths (a
+    /// Handoff carrying up to 20 revisioned ContextRefs) do not pay a
+    /// workspace read plus a project read per name pair.
+    ///
+    /// # Errors
+    /// Propagates any SQL, identifier, or pool error.
+    pub async fn find_scopes_by_name(
+        &self,
+        pairs: Vec<(String, String)>,
+    ) -> StoreResult<HashMap<(String, String), (WorkspaceId, ProjectId)>> {
+        if pairs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut unique: Vec<(String, String)> = Vec::new();
+        for pair in pairs {
+            if !unique.contains(&pair) {
+                unique.push(pair);
+            }
+        }
+        self.with_conn(move |conn| {
+            // One statement over a row-value IN list: `(w.name, p.name) IN
+            // (VALUES (?,?), ...)`. The join is the only place the pairing is
+            // authoritative, so a project name is never matched against the
+            // wrong workspace.
+            let rows = unique.iter().map(|_| "(?,?)").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT w.name, p.name, w.id, p.id \
+                 FROM projects p JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE (w.name, p.name) IN (VALUES {rows})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let bound: Vec<&dyn rusqlite::ToSql> = unique
+                .iter()
+                .flat_map(|(workspace, project)| {
+                    [
+                        workspace as &dyn rusqlite::ToSql,
+                        project as &dyn rusqlite::ToSql,
+                    ]
+                })
+                .collect();
+            let mut resolved = HashMap::new();
+            let mut found = stmt.query(rusqlite::params_from_iter(bound))?;
+            while let Some(row) = found.next()? {
+                let workspace_name: String = row.get(0)?;
+                let project_name: String = row.get(1)?;
+                let workspace_bytes: Vec<u8> = row.get(2)?;
+                let project_bytes: Vec<u8> = row.get(3)?;
+                resolved.insert(
+                    (workspace_name, project_name),
+                    (
+                        WorkspaceId::from_slice(&workspace_bytes)?,
+                        ProjectId::from_slice(&project_bytes)?,
+                    ),
+                );
+            }
+            Ok(resolved)
         })
         .await
     }

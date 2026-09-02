@@ -688,6 +688,28 @@ async fn handoff_attempts_are_replay_safe_and_expired_leases_are_recoverable() {
         "{mismatch}"
     );
 
+    // The claim returns an assembled package, so the assembly options are part
+    // of the Attempt identity too: changing the budget is a changed request,
+    // not a lost-response retry that may replay under the same id.
+    let changed_budget = call_tool_failure(
+        winning_router,
+        251,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": handoff_id,
+            "expected_revision": 1,
+            "run_id": winning_run,
+            "attempt_id": winning_attempt,
+            "context_budget": 8192,
+            "lease_seconds": 30
+        }),
+    )
+    .await;
+    assert!(
+        changed_budget.contains("different continuity request"),
+        "{changed_budget}"
+    );
+
     let claim_id = first_claim["claim_id"].as_str().unwrap();
     let wrong_owner = call_tool_failure(
         replacement_router,

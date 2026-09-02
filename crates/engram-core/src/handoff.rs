@@ -238,6 +238,17 @@ pub struct HandoffClaim {
     pub attempt_id: AttemptId,
     pub actor_key: String,
     pub lease_seconds: u64,
+    /// Caller-supplied context-assembly options, verbatim, as part of the
+    /// Attempt identity.
+    ///
+    /// The claim returns an assembled ContextPackage, so budget, quotas and
+    /// already-used refs decide what the caller receives. Without them in the
+    /// digest, reusing one Attempt id with a different budget would replay the
+    /// recorded claim and then assemble a *different* package — a changed
+    /// request silently succeeding instead of being rejected. `Null` for
+    /// callers that assemble nothing.
+    #[serde(default)]
+    pub context_options: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

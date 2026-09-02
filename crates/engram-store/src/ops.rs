@@ -1244,6 +1244,7 @@ pub fn claim_handoff(
         "expected_revision": input.expected_revision,
         "run_id": input.run_id,
         "lease_seconds": input.lease_seconds,
+        "context_options": input.context_options,
     }))?;
     if let Some(replayed) = replay_attempt::<HandoffClaimResult>(
         &tx,
@@ -3734,6 +3735,7 @@ mod tests {
                 attempt_id: AttemptId::new(),
                 actor_key: "receiver".into(),
                 lease_seconds: 60,
+                context_options: serde_json::Value::Null,
             },
         )
         .unwrap();

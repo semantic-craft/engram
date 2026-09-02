@@ -303,12 +303,14 @@ with retrieval candidates under the same quotas but carry a selection priority
 compared before the retrieval score, so a publisher-selected source enters
 quota and budget ahead of any rank; unresolved or unauthorized refs become
 bounded diagnostics without substituting another scope, and the package plus
-trace are returned on a successful claim. The retrieval leg receives the
-handoff text as prose — never pre-compiled into an FTS5 expression — so the
-store's routed search normalizes it once and keeps its CJK legs, and
-generated prose carrying `NOT`, quotes, or parentheses cannot fail parsing
-after the compare-and-set has already claimed the Handoff. Pages surfaced by
-that leg take the same access bump as every other retrieval path. Rendering or assembling
+trace are returned on a successful claim. The retrieval leg reduces the
+handoff text to plain search terms first (`natural_language_terms`), so
+generated prose carrying `NOT`, `title:`, a lone `*`, quotes, or parentheses
+is never read as an FTS5 expression; the store's routed search then
+normalizes once and keeps its CJK legs. Pages surfaced by that leg take the
+same access bump as every other retrieval path, and the assembly options are
+part of the claim Attempt's identity, so reusing one Attempt id with a
+different budget is a conflicting request rather than a replay. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
 Checkpoint accepts it. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.

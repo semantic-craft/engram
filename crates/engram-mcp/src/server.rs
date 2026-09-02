@@ -1571,7 +1571,7 @@ impl EngramServer {
         Ok(references
             .iter()
             .map(|reference| {
-                let scope = scopes.get(&scope_key(reference)).copied().flatten();
+                let scope = scopes.get(&scope_key(reference)).copied();
                 match (scope, reference.kind()) {
                     (None, _) => unresolved_ref(reference.clone()),
                     (Some(scope), ContextKind::WikiPage | ContextKind::SessionPage) => {
@@ -1585,37 +1585,30 @@ impl EngramServer {
             .collect())
     }
 
-    /// One `lookup_existing_scope` per distinct encoded workspace/project.
-    /// A missing scope maps to `None` so the reference is omitted, never
-    /// substituted with another scope.
+    /// Resolve every distinct encoded workspace/project pair in one reader
+    /// query. A pair with no existing scope maps to `None` so its references
+    /// are omitted, never substituted with another scope.
     async fn batch_lookup_context_scopes(
         &self,
         references: &[ContextRef],
-    ) -> Result<HashMap<(String, String), Option<engram_store::ResolvedScope>>, McpError> {
-        let mut scopes: HashMap<(String, String), Option<engram_store::ResolvedScope>> =
-            HashMap::new();
-        for reference in references {
-            let key = scope_key(reference);
-            if scopes.contains_key(&key) {
-                continue;
-            }
-            let resolved = match engram_store::lookup_existing_scope(
-                &self.reader,
-                reference.workspace(),
-                reference.project(),
-            )
+    ) -> Result<HashMap<(String, String), engram_store::ResolvedScope>, McpError> {
+        let resolved = self
+            .reader
+            .find_scopes_by_name(references.iter().map(scope_key).collect())
             .await
-            {
-                Ok(scope) => Some(scope),
-                Err(engram_store::ScopeResolutionError::WorkspaceNotFound { .. })
-                | Err(engram_store::ScopeResolutionError::ProjectNotFoundInWorkspace { .. }) => {
-                    None
-                }
-                Err(error) => return Err(Self::scope_error(error)),
-            };
-            scopes.insert(key, resolved);
-        }
-        Ok(scopes)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(resolved
+            .into_iter()
+            .map(|(names, (workspace_id, project_id))| {
+                (
+                    names,
+                    engram_store::ResolvedScope {
+                        workspace_id,
+                        project_id,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -2861,6 +2854,19 @@ impl EngramServer {
                 .map_err(|e| McpError::invalid_params(format!("invalid attempt_id: {e}"), None))?,
             actor_key: Self::continuity_actor(&parts),
             lease_seconds: args.lease_seconds.unwrap_or(300).clamp(1, 3_600),
+            // The assembly options decide what this Attempt returns, so they
+            // belong in its identity: reusing the id with a different budget
+            // is a changed request, not a lost-response retry. The already-used
+            // set is canonicalized because the assembler treats it as a set.
+            context_options: serde_json::json!({
+                "context_budget": args.context_budget,
+                "context_quotas": &args.context_quotas,
+                "already_used_context": args
+                    .already_used_context
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+            }),
         };
         let claimed = self
             .writer
@@ -3574,36 +3580,10 @@ fn handoff_retrieval_query(handoff: &Handoff) -> String {
     .filter(|part| !part.trim().is_empty())
     .collect::<Vec<_>>()
     .join(" ");
-    force_natural_language(&raw)
-}
-
-/// Route handoff-derived text as prose, never as an FTS5 expression.
-///
-/// The store's routed search normalizes the query itself, so this must not
-/// pre-run `prepare_fts5_query`: the injected `OR`/quotes would look like
-/// deliberate FTS5 syntax to `route_fts_query`, which then skips term routing
-/// and drops the LIKE leg a 1–2 character CJK term depends on.
-///
-/// Handoff summaries are generated prose, though, and prose can carry the
-/// same triggers by accident — a summary of `NOT ready` or `(#44)` would
-/// select explicit-query mode and then fail FTS5 parsing. Because the claim's
-/// compare-and-set has already succeeded by then, that surfaces as an error
-/// on a Handoff that stays claimed until release or lease expiry. Neutralize
-/// exactly the four triggers: drop `"`/`(`/`)`, and lower-case the bare
-/// operator words (unicode61 folds case, so recall is unchanged). Every
-/// remaining term is then quoted or passed through by the router's own token
-/// pipeline.
-fn force_natural_language(raw: &str) -> String {
-    raw.chars()
-        .map(|c| if matches!(c, '"' | '(' | ')') { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .map(|term| match term {
-            "OR" | "AND" | "NOT" | "NEAR" => term.to_lowercase(),
-            _ => term.to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    // The store owns what counts as FTS5 metasyntax; handoff text is prose
+    // and must never be read as a query expression. Routing happens once, in
+    // the store's routed search.
+    engram_store::natural_language_terms(&raw)
 }
 
 fn explicit_page_candidate(
@@ -5246,6 +5226,7 @@ mod tests {
                 attempt_id: AttemptId::new(),
                 actor_key: "anonymous".into(),
                 lease_seconds: 30,
+                context_options: serde_json::Value::Null,
             })
             .await
             .unwrap();

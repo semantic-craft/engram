@@ -108,6 +108,37 @@ fn quote_fts5_token(token: &str) -> String {
     }
 }
 
+/// Reduce generated prose to plain search terms, so text that was never
+/// authored as a query cannot be read as one.
+///
+/// [`prepare_fts5_query`] and [`route_fts_query`] deliberately honour explicit
+/// FTS5 syntax written by an agent or user. Machine-generated prose — a
+/// handoff summary, a next step — carries the same shapes by accident: a
+/// summary of `NOT ready`, a path fragment ending in `title:`, a stray `*`, a
+/// parenthesised `(#44)` or a quoted phrase all reach FTS5 as grammar and can
+/// fail to parse. Callers that know their input is prose run it through here
+/// first.
+///
+/// Every ASCII punctuation character becomes a space and the four bare
+/// operator words are lower-cased (unicode61 folds case, so they still match
+/// their occurrences). What remains is barewords and CJK runs, which the
+/// router then term-splits and quotes on its own. A hyphenated token is split
+/// into its words rather than phrase-matched — for prose that widens recall
+/// instead of narrowing it.
+#[must_use]
+pub fn natural_language_terms(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|term| match term {
+            "OR" | "AND" | "NOT" | "NEAR" => term.to_lowercase(),
+            _ => term.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Per-leg MATCH/LIKE inputs for CJK-aware routed search (#14).
 ///
 /// unicode61 keeps word semantics for Latin text but tokenizes a CJK run as
@@ -220,6 +251,42 @@ pub fn route_fts_query(raw: &str, cjk_index: CjkIndex) -> RoutedFtsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_prose_never_reaches_fts5_as_grammar() {
+        // Each of these parses as FTS5 grammar when passed through verbatim:
+        // `NOT` cannot open an expression, `title:` is a column prefix with no
+        // term, a lone `*` is a dangling prefix operator, and quotes/parens
+        // switch the router into explicit-syntax mode.
+        let prose = "NOT ready: the \"context package\" (#44) needs review AND a * rerun";
+        let terms = natural_language_terms(prose);
+        assert_eq!(
+            terms,
+            "not ready the context package 44 needs review and a rerun"
+        );
+        let routed = route_fts_query(&terms, CjkIndex::Trigram);
+        assert!(routed.trigram.is_empty());
+        assert!(routed.like_terms.is_empty());
+        assert_eq!(
+            routed.unicode,
+            "not OR ready OR the OR context OR package OR 44 OR needs OR review OR and OR a OR rerun"
+        );
+
+        // CJK runs survive: only ASCII punctuation is stripped, so full-width
+        // punctuation stays inside its term (it is not FTS5 grammar), and a
+        // 1-2 character term still reaches the LIKE fallback it depends on.
+        let routed = route_fts_query(&natural_language_terms("契约（回归）"), CjkIndex::Trigram);
+        assert_eq!(routed.trigram, "\"契约（回归）\"");
+        assert!(routed.like_terms.is_empty());
+        let routed = route_fts_query(&natural_language_terms("(契约) 回归!"), CjkIndex::Trigram);
+        assert_eq!(
+            routed.like_terms,
+            vec!["契约".to_string(), "回归".to_string()]
+        );
+        assert!(routed.unicode.is_empty());
+
+        assert_eq!(natural_language_terms("*** (\"\") ***"), "");
+    }
 
     #[test]
     fn colon_is_not_column_syntax() {

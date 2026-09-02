@@ -24,7 +24,7 @@ mod scope;
 pub mod users;
 mod writer;
 
-pub use fts_query::prepare_fts5_query;
+pub use fts_query::{natural_language_terms, prepare_fts5_query};
 
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
