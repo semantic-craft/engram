@@ -64,6 +64,8 @@ fn new_handoff(
         open_questions: vec![],
         next_steps: vec![],
         files_touched: vec![],
+        artifacts: vec![],
+        relationships: vec![],
     }
 }
 

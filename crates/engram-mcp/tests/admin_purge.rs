@@ -173,6 +173,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    artifacts: vec![],
+                    relationships: vec![],
                 })
                 .await
                 .unwrap();

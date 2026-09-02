@@ -114,7 +114,7 @@ priors are at the [bottom](#influences-and-prior-art).
 
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
-  typed handoff with open questions, next steps, and a session summary. Grok
+  typed handoff with open questions, next steps, artifact evidence, and a session summary. Grok
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
   `memory_handoff_discover`, then claim the exact revision before resuming.
 - **"What did we decide about X six weeks ago?"** Type

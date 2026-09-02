@@ -237,11 +237,11 @@ invariants below.
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
-| `memory_handoff_begin` | write | Create a WorkItem and open Handoff, or publish a continuation for an exact owned WorkItem. Only new WorkItems use the create-capable scope path. |
-| `memory_handoff_discover` | read-only | Fetch the latest claimable Handoff without consuming or acknowledging it. Expired leases are claimable again. |
-| `memory_handoff_claim` | write | Compare-and-set one exact Handoff revision to `claimed` for an authenticated actor and receiver Run under a bounded lease. Attempt-idempotent. |
+| `memory_handoff_begin` | write | Create a WorkItem and open Handoff, or publish a continuation for an exact owned WorkItem. Only new WorkItems use the create-capable scope path. May carry typed ArtifactRefs and explicit WorkItem relationships. |
+| `memory_handoff_discover` | read-only | Fetch the latest claimable Handoff without consuming or acknowledging it. Expired leases are claimable again. Exposes ArtifactRefs and relationships with stable identities. |
+| `memory_handoff_claim` | write | Compare-and-set one exact Handoff revision to `claimed` for an authenticated actor and receiver Run under a bounded lease. Attempt-idempotent. A child WorkItem cannot claim its parent. |
 | `memory_handoff_release` | write | Return one exact live Claim to `open`. Attempt-idempotent. |
-| `memory_checkpoint_write` | write | Append ordered WorkItem progress; optionally acknowledge the exact receiving Claim in the same transaction. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
+| `memory_checkpoint_write` | write | Append ordered WorkItem progress and optional artifact/parent-result evidence; optionally acknowledge the exact receiving Claim in the same transaction. Explicitly records active/blocked/completed/abandoned. Attempt-idempotent. |
 | `memory_handoff_cancel` | write | Let the source actor and source Run expire an exact open Handoff revision. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |

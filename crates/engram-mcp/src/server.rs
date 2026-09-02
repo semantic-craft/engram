@@ -9,15 +9,19 @@ use engram_consolidate::{
     run_auto_improve_review, run_lint, run_sweep,
 };
 use engram_core::{
-    AcceptanceCriterionStatus, ActiveProject, AgentKind, AttemptId, AuthLevel, Capability,
-    CheckpointWrite, ClaimId, ContextAssembler, ContextAssemblyRequest, ContextCandidate,
-    ContextKind, ContextProvenance, ContextQuota, ContextRef, ContextRepresentations,
-    HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff, PageId, PagePath,
-    ProjectId, SessionId, Tier, WorkItemId, WorkItemState, WorkspaceId,
+    AcceptanceCriterionStatus, ActiveProject, AgentKind, ArtifactInput, AttemptId, AuthLevel,
+    Capability, CheckpointWrite, ClaimId, ContextAssembler, ContextAssemblyRequest,
+    ContextCandidate, ContextKind, ContextProvenance, ContextQuota, ContextRef,
+    ContextRepresentations, HandoffCancel, HandoffClaim, HandoffId, HandoffRelease, NewHandoff,
+    PageId, PagePath, ParentResultInput, ProjectId, RelationshipInput, SessionId, Tier, WorkItemId,
+    WorkItemRelationshipKind, WorkItemState, WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider};
 use engram_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
-use engram_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
+use engram_store::{
+    DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
+    WriterHandle, lookup_existing_scope,
+};
 use engram_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
@@ -141,6 +145,58 @@ fn push_handoff_omission_marker(
     out.push(marker);
 }
 
+fn scrub_opt(sanitizer: &engram_core::Sanitizer, value: Option<String>) -> Option<String> {
+    value.map(|text| {
+        cap_text_with_marker(
+            &sanitizer.scrub(&text),
+            HANDOFF_FILE_MAX_CHARS,
+            "artifact field",
+        )
+    })
+}
+
+fn scrub_artifact(
+    sanitizer: &engram_core::Sanitizer,
+    mut artifact: ArtifactInput,
+) -> ArtifactInput {
+    artifact.locator = cap_text_with_marker(
+        &sanitizer.scrub(&artifact.locator),
+        HANDOFF_FILE_MAX_CHARS,
+        "artifact locator",
+    );
+    artifact.observed_revision = scrub_opt(sanitizer, artifact.observed_revision);
+    artifact.content_hash = scrub_opt(sanitizer, artifact.content_hash);
+    artifact.repository_identity = scrub_opt(sanitizer, artifact.repository_identity);
+    artifact.git_ref = scrub_opt(sanitizer, artifact.git_ref);
+    artifact.commit_id = scrub_opt(sanitizer, artifact.commit_id);
+    artifact.tree_hash = scrub_opt(sanitizer, artifact.tree_hash);
+    artifact.local_path_hint = scrub_opt(sanitizer, artifact.local_path_hint);
+    artifact.provenance = cap_text_with_marker(
+        &sanitizer.scrub(&artifact.provenance),
+        HANDOFF_ITEM_MAX_CHARS,
+        "artifact provenance",
+    );
+    artifact.verification = artifact
+        .verification
+        .into_iter()
+        .map(|mut evidence| {
+            evidence.check = cap_text_with_marker(
+                &sanitizer.scrub(&evidence.check),
+                HANDOFF_ITEM_MAX_CHARS,
+                "verification check",
+            );
+            evidence.result = cap_text_with_marker(
+                &sanitizer.scrub(&evidence.result),
+                HANDOFF_ITEM_MAX_CHARS,
+                "verification result",
+            );
+            evidence.applies_to_revision = scrub_opt(sanitizer, evidence.applies_to_revision);
+            evidence
+        })
+        .collect();
+    artifact
+}
+
 /// Instructions surfaced to clients via `ServerInfo`. Sent on every
 /// MCP handshake so Claude Code / Codex / OpenCode see this in their
 /// session preamble. Maps conversational triggers to tool names so
@@ -203,23 +259,32 @@ the conversation calls for them:\n\
   the current session and you want to ensure the next agent has context \
   (the SessionEnd hook also auto-captures this). Supply the source `run_id`; \
   omit `work_item_id` and supply an objective to create a WorkItem, or pass \
-  the exact owned WorkItem id to continue it. DO NOT use this to \
-  summarize work mid-session, check project status, or answer a request \
-  for a briefing. Keep the summary terse (2-3 sentences); put detail \
-  in open_questions + next_steps bullets. Pass `workspace` + `project` \
-  together only when leaving a handoff for a named sibling \
-  workspace/project.\n\
+  the exact owned WorkItem id to continue it. Attach typed `artifacts` \
+  (file/git/worktree/external) and explicit `depends_on`/`derived_from`/`child_of` \
+  relationships; absolute cwd is never artifact or WorkItem identity. Engram \
+  records observed status and does not run Git checkout, commit, push, merge, \
+  release, or deploy. Related work creates a new WorkItem and never inherits \
+  the prior claim or blockers. DO NOT use this to summarize work mid-session, \
+  check project status, or answer a request for a briefing. Keep the summary \
+  terse (2-3 sentences); put detail in open_questions + next_steps bullets. \
+  Pass `workspace` + `project` together only when leaving a handoff for a \
+  named sibling workspace/project.\n\
 - `memory_handoff_discover` — when the user asks where work left off and \
   no SessionStart block is visible. This read is non-destructive: it never \
-  consumes or acknowledges a Handoff.\n\
+  consumes or acknowledges a Handoff. Responses include ArtifactRefs and \
+  WorkItem relationships with stable identities and revisions.\n\
 - `memory_handoff_claim` — before acting as receiver, claim the exact \
   Handoff revision with the current Run and a fresh caller-supplied \
   `attempt_id`. Identical retries replay the original result; a changed \
-  request must use a new Attempt.\n\
+  request must use a new Attempt. A child WorkItem cannot claim its parent.\n\
 - `memory_checkpoint_write` — append durable progress for the exact \
-  WorkItem. The first receiver checkpoint supplies its live Claim and \
+  WorkItem, including typed artifacts and optional parent_result evidence. \
+  The first receiver checkpoint supplies its live Claim and \
   acknowledges the Handoff transactionally. Record `active`, `blocked`, \
-  `completed`, or `abandoned` explicitly; acknowledgement is not completion.\n\
+  `completed`, or `abandoned` explicitly; acknowledgement is not completion. \
+  Changed/verified/committed/pushed/reviewed/merged/released/deployed/\
+  submitted/approved facts stay independent and are never inferred. \
+  A child cannot complete, abandon, claim, or supersede its parent.\n\
 - `memory_handoff_release` — return a live Claim to `open` when the \
   receiver will not continue. Supply a fresh Attempt; expired leases become \
   claimable without a manual release.\n\
@@ -592,6 +657,12 @@ struct HandoffBeginArgs {
     /// Files touched during the session.
     #[serde(default)]
     files_touched: Vec<String>,
+    /// Typed artifact evidence. Absolute cwd is never artifact identity.
+    #[serde(default)]
+    artifacts: Vec<ArtifactInput>,
+    /// Explicit WorkItem relationships (`depends_on`, `derived_from`, `child_of`).
+    #[serde(default)]
+    relationships: Vec<RelationshipArg>,
     /// Working directory at the time of handoff. Used to match the
     /// next agent's discovery routing.
     #[serde(default)]
@@ -705,9 +776,23 @@ struct CheckpointWriteArgs {
     #[serde(default)]
     acceptance_criteria: Vec<AcceptanceCriterionArg>,
     #[serde(default)]
+    artifacts: Vec<ArtifactInput>,
+    #[serde(default)]
+    parent_result: Option<ParentResultInput>,
+    #[serde(default)]
     project: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct RelationshipArg {
+    kind: String,
+    target_work_item_id: String,
+    #[serde(default)]
+    target_workspace: Option<String>,
+    #[serde(default)]
+    target_project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -848,6 +933,60 @@ impl EngramServer {
 
     fn scope_error(err: engram_store::ScopeResolutionError) -> McpError {
         McpError::internal_error(err.to_string(), None)
+    }
+
+    fn scrub_artifacts(
+        sanitizer: &engram_core::Sanitizer,
+        artifacts: Vec<ArtifactInput>,
+    ) -> Vec<ArtifactInput> {
+        artifacts
+            .into_iter()
+            .take(HANDOFF_LIST_MAX_ITEMS)
+            .map(|artifact| scrub_artifact(sanitizer, artifact))
+            .collect()
+    }
+
+    async fn parse_relationships(
+        &self,
+        args: Vec<RelationshipArg>,
+        current_ws: WorkspaceId,
+        current_proj: ProjectId,
+    ) -> Result<Vec<RelationshipInput>, McpError> {
+        let mut relationships = Vec::with_capacity(args.len());
+        for rel in args.into_iter().take(HANDOFF_LIST_MAX_ITEMS) {
+            let kind = WorkItemRelationshipKind::from_str(&rel.kind).map_err(|e| {
+                McpError::invalid_params(format!("invalid relationship kind: {e}"), None)
+            })?;
+            let target_work_item_id =
+                WorkItemId::from_str(&rel.target_work_item_id).map_err(|e| {
+                    McpError::invalid_params(format!("invalid target_work_item_id: {e}"), None)
+                })?;
+            let (target_workspace_id, target_project_id) = match (
+                rel.target_workspace.as_deref(),
+                rel.target_project.as_deref(),
+            ) {
+                (None, None) => (current_ws, current_proj),
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(McpError::invalid_params(
+                        WORKSPACE_PROJECT_PAIR_REQUIRED,
+                        None,
+                    ));
+                }
+                (Some(workspace), Some(project)) => {
+                    let scope = lookup_existing_scope(&self.reader, workspace, project)
+                        .await
+                        .map_err(Self::scope_error)?;
+                    (scope.workspace_id, scope.project_id)
+                }
+            };
+            relationships.push(RelationshipInput {
+                kind,
+                target_work_item_id,
+                target_workspace_id,
+                target_project_id,
+            });
+        }
+        Ok(relationships)
     }
 
     /// Construct a server backed by the given reader/writer + 3-tuple
@@ -2309,6 +2448,10 @@ impl EngramServer {
             "handoff file",
             "handoff files_touched",
         );
+        let artifacts = Self::scrub_artifacts(s, args.artifacts);
+        let relationships = self
+            .parse_relationships(args.relationships, ws, proj)
+            .await?;
         let acceptance_criteria = cap_handoff_list(
             args.acceptance_criteria
                 .iter()
@@ -2342,6 +2485,8 @@ impl EngramServer {
             open_questions,
             next_steps,
             files_touched,
+            artifacts,
+            relationships,
         };
         let published = self
             .writer
@@ -2515,6 +2660,15 @@ impl EngramServer {
                 satisfied: criterion.satisfied,
             })
             .collect();
+        let artifacts = Self::scrub_artifacts(s, args.artifacts);
+        let parent_result = args.parent_result.map(|result| ParentResultInput {
+            summary: cap_text_with_marker(
+                &s.scrub(&result.summary),
+                HANDOFF_SUMMARY_MAX_CHARS,
+                "parent result summary",
+            ),
+            artifacts: Self::scrub_artifacts(s, result.artifacts),
+        });
         let checkpoint = CheckpointWrite {
             work_item_id: WorkItemId::from_str(&args.work_item_id).map_err(|e| {
                 McpError::invalid_params(format!("invalid work_item_id: {e}"), None)
@@ -2549,6 +2703,8 @@ impl EngramServer {
             actor_key: Self::continuity_actor(&parts),
             attempt_id: AttemptId::from_str(&args.attempt_id)
                 .map_err(|e| McpError::invalid_params(format!("invalid attempt_id: {e}"), None))?,
+            artifacts,
+            parent_result,
         };
         let result = self
             .writer
@@ -5951,6 +6107,8 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    artifacts: vec![],
+                    relationships: vec![],
                     cwd: Some(r"C:\GIT\engram".into()),
                     project: None,
                     workspace: None,

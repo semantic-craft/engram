@@ -1,0 +1,444 @@
+//! Typed, verifiable artifact references for WorkItem continuity.
+//!
+//! An [`ArtifactRef`] identifies a file, Git repository revision, worktree, or
+//! external object without treating an absolute cwd as identity. Delivery facts
+//! such as changed, verified, committed, and pushed are stored independently
+//! and are never inferred from one another. Engram records observed status; it
+//! never checks out, commits, pushes, merges, releases, deploys, submits, or
+//! approves anything in Git or an external system.
+
+#![allow(missing_docs)]
+
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
+
+use crate::error::MemoryError;
+use crate::ids::{ArtifactId, SessionId};
+
+/// Kind of verifiable object a Handoff or Checkpoint can point at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    File,
+    Git,
+    Worktree,
+    External,
+}
+
+impl ArtifactKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Git => "git",
+            Self::Worktree => "worktree",
+            Self::External => "external",
+        }
+    }
+}
+
+impl std::str::FromStr for ArtifactKind {
+    type Err = MemoryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "file" => Ok(Self::File),
+            "git" => Ok(Self::Git),
+            "worktree" => Ok(Self::Worktree),
+            "external" => Ok(Self::External),
+            other => Err(MemoryError::MalformedRecord(format!(
+                "unknown artifact kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// Independent delivery facts. Each flag is an explicit observation; no flag
+/// is derived from any other flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DeliveryFacts {
+    pub changed: bool,
+    pub verified: bool,
+    pub committed: bool,
+    pub pushed: bool,
+    pub reviewed: bool,
+    pub merged: bool,
+    pub released: bool,
+    pub deployed: bool,
+    pub submitted: bool,
+    pub approved: bool,
+}
+
+impl DeliveryFacts {
+    /// Wire names in the order tests and docs enumerate independent facts.
+    pub const FLAG_NAMES: [&'static str; 10] = [
+        "changed",
+        "verified",
+        "committed",
+        "pushed",
+        "reviewed",
+        "merged",
+        "released",
+        "deployed",
+        "submitted",
+        "approved",
+    ];
+
+    #[must_use]
+    pub fn only(flag: &str) -> Option<Self> {
+        let mut facts = Self::default();
+        match flag {
+            "changed" => facts.changed = true,
+            "verified" => facts.verified = true,
+            "committed" => facts.committed = true,
+            "pushed" => facts.pushed = true,
+            "reviewed" => facts.reviewed = true,
+            "merged" => facts.merged = true,
+            "released" => facts.released = true,
+            "deployed" => facts.deployed = true,
+            "submitted" => facts.submitted = true,
+            "approved" => facts.approved = true,
+            _ => return None,
+        }
+        Some(facts)
+    }
+
+    #[must_use]
+    pub fn asserted_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if self.changed {
+            flags.push("changed");
+        }
+        if self.verified {
+            flags.push("verified");
+        }
+        if self.committed {
+            flags.push("committed");
+        }
+        if self.pushed {
+            flags.push("pushed");
+        }
+        if self.reviewed {
+            flags.push("reviewed");
+        }
+        if self.merged {
+            flags.push("merged");
+        }
+        if self.released {
+            flags.push("released");
+        }
+        if self.deployed {
+            flags.push("deployed");
+        }
+        if self.submitted {
+            flags.push("submitted");
+        }
+        if self.approved {
+            flags.push("approved");
+        }
+        flags
+    }
+}
+
+/// Caller-supplied verification evidence. Timestamp and source Run are filled
+/// by the server from the enclosing Handoff or Checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerificationEvidenceInput {
+    pub check: String,
+    pub result: String,
+    #[serde(default)]
+    pub applies_to_revision: Option<String>,
+}
+
+/// Recorded verification evidence for one artifact attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationEvidence {
+    pub check: String,
+    pub result: String,
+    pub observed_at: Timestamp,
+    pub source_run_id: SessionId,
+    pub applies_to_revision: String,
+    /// True when `applies_to_revision` does not match the artifact's observed
+    /// revision. Stale evidence is retained; it is never treated as current.
+    pub stale: bool,
+}
+
+/// Publish/checkpoint input for one typed artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ArtifactInput {
+    pub kind: ArtifactKind,
+    /// Stable locator. For files this is repository-relative. Absolute cwd
+    /// values belong in `local_path_hint` and are never identity.
+    pub locator: String,
+    #[serde(default)]
+    pub observed_revision: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub repository_identity: Option<String>,
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    #[serde(default)]
+    pub tree_hash: Option<String>,
+    #[serde(default)]
+    pub dirty: Option<bool>,
+    #[serde(default)]
+    pub local_path_hint: Option<String>,
+    #[serde(default)]
+    pub provenance: String,
+    #[serde(default)]
+    pub delivery: DeliveryFacts,
+    #[serde(default)]
+    pub verification: Vec<VerificationEvidenceInput>,
+}
+
+impl ArtifactInput {
+    /// Canonical identity key. Absolute paths and local-path hints are
+    /// excluded so two machines with different cwds resolve the same object.
+    pub fn identity_key(&self) -> Result<String, MemoryError> {
+        let normalized = self.normalized()?;
+        Ok(normalized.identity_key)
+    }
+
+    pub fn normalized(&self) -> Result<NormalizedArtifact, MemoryError> {
+        let locator = normalize_locator(&self.locator)?;
+        if locator.is_empty() {
+            return Err(MemoryError::MalformedRecord(
+                "artifact locator must not be empty".into(),
+            ));
+        }
+        let repository_identity = self
+            .repository_identity
+            .as_deref()
+            .map(normalize_repository_identity)
+            .transpose()?;
+        let commit_id = nonempty_opt(self.commit_id.as_deref());
+        let observed_revision = nonempty_opt(self.observed_revision.as_deref())
+            .or_else(|| commit_id.clone())
+            .or_else(|| nonempty_opt(self.content_hash.as_deref()));
+        let content_hash = nonempty_opt(self.content_hash.as_deref());
+        let tree_hash = nonempty_opt(self.tree_hash.as_deref());
+        let git_ref = nonempty_opt(self.git_ref.as_deref());
+        let local_path_hint = nonempty_opt(self.local_path_hint.as_deref());
+        let provenance = self.provenance.trim().to_string();
+
+        match self.kind {
+            ArtifactKind::File => {
+                if is_absolute_path(&locator) {
+                    return Err(MemoryError::MalformedRecord(
+                        "file artifact locator must be repository-relative; put absolute paths in local_path_hint".into(),
+                    ));
+                }
+            }
+            ArtifactKind::Git | ArtifactKind::Worktree => {
+                if repository_identity
+                    .as_ref()
+                    .is_none_or(|value| value.is_empty())
+                {
+                    return Err(MemoryError::MalformedRecord(format!(
+                        "{} artifact requires repository_identity; absolute cwd is not identity",
+                        self.kind.as_str()
+                    )));
+                }
+                if observed_revision
+                    .as_ref()
+                    .is_none_or(|value| value.is_empty())
+                {
+                    return Err(MemoryError::MalformedRecord(format!(
+                        "{} artifact requires observed_revision or commit_id",
+                        self.kind.as_str()
+                    )));
+                }
+            }
+            ArtifactKind::External => {}
+        }
+
+        let identity_key = match self.kind {
+            ArtifactKind::File => format!("file|{locator}"),
+            ArtifactKind::Git => format!(
+                "git|{}|{}",
+                repository_identity.as_deref().unwrap_or(""),
+                observed_revision.as_deref().unwrap_or("")
+            ),
+            ArtifactKind::Worktree => format!(
+                "worktree|{}|{}",
+                repository_identity.as_deref().unwrap_or(""),
+                observed_revision.as_deref().unwrap_or("")
+            ),
+            ArtifactKind::External => format!(
+                "external|{locator}|{}",
+                observed_revision.as_deref().unwrap_or("")
+            ),
+        };
+
+        Ok(NormalizedArtifact {
+            kind: self.kind,
+            locator,
+            observed_revision,
+            content_hash,
+            repository_identity,
+            git_ref,
+            commit_id,
+            tree_hash,
+            dirty: self.dirty,
+            local_path_hint,
+            provenance,
+            delivery: self.delivery.clone(),
+            verification: self.verification.clone(),
+            identity_key,
+        })
+    }
+}
+
+/// Validated artifact fields ready for persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedArtifact {
+    pub kind: ArtifactKind,
+    pub locator: String,
+    pub observed_revision: Option<String>,
+    pub content_hash: Option<String>,
+    pub repository_identity: Option<String>,
+    pub git_ref: Option<String>,
+    pub commit_id: Option<String>,
+    pub tree_hash: Option<String>,
+    pub dirty: Option<bool>,
+    pub local_path_hint: Option<String>,
+    pub provenance: String,
+    pub delivery: DeliveryFacts,
+    pub verification: Vec<VerificationEvidenceInput>,
+    pub identity_key: String,
+}
+
+/// Materialized artifact attached to a Handoff, Checkpoint, or parent result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub id: ArtifactId,
+    pub kind: ArtifactKind,
+    pub locator: String,
+    pub observed_revision: Option<String>,
+    pub content_hash: Option<String>,
+    pub repository_identity: Option<String>,
+    pub git_ref: Option<String>,
+    pub commit_id: Option<String>,
+    pub tree_hash: Option<String>,
+    pub dirty: Option<bool>,
+    /// Local absolute path, never part of identity.
+    pub local_path_hint: Option<String>,
+    pub provenance: String,
+    pub source_run_id: SessionId,
+    pub observed_at: Timestamp,
+    pub delivery: DeliveryFacts,
+    pub verification: Vec<VerificationEvidence>,
+}
+
+fn nonempty_opt(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.contains('\0') {
+        return Err(MemoryError::MalformedRecord(
+            "artifact locator must not contain NUL".into(),
+        ));
+    }
+    for segment in trimmed.split(['/', '\\']) {
+        if segment == ".." {
+            return Err(MemoryError::MalformedRecord(
+                "artifact locator must not contain parent segments".into(),
+            ));
+        }
+    }
+    Ok(trimmed.trim_end_matches(['/', '\\']).to_string())
+}
+
+fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
+    let locator = normalize_locator(raw)?;
+    Ok(locator.trim_end_matches(".git").to_string())
+}
+
+fn is_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || (value.len() >= 3
+            && value.as_bytes()[1] == b':'
+            && value.as_bytes()[0].is_ascii_alphabetic())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_identity_ignores_absolute_cwd_hints() {
+        let left = ArtifactInput {
+            kind: ArtifactKind::Git,
+            locator: "ignored-cwd".into(),
+            observed_revision: Some("abc123".into()),
+            repository_identity: Some("https://github.com/semantic-craft/engram.git/".into()),
+            local_path_hint: Some("/tmp/machine-a/engram".into()),
+            provenance: "source".into(),
+            ..empty_input()
+        };
+        let right = ArtifactInput {
+            kind: ArtifactKind::Git,
+            locator: "other-cwd".into(),
+            observed_revision: Some("abc123".into()),
+            repository_identity: Some("https://github.com/semantic-craft/engram".into()),
+            local_path_hint: Some("/var/machine-b/engram".into()),
+            provenance: "source".into(),
+            ..empty_input()
+        };
+        assert_eq!(left.identity_key().unwrap(), right.identity_key().unwrap());
+        assert_ne!(
+            left.local_path_hint.as_deref(),
+            right.local_path_hint.as_deref()
+        );
+    }
+
+    #[test]
+    fn file_locator_rejects_absolute_paths() {
+        let input = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "/tmp/repo/src/lib.rs".into(),
+            local_path_hint: Some("/tmp/repo/src/lib.rs".into()),
+            ..empty_input()
+        };
+        assert!(input.normalized().is_err());
+    }
+
+    #[test]
+    fn delivery_facts_are_independent() {
+        for flag in DeliveryFacts::FLAG_NAMES {
+            let facts = DeliveryFacts::only(flag).unwrap();
+            assert_eq!(facts.asserted_flags(), vec![flag]);
+        }
+    }
+
+    fn empty_input() -> ArtifactInput {
+        ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/lib.rs".into(),
+            observed_revision: None,
+            content_hash: None,
+            repository_identity: None,
+            git_ref: None,
+            commit_id: None,
+            tree_hash: None,
+            dirty: None,
+            local_path_hint: None,
+            provenance: String::new(),
+            delivery: DeliveryFacts::default(),
+            verification: Vec::new(),
+        }
+    }
+}

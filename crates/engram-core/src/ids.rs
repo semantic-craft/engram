@@ -84,6 +84,8 @@ id_newtype!(pub ObservationId, "Identifier for a single observation captured dur
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkItemId, "Identifier for a stable unit of user work.");
+id_newtype!(pub ArtifactId, "Identifier for one typed, verifiable artifact reference.");
+id_newtype!(pub WorkItemRelationshipId, "Identifier for one explicit WorkItem relationship.");
 id_newtype!(pub ClaimId, "Opaque identifier for one temporary handoff claim.");
 id_newtype!(pub CheckpointId, "Identifier for one durable WorkItem checkpoint.");
 id_newtype!(pub AttemptId, "Caller-supplied identifier for one retryable continuity mutation.");

@@ -159,6 +159,8 @@ Handoff        revisioned transfer offer for one WorkItem
 Claim          opaque receiver capability with a bounded lease
 Checkpoint     append-only ordered progress; may acknowledge one Claim
 Attempt        caller identity for replay-safe claim/release/checkpoint retries
+ArtifactRef    typed file/git/worktree/external evidence; cwd is never identity
+Relationship   explicit depends_on / derived_from / child_of between WorkItems
 ```
 
 `memory_handoff_begin` creates a WorkItem plus open Handoff, or publishes a
@@ -172,7 +174,18 @@ and expired leases are claimable by another receiver. Claim, release, and
 checkpoint Attempts bind actor, scope, exact identities, expected revisions,
 Run, and canonical request digest so a lost-response retry returns the original
 result while changed reuse fails closed. Claim secrets and checkpoint payloads
-are excluded from audit detail.
+are excluded from audit detail. Handoffs and Checkpoints may carry typed
+ArtifactRefs: files use repository-relative locators, Git/worktree refs use
+repository identity plus revision, and absolute paths stay local-path hints.
+Changed, verified, committed, pushed, reviewed, merged, released, deployed,
+submitted, and approved facts are stored independently and never inferred from
+one another. Related work uses `depends_on`, `derived_from`, or `child_of`
+instead of inheriting a prior WorkItem's claim or blockers; a child may return
+structured `parent_result` evidence but cannot complete, abandon, claim, or
+supersede its parent. Cross-project links require a complete existing
+workspace/project pair and fail closed. Engram records these observations; it
+does not check out, commit, push, merge, release, deploy, submit, or approve
+Git or external systems.
 
 The cwd is matched by path-boundary: a Handoff left in `/repo` is discovered by
 a session in `/repo/api`, but never `/repo-other`. Manual project-wide Handoffs
