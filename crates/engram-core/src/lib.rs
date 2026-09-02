@@ -7,12 +7,14 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod artifact;
 pub mod context;
 pub mod error;
 pub mod handoff;
 pub mod ids;
 pub mod observation;
 pub mod page;
+pub mod relationship;
 pub mod routing_skills;
 pub mod routing_snippet;
 pub mod sanitize;
@@ -38,6 +40,10 @@ pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
 pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
+pub use artifact::{
+    ArtifactInput, ArtifactKind, ArtifactRef, DeliveryFacts, NormalizedArtifact,
+    VerificationEvidence, VerificationEvidenceInput,
+};
 pub use context::{
     AssemblyOmission, AssemblyOmissionReason, AssemblyTrace, CONTEXT_BUDGET_UNIT, ContextAssembler,
     ContextAssemblyRequest, ContextAssemblyResult, ContextCandidate, ContextDetailTier,
@@ -51,12 +57,16 @@ pub use handoff::{
     NewHandoff, PublishedHandoff, WorkItem, WorkItemState,
 };
 pub use ids::{
-    AgentKind, AttemptId, AutoImproveProposalId, AutoImproveRunId, BackgroundJobId, CheckpointId,
-    ClaimId, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, UserId, WorkItemId,
-    WorkspaceId,
+    AgentKind, ArtifactId, AttemptId, AutoImproveProposalId, AutoImproveRunId, BackgroundJobId,
+    CheckpointId, ClaimId, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId,
+    UserId, WorkItemId, WorkItemRelationshipId, WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};
+pub use relationship::{
+    ParentResult, ParentResultInput, RelationshipInput, WorkItemRelationship,
+    WorkItemRelationshipKind,
+};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, full_block};
 pub use sanitize::{SanitizeConfig, Sanitized, Sanitizer};
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};

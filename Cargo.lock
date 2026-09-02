@@ -758,6 +758,7 @@ dependencies = [
  "flate2",
  "jiff",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

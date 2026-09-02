@@ -13,6 +13,16 @@ use engram_core::{
     NewSession, ObservationId, ObservationKind, PageId, PagePath, ProjectId, PublishedHandoff,
     SessionId, WorkItemId, WorkItemState, WorkspaceId,
 };
+use jiff::Timestamp;
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+use crate::artifacts::{
+    CHILD_MUTATION_FORBIDDEN, RELATIONSHIP_UNAUTHORIZED, actor_run_is_child_of, audit_artifact_ids,
+    load_owner_artifacts, load_work_item_relationships, persist_artifacts, persist_parent_result,
+    persist_relationships,
+};
+use crate::error::{StoreError, StoreResult};
 
 /// Summary returned by [`reorg_sessions`] and exposed via
 /// [`crate::writer::WriterHandle::reorg_sessions`].
@@ -48,11 +58,6 @@ pub struct PurgeSummary {
     /// Number of `page_embeddings` rows deleted (cascades through pages).
     pub embeddings_deleted: u64,
 }
-use jiff::Timestamp;
-use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
-
-use crate::error::{StoreError, StoreResult};
 
 type WorkItemOwnershipRow = (Vec<u8>, Vec<u8>, String, i64, String, Option<Vec<u8>>);
 type WorkItemCheckpointRow = (
@@ -1048,6 +1053,16 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
                 "cannot publish from terminal work item state {state}"
             )));
         }
+        if actor_run_is_child_of(&tx, id, &h.source_actor, h.source_run_id)? {
+            return Err(StoreError::InvalidState(
+                CHILD_MUTATION_FORBIDDEN.to_string(),
+            ));
+        }
+        if !h.relationships.is_empty() && owner_actor != h.source_actor {
+            return Err(StoreError::InvalidState(
+                RELATIONSHIP_UNAUTHORIZED.to_string(),
+            ));
+        }
         let owner_run_matches = owner_run
             .as_deref()
             .is_some_and(|bytes| bytes == h.source_run_id.as_bytes());
@@ -1144,7 +1159,27 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
             now,
         ],
     )?;
-    audit_continuity(
+    let artifacts = persist_artifacts(
+        &tx,
+        "handoff",
+        id.as_bytes(),
+        h.workspace_id,
+        h.project_id,
+        h.source_run_id,
+        now,
+        &h.artifacts,
+    )?;
+    let relationships = persist_relationships(
+        &tx,
+        work_item_id,
+        h.workspace_id,
+        h.project_id,
+        &h.source_actor,
+        h.source_run_id,
+        now,
+        &h.relationships,
+    )?;
+    audit_continuity_with_refs(
         &tx,
         "handoff_publish",
         h.workspace_id,
@@ -1157,6 +1192,11 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         &h.source_actor,
         "published",
         now,
+        &audit_artifact_ids(&artifacts),
+        &relationships
+            .iter()
+            .map(|rel| rel.id.to_string())
+            .collect::<Vec<_>>(),
     )?;
     tx.commit()?;
     Ok(PublishedHandoff {
@@ -1164,6 +1204,8 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         handoff_id: id,
         work_item_revision,
         handoff_revision: 1,
+        artifacts,
+        relationships,
     })
 }
 
@@ -1204,7 +1246,11 @@ pub fn claim_handoff(
         return replayed;
     }
     let validation =
-        if handoff.workspace_id != input.workspace_id || handoff.project_id != input.project_id {
+        if actor_run_is_child_of(&tx, handoff.work_item_id, &input.actor_key, input.run_id)? {
+            Some(CHILD_MUTATION_FORBIDDEN.to_string())
+        } else if handoff.workspace_id != input.workspace_id
+            || handoff.project_id != input.project_id
+        {
             Some("handoff does not belong to the resolved scope".to_string())
         } else if handoff.revision != input.expected_revision {
             Some(format!(
@@ -1335,6 +1381,7 @@ pub fn claim_handoff(
     }
     handoff.state = HandoffState::Claimed;
     handoff.revision = next_revision;
+    let relationships = load_work_item_relationships(&tx, handoff.work_item_id)?;
     let result = HandoffClaimResult {
         work_item_id: handoff.work_item_id,
         handoff_id: handoff.id,
@@ -1343,6 +1390,7 @@ pub fn claim_handoff(
             .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
         revision: next_revision,
         handoff,
+        relationships,
     };
     record_attempt_success(
         &tx,
@@ -1630,6 +1678,9 @@ pub fn write_checkpoint(
         "summary": input.summary,
         "work_item_state": input.work_item_state,
         "acceptance_criteria": input.acceptance_criteria,
+        "artifacts": input.artifacts,
+        "relationships": input.relationships,
+        "parent_result": input.parent_result,
     }))?;
     if let Some(replayed) = replay_attempt::<CheckpointWriteResult>(
         &tx,
@@ -1654,36 +1705,44 @@ pub fn write_checkpoint(
         .iter()
         .map(|status| status.criterion.as_str())
         .collect();
-    let mut validation = if ws.as_slice() != input.workspace_id.as_bytes()
-        || project.as_slice() != input.project_id.as_bytes()
-    {
-        Some("work item does not belong to the resolved scope".to_string())
-    } else if u64::try_from(revision).ok() != Some(input.expected_work_item_revision) {
-        Some(format!(
-            "stale work item revision: expected {}, current {}",
-            input.expected_work_item_revision, revision
-        ))
-    } else if stable_criteria
-        .iter()
-        .map(String::as_str)
-        .ne(checkpoint_criteria.iter().copied())
-    {
-        Some(
+    let mut validation =
+        if actor_run_is_child_of(&tx, input.work_item_id, &input.actor_key, input.run_id)? {
+            Some(CHILD_MUTATION_FORBIDDEN.to_string())
+        } else if !input.relationships.is_empty() && owner_actor != input.actor_key {
+            Some(RELATIONSHIP_UNAUTHORIZED.to_string())
+        } else if ws.as_slice() != input.workspace_id.as_bytes()
+            || project.as_slice() != input.project_id.as_bytes()
+        {
+            Some("work item does not belong to the resolved scope".to_string())
+        } else if u64::try_from(revision).ok() != Some(input.expected_work_item_revision) {
+            Some(format!(
+                "stale work item revision: expected {}, current {}",
+                input.expected_work_item_revision, revision
+            ))
+        } else if stable_criteria
+            .iter()
+            .map(String::as_str)
+            .ne(checkpoint_criteria.iter().copied())
+        {
+            Some(
             "checkpoint must report every stable acceptance criterion exactly once and in order"
                 .to_string(),
         )
-    } else if input.work_item_state == WorkItemState::Completed
-        && input
-            .acceptance_criteria
-            .iter()
-            .any(|status| !status.satisfied)
-    {
-        Some("completed WorkItem requires every acceptance criterion to be satisfied".to_string())
-    } else if input.summary.trim().is_empty() {
-        Some("checkpoint summary must not be empty".to_string())
-    } else {
-        None
-    };
+        } else if input.work_item_state == WorkItemState::Completed
+            && input
+                .acceptance_criteria
+                .iter()
+                .any(|status| !status.satisfied)
+        {
+            Some(
+                "completed WorkItem requires every acceptance criterion to be satisfied"
+                    .to_string(),
+            )
+        } else if input.summary.trim().is_empty() {
+            Some("checkpoint summary must not be empty".to_string())
+        } else {
+            None
+        };
 
     let acknowledgement = match (
         input.handoff_id,
@@ -1884,6 +1943,37 @@ pub fn write_checkpoint(
             (None, None)
         };
 
+    let artifacts = persist_artifacts(
+        &tx,
+        "checkpoint",
+        checkpoint_id.as_bytes(),
+        input.workspace_id,
+        input.project_id,
+        input.run_id,
+        now,
+        &input.artifacts,
+    )?;
+    let relationships = persist_relationships(
+        &tx,
+        input.work_item_id,
+        input.workspace_id,
+        input.project_id,
+        &input.actor_key,
+        input.run_id,
+        now,
+        &input.relationships,
+    )?;
+    let parent_result = match &input.parent_result {
+        Some(result) => Some(persist_parent_result(
+            &tx,
+            input.work_item_id,
+            checkpoint_id,
+            input.run_id,
+            now,
+            result,
+        )?),
+        None => None,
+    };
     let result = CheckpointWriteResult {
         checkpoint_id,
         work_item_id: input.work_item_id,
@@ -1894,6 +1984,9 @@ pub fn write_checkpoint(
         handoff_id: input.handoff_id,
         handoff_revision,
         handoff_state,
+        artifacts,
+        relationships,
+        parent_result,
     };
     record_attempt_success(
         &tx,
@@ -1910,7 +2003,7 @@ pub fn write_checkpoint(
         &result,
         now,
     )?;
-    audit_continuity(
+    audit_continuity_with_refs(
         &tx,
         "checkpoint_write",
         input.workspace_id,
@@ -1923,6 +2016,12 @@ pub fn write_checkpoint(
         &input.actor_key,
         input.work_item_state.as_str(),
         now,
+        &audit_artifact_ids(&result.artifacts),
+        &result
+            .relationships
+            .iter()
+            .map(|rel| rel.id.to_string())
+            .collect::<Vec<_>>(),
     )?;
     if matches!(
         input.work_item_state,
@@ -2177,7 +2276,7 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
     else {
         return Ok(None);
     };
-    Ok(Some(Handoff {
+    let mut handoff = Handoff {
         id: HandoffId::from_slice(&id)?,
         work_item_id: WorkItemId::from_slice(&work_item)?,
         workspace_id: WorkspaceId::from_slice(&ws)?,
@@ -2209,7 +2308,10 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
             .as_deref()
             .map(SessionId::from_slice)
             .transpose()?,
-    }))
+        artifacts: Vec::new(),
+    };
+    handoff.artifacts = load_owner_artifacts(conn, "handoff", handoff.id.as_bytes())?;
+    Ok(Some(handoff))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2227,6 +2329,41 @@ fn audit_continuity(
     outcome: &str,
     at: i64,
 ) -> StoreResult<()> {
+    audit_continuity_with_refs(
+        tx,
+        op,
+        workspace_id,
+        project_id,
+        work_item_id,
+        run_id,
+        handoff_id,
+        revision,
+        attempt_id,
+        actor,
+        outcome,
+        at,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_continuity_with_refs(
+    tx: &rusqlite::Transaction<'_>,
+    op: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    run_id: SessionId,
+    handoff_id: Option<HandoffId>,
+    revision: Option<u64>,
+    attempt_id: Option<AttemptId>,
+    actor: &str,
+    outcome: &str,
+    at: i64,
+    artifact_ids: &[String],
+    relationship_ids: &[String],
+) -> StoreResult<()> {
     let detail = serde_json::to_string(&serde_json::json!({
         "actor": actor,
         "work_item_id": work_item_id,
@@ -2235,6 +2372,8 @@ fn audit_continuity(
         "revision": revision,
         "attempt_id": attempt_id,
         "outcome": outcome,
+        "artifact_ids": artifact_ids,
+        "relationship_ids": relationship_ids,
     }))?;
     tx.execute(
         "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
@@ -2595,6 +2734,18 @@ pub fn move_project_workspace(
         "UPDATE continuity_attempts SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    tx.execute(
+        "UPDATE artifacts SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
+    tx.execute(
+        "UPDATE work_item_relationships SET from_workspace_id = ?1 WHERE from_project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
+    tx.execute(
+        "UPDATE work_item_relationships SET to_workspace_id = ?1 WHERE to_project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
     let audit_log_moved = tx.execute(
         "UPDATE audit_log SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -3542,6 +3693,8 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
             },
         )
         .unwrap();
@@ -3576,6 +3729,9 @@ mod tests {
                 acceptance_criteria: vec![],
                 actor_key: "receiver".into(),
                 attempt_id: AttemptId::new(),
+                artifacts: vec![],
+                relationships: vec![],
+                parent_result: None,
             },
         )
         .unwrap();
@@ -4277,6 +4433,8 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
             },
         )
         .unwrap();
@@ -4422,6 +4580,8 @@ mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            artifacts: vec![],
+            relationships: vec![],
         };
         assert!(
             publish_handoff(&mut conn, &mismatched_handoff).is_err(),

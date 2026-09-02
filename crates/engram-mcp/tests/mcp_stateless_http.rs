@@ -21,7 +21,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
 use engram_core::{
-    ActiveProject, ActiveProjectMode, ActorContext, ActorKey, AuthLevel, ProjectId, WorkspaceId,
+    ActiveProject, ActiveProjectMode, ActorContext, ActorKey, AuthLevel, ProjectId, WorkItemId,
+    WorkItemState, WorkspaceId,
 };
 use engram_mcp::EngramServer;
 use engram_store::Store;
@@ -966,4 +967,1057 @@ async fn stateful_tools_call_without_session_is_rejected() {
         body.contains("initialize"),
         "stateful rejection should mention the missing initialize: {body}"
     );
+}
+
+const DELIVERY_FLAGS: [&str; 10] = [
+    "changed",
+    "verified",
+    "committed",
+    "pushed",
+    "reviewed",
+    "merged",
+    "released",
+    "deployed",
+    "submitted",
+    "approved",
+];
+
+fn delivery_only(flag: &str) -> serde_json::Value {
+    let mut facts = serde_json::Map::new();
+    for name in DELIVERY_FLAGS {
+        facts.insert(name.to_string(), serde_json::json!(name == flag));
+    }
+    serde_json::Value::Object(facts)
+}
+
+fn asserted_flags(value: &serde_json::Value) -> Vec<&str> {
+    DELIVERY_FLAGS
+        .into_iter()
+        .filter(|flag| value["delivery"][flag] == true)
+        .collect()
+}
+
+/// Issue #42 tracer: publish/checkpoint carry typed ArtifactRefs and never
+/// infer delivery facts from one another.
+#[tokio::test]
+async fn typed_artifact_refs_carry_independent_delivery_facts() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+    let run_id = "019f0042-0000-7000-8000-000000000001";
+    let mut artifacts = Vec::new();
+    for flag in DELIVERY_FLAGS {
+        artifacts.push(serde_json::json!({
+            "kind": "file",
+            "locator": format!("src/{flag}.rs"),
+            "content_hash": format!("hash-{flag}"),
+            "provenance": "source agent observation",
+            "delivery": delivery_only(flag)
+        }));
+    }
+    artifacts.push(serde_json::json!({
+        "kind": "worktree",
+        "locator": "main-worktree",
+        "repository_identity": "github.com/semantic-craft/engram",
+        "observed_revision": "abc123deadbeef",
+        "dirty": true,
+        "local_path_hint": "/tmp/machine-a/engram",
+        "provenance": "dirty checkout",
+        "delivery": delivery_only("changed")
+    }));
+    artifacts.push(serde_json::json!({
+        "kind": "git",
+        "locator": "origin",
+        "repository_identity": "github.com/semantic-craft/engram",
+        "observed_revision": "abc123deadbeef",
+        "commit_id": "abc123deadbeef",
+        "local_path_hint": "/tmp/machine-a/engram",
+        "provenance": "stale tests",
+        "verification": [{
+            "check": "cargo test --workspace",
+            "result": "ok",
+            "applies_to_revision": "old-revision"
+        }]
+    }));
+
+    let published = call_tool(
+        &router,
+        42,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": run_id,
+            "objective": "Carry typed artifact evidence",
+            "acceptance_criteria": ["facts stay independent"],
+            "summary": "Published independent delivery facts.",
+            "artifacts": artifacts
+        }),
+    )
+    .await;
+    let returned = published["artifacts"]
+        .as_array()
+        .expect("begin returns artifacts");
+    assert_eq!(returned.len(), DELIVERY_FLAGS.len() + 2);
+    for (flag, artifact) in DELIVERY_FLAGS.iter().zip(returned.iter()) {
+        assert_eq!(artifact["kind"], "file");
+        assert_eq!(asserted_flags(artifact), vec![*flag], "{artifact}");
+        assert_eq!(artifact["locator"], format!("src/{flag}.rs"));
+    }
+    let worktree = &returned[DELIVERY_FLAGS.len()];
+    assert_eq!(worktree["kind"], "worktree");
+    assert_eq!(worktree["dirty"], true);
+    assert_eq!(asserted_flags(worktree), vec!["changed"]);
+    assert_ne!(worktree["delivery"]["committed"], true);
+    assert_ne!(worktree["delivery"]["pushed"], true);
+    let git = &returned[DELIVERY_FLAGS.len() + 1];
+    assert_eq!(git["verification"][0]["stale"], true);
+    assert_eq!(
+        git["verification"][0]["applies_to_revision"],
+        "old-revision"
+    );
+    assert_eq!(git["observed_revision"], "abc123deadbeef");
+
+    let checkpoint = call_tool(
+        &router,
+        43,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": published["work_item_id"],
+            "run_id": run_id,
+            "attempt_id": "019f0042-0000-7000-8000-000000000002",
+            "expected_work_item_revision": 1,
+            "summary": "Checkpointed the same independent facts.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "facts stay independent", "satisfied": false}
+            ],
+            "artifacts": [{
+                "kind": "external",
+                "locator": "https://github.com/semantic-craft/engram/issues/42",
+                "observed_revision": "open",
+                "provenance": "issue tracker",
+                "delivery": delivery_only("submitted")
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(checkpoint["artifacts"][0]["kind"], "external");
+    assert_eq!(
+        asserted_flags(&checkpoint["artifacts"][0]),
+        vec!["submitted"]
+    );
+    assert_ne!(checkpoint["artifacts"][0]["delivery"]["approved"], true);
+
+    let mismatch = call_tool_failure(
+        &router,
+        44,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000003",
+            "objective": "Conflicting hash",
+            "summary": "Same file locator, different content hash.",
+            "artifacts": [{
+                "kind": "file",
+                "locator": "src/changed.rs",
+                "content_hash": "hash-changed-other",
+                "provenance": "second observer"
+            }]
+        }),
+    )
+    .await;
+    assert!(mismatch.contains("content-hash mismatch"), "{mismatch}");
+}
+
+/// Issue #42 tracer: two absolute cwds with the same repository identity and
+/// revision resolve to one artifact.
+#[tokio::test]
+async fn git_artifact_identity_ignores_absolute_cwd() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+    let machine_a = call_tool(
+        &router,
+        50,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000010",
+            "objective": "Machine A continuation",
+            "summary": "First absolute cwd.",
+            "cwd": "/tmp/machine-a/engram",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "https://github.com/semantic-craft/engram.git",
+                "observed_revision": "def456",
+                "commit_id": "def456",
+                "local_path_hint": "/tmp/machine-a/engram"
+            }]
+        }),
+    )
+    .await;
+    let machine_b = call_tool(
+        &router,
+        51,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000011",
+            "objective": "Machine B continuation",
+            "summary": "Second absolute cwd.",
+            "cwd": "/Users/other/machine-b/engram",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "https://github.com/semantic-craft/engram",
+                "observed_revision": "def456",
+                "commit_id": "def456",
+                "local_path_hint": "/Users/other/machine-b/engram"
+            }]
+        }),
+    )
+    .await;
+    assert_ne!(machine_a["work_item_id"], machine_b["work_item_id"]);
+    assert_eq!(
+        machine_a["artifacts"][0]["id"],
+        machine_b["artifacts"][0]["id"]
+    );
+    assert_eq!(machine_a["artifacts"][0]["observed_revision"], "def456");
+    assert_eq!(machine_b["artifacts"][0]["observed_revision"], "def456");
+    assert_eq!(
+        machine_a["artifacts"][0]["source_run_id"],
+        "019f0042-0000-7000-8000-000000000010"
+    );
+    assert_eq!(
+        machine_b["artifacts"][0]["source_run_id"],
+        "019f0042-0000-7000-8000-000000000011"
+    );
+    assert_eq!(
+        machine_a["artifacts"][0]["local_path_hint"],
+        "/tmp/machine-a/engram"
+    );
+    assert_eq!(
+        machine_b["artifacts"][0]["local_path_hint"],
+        "/Users/other/machine-b/engram"
+    );
+}
+
+/// Issue #42 tracer: related WorkItems use explicit relationships, do not
+/// inherit claims/blockers, and fail closed on child authority, missing
+/// scope, self-links, and cycles.
+#[tokio::test]
+async fn work_item_relationships_fail_closed_and_do_not_inherit_claims() {
+    let tmp = TempDir::new().unwrap();
+    let parent_actor = ActorContext {
+        agent: Some("claude-code".into()),
+        user: Some("parent-user".into()),
+        ..ActorContext::default()
+    };
+    let child_actor = ActorContext {
+        agent: Some("codex".into()),
+        user: Some("child-user".into()),
+        ..ActorContext::default()
+    };
+    let (parent_router, store) = make_router_for_actor(&tmp, false, parent_actor).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    let _ = sibling;
+    let child_server = EngramServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+    let child_svc = StreamableHttpService::new(
+        move || Ok(child_server.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    );
+    let child_router = Router::new()
+        .nest_service("/mcp", child_svc)
+        .layer(Extension(AuthLevel::User))
+        .layer(Extension(child_actor));
+
+    let parent_run = "019f0042-0000-7000-8000-000000000020";
+    let parent = call_tool(
+        &parent_router,
+        60,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": parent_run,
+            "objective": "Parent work",
+            "acceptance_criteria": ["parent remains parent"],
+            "summary": "Parent is blocked and claimed independently."
+        }),
+    )
+    .await;
+    let parent_id = parent["work_item_id"].as_str().unwrap().to_string();
+    let parent_handoff = parent["handoff_id"].as_str().unwrap().to_string();
+
+    call_tool(
+        &parent_router,
+        61,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": parent_id,
+            "run_id": parent_run,
+            "attempt_id": "019f0042-0000-7000-8000-000000000021",
+            "expected_work_item_revision": 1,
+            "summary": "Parent is blocked on review.",
+            "work_item_state": "blocked",
+            "acceptance_criteria": [
+                {"criterion": "parent remains parent", "satisfied": false}
+            ]
+        }),
+    )
+    .await;
+
+    let claimed = call_tool(
+        &parent_router,
+        62,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": parent_handoff,
+            "expected_revision": 1,
+            "run_id": parent_run,
+            "attempt_id": "019f0042-0000-7000-8000-000000000022"
+        }),
+    )
+    .await;
+    assert_eq!(claimed["handoff"]["state"], "claimed");
+
+    let child = call_tool(
+        &child_router,
+        63,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "objective": "Child investigation",
+            "summary": "New WorkItem derived from the parent.",
+            "relationships": [
+                {"kind": "child_of", "target_work_item_id": parent_id},
+                {"kind": "derived_from", "target_work_item_id": parent_id},
+                {"kind": "depends_on", "target_work_item_id": parent_id}
+            ]
+        }),
+    )
+    .await;
+    let child_id = child["work_item_id"].as_str().unwrap().to_string();
+    assert_ne!(child_id, parent_id);
+    let kinds: Vec<_> = child["relationships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rel| rel["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"child_of"));
+    assert!(kinds.contains(&"derived_from"));
+    assert!(kinds.contains(&"depends_on"));
+
+    let discovered_child = call_tool(
+        &child_router,
+        64,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(discovered_child["work_item"]["id"], child_id);
+    assert_eq!(discovered_child["work_item"]["state"], "active");
+    assert_eq!(discovered_child["handoff"]["state"], "open");
+
+    let parent_item = store
+        .reader
+        .work_item_by_id(parent_id.parse::<WorkItemId>().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_item.state, WorkItemState::Blocked);
+
+    let child_claim = call_tool_failure(
+        &child_router,
+        66,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": parent_handoff,
+            "expected_revision": claimed["revision"],
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "attempt_id": "019f0042-0000-7000-8000-000000000024"
+        }),
+    )
+    .await;
+    assert!(
+        child_claim.contains("child WorkItem cannot"),
+        "{child_claim}"
+    );
+
+    let child_complete = call_tool_failure(
+        &child_router,
+        67,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": parent_id,
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "attempt_id": "019f0042-0000-7000-8000-000000000025",
+            "expected_work_item_revision": 2,
+            "summary": "Child tried to complete the parent.",
+            "work_item_state": "completed",
+            "acceptance_criteria": [
+                {"criterion": "parent remains parent", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        child_complete.contains("child WorkItem cannot"),
+        "{child_complete}"
+    );
+
+    let child_abandon = call_tool_failure(
+        &child_router,
+        65,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": parent_id,
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "attempt_id": "019f0042-0000-7000-8000-000000000032",
+            "expected_work_item_revision": 2,
+            "summary": "Child tried to abandon the parent.",
+            "work_item_state": "abandoned",
+            "acceptance_criteria": [
+                {"criterion": "parent remains parent", "satisfied": false}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        child_abandon.contains("child WorkItem cannot"),
+        "{child_abandon}"
+    );
+
+    let child_supersede = call_tool_failure(
+        &child_router,
+        69,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": parent_id,
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "summary": "Child tried to supersede the parent by publishing a continuation."
+        }),
+    )
+    .await;
+    assert!(
+        child_supersede.contains("child WorkItem cannot"),
+        "{child_supersede}"
+    );
+
+    let parent_result = call_tool(
+        &child_router,
+        68,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": child_id,
+            "run_id": "019f0042-0000-7000-8000-000000000023",
+            "attempt_id": "019f0042-0000-7000-8000-000000000026",
+            "expected_work_item_revision": 1,
+            "summary": "Child recorded evidence for the parent.",
+            "work_item_state": "active",
+            "parent_result": {
+                "summary": "investigation notes",
+                "artifacts": [{
+                    "kind": "file",
+                    "locator": "notes/child.md",
+                    "provenance": "child evidence"
+                }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        parent_result["parent_result"]["parent_work_item_id"],
+        parent_id
+    );
+    let parent_after = store
+        .reader
+        .work_item_by_id(parent_id.parse::<WorkItemId>().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_after.state, WorkItemState::Blocked);
+    assert_eq!(parent_after.child_results[0].summary, "investigation notes");
+
+    let self_link = call_tool_failure(
+        &parent_router,
+        70,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": parent_id,
+            "run_id": parent_run,
+            "summary": "Self-link should fail.",
+            "relationships": [{"kind": "depends_on", "target_work_item_id": parent_id}]
+        }),
+    )
+    .await;
+    assert!(self_link.contains("self-link"), "{self_link}");
+
+    let partial_scope = call_tool_failure(
+        &child_router,
+        71,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000027",
+            "objective": "Partial scope",
+            "summary": "Missing project on the target.",
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": parent_id,
+                "target_workspace": "default"
+            }]
+        }),
+    )
+    .await;
+    assert!(
+        partial_scope.contains("workspace") && partial_scope.contains("project"),
+        "{partial_scope}"
+    );
+
+    let missing_scope = call_tool_failure(
+        &child_router,
+        72,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000028",
+            "objective": "Missing scope",
+            "summary": "Target project does not exist.",
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": parent_id,
+                "target_workspace": "default",
+                "target_project": "does-not-exist"
+            }]
+        }),
+    )
+    .await;
+    assert!(
+        missing_scope.to_lowercase().contains("not found"),
+        "{missing_scope}"
+    );
+
+    let foreign = call_tool(
+        &parent_router,
+        73,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000029",
+            "objective": "Sibling project work",
+            "summary": "Lives in sibling.",
+            "workspace": "default",
+            "project": "sibling"
+        }),
+    )
+    .await;
+    let linked = call_tool(
+        &parent_router,
+        74,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": parent_run,
+            "objective": "Cross-project link",
+            "summary": "Depends on sibling work.",
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": foreign["work_item_id"],
+                "target_workspace": "default",
+                "target_project": "sibling"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        linked["relationships"][0]["to_work_item_id"],
+        foreign["work_item_id"]
+    );
+
+    let cycle_a = call_tool(
+        &parent_router,
+        75,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000030",
+            "objective": "Cycle A",
+            "summary": "First node."
+        }),
+    )
+    .await;
+    let cycle_b = call_tool(
+        &parent_router,
+        76,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000031",
+            "objective": "Cycle B",
+            "summary": "Depends on A.",
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": cycle_a["work_item_id"]
+            }]
+        }),
+    )
+    .await;
+    let cycle = call_tool_failure(
+        &parent_router,
+        77,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": cycle_a["work_item_id"],
+            "run_id": "019f0042-0000-7000-8000-000000000030",
+            "summary": "A depends on B would cycle.",
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": cycle_b["work_item_id"]
+            }]
+        }),
+    )
+    .await;
+    assert!(cycle.contains("acyclic"), "{cycle}");
+}
+
+/// Issue #42 tracer: artifact text is privacy-scrubbed and audit detail never
+/// records opaque claim secrets.
+#[tokio::test]
+async fn artifact_text_is_scrubbed_and_audit_omits_claim_secrets() {
+    let tmp = TempDir::new().unwrap();
+    let (router, store) = make_router(&tmp, false).await;
+    let published = call_tool(
+        &router,
+        80,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000040",
+            "objective": "Scrub secrets",
+            "acceptance_criteria": ["no leaked claim material"],
+            "summary": "Artifact provenance contains a key.",
+            "artifacts": [{
+                "kind": "file",
+                "locator": "src/secret.rs",
+                "provenance": "token sk-or-v1-deadbeefcafebabe1234567890abcdef"
+            }]
+        }),
+    )
+    .await;
+    let provenance = published["artifacts"][0]["provenance"].as_str().unwrap();
+    assert!(provenance.contains("[REDACTED]"), "{provenance}");
+    assert!(!provenance.contains("deadbeef"), "{provenance}");
+
+    let claimed = call_tool(
+        &router,
+        81,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": published["handoff_id"],
+            "expected_revision": 1,
+            "run_id": "019f0042-0000-7000-8000-000000000041",
+            "attempt_id": "019f0042-0000-7000-8000-000000000042"
+        }),
+    )
+    .await;
+    let claim_id = claimed["claim_id"].as_str().unwrap();
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT detail FROM audit_log WHERE op LIKE 'handoff%' OR op LIKE 'checkpoint%'")
+        .unwrap();
+    let details: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert!(!details.is_empty(), "expected continuity audit rows");
+    for detail in &details {
+        assert!(
+            !detail.contains(claim_id),
+            "audit leaked claim secret: {detail}"
+        );
+        assert!(
+            !detail.contains("deadbeef"),
+            "audit leaked scrubbed secret: {detail}"
+        );
+    }
+}
+
+/// Issue #42 tracer: checkpoint write and response expose ArtifactRefs and
+/// relationships with stable identities.
+#[tokio::test]
+async fn checkpoint_write_returns_artifacts_and_relationships() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+    let run_id = "019f0042-0000-7000-8000-000000000050";
+    let current = call_tool(
+        &router,
+        90,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": run_id,
+            "objective": "Checkpoint artifacts and relationships",
+            "acceptance_criteria": ["checkpoint returns both"],
+            "summary": "Work item that will checkpoint evidence."
+        }),
+    )
+    .await;
+    let dependency = call_tool(
+        &router,
+        91,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000051",
+            "objective": "Upstream dependency",
+            "summary": "Target of an explicit depends_on link."
+        }),
+    )
+    .await;
+
+    let checkpoint = call_tool(
+        &router,
+        92,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": current["work_item_id"],
+            "run_id": run_id,
+            "attempt_id": "019f0042-0000-7000-8000-000000000052",
+            "expected_work_item_revision": 1,
+            "summary": "Attached an artifact and a depends_on relationship.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "checkpoint returns both", "satisfied": false}
+            ],
+            "artifacts": [{
+                "kind": "file",
+                "locator": "src/checkpoint.rs",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "content_hash": "checkpoint-hash",
+                "provenance": "checkpoint observation",
+                "local_path_hint": "/tmp/machine-a/src/checkpoint.rs"
+            }],
+            "relationships": [{
+                "kind": "depends_on",
+                "target_work_item_id": dependency["work_item_id"]
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(checkpoint["artifacts"][0]["kind"], "file");
+    assert_eq!(checkpoint["artifacts"][0]["locator"], "src/checkpoint.rs");
+    assert_eq!(
+        checkpoint["artifacts"][0]["repository_identity"],
+        "github.com/semantic-craft/engram"
+    );
+    assert_eq!(checkpoint["artifacts"][0]["source_run_id"], run_id);
+    assert!(checkpoint["artifacts"][0]["id"].as_str().is_some());
+    assert_eq!(checkpoint["relationships"][0]["kind"], "depends_on");
+    assert_eq!(
+        checkpoint["relationships"][0]["from_work_item_id"],
+        current["work_item_id"]
+    );
+    assert_eq!(
+        checkpoint["relationships"][0]["to_work_item_id"],
+        dependency["work_item_id"]
+    );
+    assert!(checkpoint["relationships"][0]["id"].as_str().is_some());
+}
+
+/// Issue #42 tracer: creating depends_on/derived_from/child_of rejects an
+/// unauthorized actor and does not mutate relationships.
+#[tokio::test]
+async fn relationship_creation_rejects_unauthorized_actor() {
+    let tmp = TempDir::new().unwrap();
+    let owner = ActorContext {
+        agent: Some("claude-code".into()),
+        user: Some("owner-user".into()),
+        ..ActorContext::default()
+    };
+    let stranger = ActorContext {
+        agent: Some("codex".into()),
+        user: Some("stranger-user".into()),
+        ..ActorContext::default()
+    };
+    let (owner_router, store) = make_router_for_actor(&tmp, false, owner).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let stranger_server = EngramServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+    let stranger_svc = StreamableHttpService::new(
+        move || Ok(stranger_server.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    );
+    let stranger_router = Router::new()
+        .nest_service("/mcp", stranger_svc)
+        .layer(Extension(AuthLevel::User))
+        .layer(Extension(stranger));
+
+    let from = call_tool(
+        &owner_router,
+        100,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000060",
+            "objective": "Owned source work",
+            "summary": "Owner publishes the FROM work item."
+        }),
+    )
+    .await;
+    let target = call_tool(
+        &owner_router,
+        101,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000061",
+            "objective": "Owned target work",
+            "summary": "Owner publishes the TO work item."
+        }),
+    )
+    .await;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let count_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_item_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_before, 0);
+
+    for (idx, kind) in ["depends_on", "derived_from", "child_of"]
+        .into_iter()
+        .enumerate()
+    {
+        let error = call_tool_failure(
+            &stranger_router,
+            102 + idx as u64,
+            "memory_handoff_begin",
+            serde_json::json!({
+                "work_item_id": from["work_item_id"],
+                "run_id": "019f0042-0000-7000-8000-000000000062",
+                "summary": format!("Stranger tried to attach {kind}."),
+                "relationships": [{
+                    "kind": kind,
+                    "target_work_item_id": target["work_item_id"]
+                }]
+            }),
+        )
+        .await;
+        assert!(
+            error.to_lowercase().contains("unauthorized"),
+            "{kind}: {error}"
+        );
+    }
+
+    let count_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_item_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_after, 0);
+}
+
+/// Issue #42 tracer: observation metadata is per attachment, file identity
+/// includes repository coordinates, and dirty worktrees do not collapse.
+#[tokio::test]
+async fn artifact_observations_are_per_attachment_and_do_not_collide() {
+    let tmp = TempDir::new().unwrap();
+    let (router, store) = make_router(&tmp, false).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let _sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+
+    let first = call_tool(
+        &router,
+        110,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000070",
+            "objective": "First observer",
+            "summary": "First machine attaches the git object.",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "abc123",
+                "commit_id": "abc123",
+                "dirty": false,
+                "local_path_hint": "/tmp/machine-a/engram",
+                "provenance": "first observer"
+            }]
+        }),
+    )
+    .await;
+    let second = call_tool(
+        &router,
+        111,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000071",
+            "objective": "Second observer",
+            "summary": "Second project attaches the same git object.",
+            "workspace": "default",
+            "project": "sibling",
+            "artifacts": [{
+                "kind": "git",
+                "locator": "origin",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "abc123",
+                "commit_id": "abc123",
+                "dirty": true,
+                "local_path_hint": "/Users/other/machine-b/engram",
+                "provenance": "second observer"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(first["artifacts"][0]["id"], second["artifacts"][0]["id"]);
+    assert_eq!(
+        second["artifacts"][0]["source_run_id"],
+        "019f0042-0000-7000-8000-000000000071"
+    );
+    assert_eq!(second["artifacts"][0]["provenance"], "second observer");
+    assert_eq!(second["artifacts"][0]["dirty"], true);
+    assert_eq!(
+        second["artifacts"][0]["local_path_hint"],
+        "/Users/other/machine-b/engram"
+    );
+    assert_eq!(
+        first["artifacts"][0]["source_run_id"],
+        "019f0042-0000-7000-8000-000000000070"
+    );
+    assert_eq!(first["artifacts"][0]["provenance"], "first observer");
+    assert_eq!(first["artifacts"][0]["dirty"], false);
+
+    let rediscovered = call_tool(
+        &router,
+        112,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["provenance"],
+        "first observer"
+    );
+    assert_eq!(
+        rediscovered["handoff"]["artifacts"][0]["local_path_hint"],
+        "/tmp/machine-a/engram"
+    );
+
+    let repo_a = call_tool(
+        &router,
+        113,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000072",
+            "objective": "Repo A file",
+            "summary": "Same relative path in repository A.",
+            "artifacts": [{
+                "kind": "file",
+                "locator": "src/lib.rs",
+                "repository_identity": "github.com/org/repo-a",
+                "content_hash": "hash-a",
+                "provenance": "repo a"
+            }]
+        }),
+    )
+    .await;
+    let repo_b = call_tool(
+        &router,
+        114,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000073",
+            "objective": "Repo B file",
+            "summary": "Same relative path in repository B.",
+            "artifacts": [{
+                "kind": "file",
+                "locator": "src/lib.rs",
+                "repository_identity": "github.com/org/repo-b",
+                "content_hash": "hash-b",
+                "provenance": "repo b"
+            }]
+        }),
+    )
+    .await;
+    assert_ne!(
+        repo_a["artifacts"][0]["id"], repo_b["artifacts"][0]["id"],
+        "same relative path in two repositories must not share identity"
+    );
+
+    let dirty_a = call_tool(
+        &router,
+        115,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000074",
+            "objective": "Dirty worktree A",
+            "summary": "First dirty checkout at the same commit.",
+            "artifacts": [{
+                "kind": "worktree",
+                "locator": "wt-a",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "abc123",
+                "tree_hash": "dirty-tree-a",
+                "dirty": true,
+                "local_path_hint": "/tmp/wt-a",
+                "provenance": "dirty a"
+            }]
+        }),
+    )
+    .await;
+    let dirty_b = call_tool(
+        &router,
+        116,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "019f0042-0000-7000-8000-000000000075",
+            "objective": "Dirty worktree B",
+            "summary": "Second dirty checkout at the same commit.",
+            "artifacts": [{
+                "kind": "worktree",
+                "locator": "wt-b",
+                "repository_identity": "github.com/semantic-craft/engram",
+                "observed_revision": "abc123",
+                "tree_hash": "dirty-tree-b",
+                "dirty": true,
+                "local_path_hint": "/tmp/wt-b",
+                "provenance": "dirty b"
+            }]
+        }),
+    )
+    .await;
+    assert_ne!(
+        dirty_a["artifacts"][0]["id"], dirty_b["artifacts"][0]["id"],
+        "dirty worktrees at the same commit must not collapse"
+    );
+    assert_eq!(dirty_a["artifacts"][0]["provenance"], "dirty a");
+    assert_eq!(dirty_b["artifacts"][0]["provenance"], "dirty b");
+    assert_eq!(dirty_a["artifacts"][0]["local_path_hint"], "/tmp/wt-a");
+    assert_eq!(dirty_b["artifacts"][0]["local_path_hint"], "/tmp/wt-b");
+    assert_eq!(dirty_a["artifacts"][0]["dirty"], true);
+    assert_eq!(dirty_b["artifacts"][0]["dirty"], true);
 }

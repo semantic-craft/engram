@@ -230,7 +230,7 @@ durable retrieval follows the Karpathy-style LLM Wiki pattern.
   into one command/transaction instead of spawning many writer messages or
   opening per-row transactions.
 - Number new store migrations strictly above the highest embedded migration
-  (currently V101; next is V102). Never slot a migration into a historical
+  (currently V103; next is V104). Never slot a migration into a historical
   gap: stores migrated by an earlier release sit above it and can only be
   opened again through the gap-backfill path in `engram-store::migrations`.
   The `no_new_migrations_below_released_high_water_mark` test enforces this;

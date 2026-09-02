@@ -2561,7 +2561,7 @@ impl ReaderPool {
                     selected = Some(handoff);
                 }
             }
-            Ok(selected)
+            selected.map(|handoff| hydrate_handoff(conn, handoff)).transpose()
         })
         .await
     }
@@ -2583,7 +2583,7 @@ impl ReaderPool {
                     row_to_handoff,
                 )
                 .optional()?;
-            row.transpose()
+            row.transpose()?.map(|handoff| hydrate_handoff(conn, handoff)).transpose()
         })
         .await
     }
@@ -2652,6 +2652,14 @@ impl ReaderPool {
                     .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
                 updated_at: Timestamp::from_microsecond(updated_at)
                     .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+                relationships: crate::artifacts::load_work_item_relationships(
+                    conn,
+                    WorkItemId::from_slice(&id)?,
+                )?,
+                child_results: crate::artifacts::load_child_results(
+                    conn,
+                    WorkItemId::from_slice(&id)?,
+                )?,
             }))
         })
         .await
@@ -3052,7 +3060,10 @@ impl ReaderPool {
                     row_to_handoff,
                 )
                 .optional()?;
-            row_opt.transpose()
+            row_opt
+                .transpose()?
+                .map(|handoff| hydrate_handoff(conn, handoff))
+                .transpose()
         })
         .await
     }
@@ -5851,7 +5862,14 @@ fn materialise_handoff(
                 )))
             })?,
         acknowledged_by_session: acknowledged_session,
+        artifacts: Vec::new(),
     })
+}
+
+fn hydrate_handoff(conn: &Connection, mut handoff: Handoff) -> StoreResult<Handoff> {
+    handoff.artifacts =
+        crate::artifacts::load_owner_artifacts(conn, "handoff", handoff.id.as_bytes())?;
+    Ok(handoff)
 }
 
 fn parse_agent(s: &str) -> AgentKind {
@@ -6415,6 +6433,7 @@ mod tests {
             acknowledged_by: None,
             acknowledged_at: None,
             acknowledged_by_session: None,
+            artifacts: vec![],
         }
     }
 
@@ -6618,6 +6637,8 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
             })
             .await
             .unwrap();
@@ -6639,6 +6660,8 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
             })
             .await
             .unwrap();

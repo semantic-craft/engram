@@ -16,8 +16,12 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::AgentKind;
+use crate::artifact::{ArtifactInput, ArtifactRef};
 use crate::ids::{
     AttemptId, CheckpointId, ClaimId, HandoffId, ProjectId, SessionId, WorkItemId, WorkspaceId,
+};
+use crate::relationship::{
+    ParentResult, ParentResultInput, RelationshipInput, WorkItemRelationship,
 };
 
 /// State of the stable unit of user work. Receiving a handoff does not change
@@ -119,6 +123,10 @@ pub struct WorkItem {
     pub owner_run_id: Option<SessionId>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    #[serde(default)]
+    pub relationships: Vec<WorkItemRelationship>,
+    #[serde(default)]
+    pub child_results: Vec<ParentResult>,
 }
 
 /// Publish input. `work_item_id = None` creates a new WorkItem; `Some` appends
@@ -140,6 +148,10 @@ pub struct NewHandoff {
     pub open_questions: Vec<String>,
     pub next_steps: Vec<String>,
     pub files_touched: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactInput>,
+    #[serde(default)]
+    pub relationships: Vec<RelationshipInput>,
 }
 
 /// Materialized transfer offer.
@@ -165,6 +177,8 @@ pub struct Handoff {
     pub acknowledged_by: Option<String>,
     pub acknowledged_at: Option<Timestamp>,
     pub acknowledged_by_session: Option<SessionId>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRef>,
 }
 
 /// Result of publishing a new transfer offer.
@@ -174,6 +188,10 @@ pub struct PublishedHandoff {
     pub handoff_id: HandoffId,
     pub work_item_revision: u64,
     pub handoff_revision: u64,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub relationships: Vec<WorkItemRelationship>,
 }
 
 /// Claim outcome. The claim id is an opaque capability and must not be copied
@@ -187,6 +205,8 @@ pub struct HandoffClaimResult {
     pub lease_expires_at: Timestamp,
     pub revision: u64,
     pub handoff: Handoff,
+    #[serde(default)]
+    pub relationships: Vec<WorkItemRelationship>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +268,12 @@ pub struct CheckpointWrite {
     pub acceptance_criteria: Vec<AcceptanceCriterionStatus>,
     pub actor_key: String,
     pub attempt_id: AttemptId,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactInput>,
+    #[serde(default)]
+    pub relationships: Vec<RelationshipInput>,
+    #[serde(default)]
+    pub parent_result: Option<ParentResultInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,4 +286,10 @@ pub struct CheckpointWriteResult {
     pub handoff_id: Option<HandoffId>,
     pub handoff_revision: Option<u64>,
     pub handoff_state: Option<HandoffState>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub relationships: Vec<WorkItemRelationship>,
+    #[serde(default)]
+    pub parent_result: Option<ParentResult>,
 }

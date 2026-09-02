@@ -28,6 +28,20 @@ only by writing the first durable checkpoint. Merely reading or claiming does
 not complete the WorkItem. Claims have bounded leases, so another receiver can
 recover the task if the first disappears.
 
+`memory_handoff_begin` and `memory_checkpoint_write` can attach typed
+ArtifactRefs and explicit WorkItem relationships, and both responses return
+those refs and relationships with stable identities and revisions. File identity
+is repository (or project) coordinates plus a repository-relative locator; Git
+identity is repository plus revision; worktree identity distinguishes dirty
+checkouts at the same commit. Absolute cwd is a hint, not identity. Observation
+metadata (source Run, timestamp, provenance, dirty, local-path hint) belongs to
+the attachment, not the shared identity. Delivery facts stay independent:
+committed does not imply pushed, and verified evidence that names an older
+revision is stale. Related work uses `depends_on`, `derived_from`, or `child_of`
+and creates a new WorkItem instead of inheriting a claim or blocker. Engram
+records these facts; it does not run Git checkout, commit, push, merge, release,
+or deploy.
+
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` with the id, revision, and source Run returned by
 `memory_handoff_begin`. Only that source owner can expire an open Handoff.

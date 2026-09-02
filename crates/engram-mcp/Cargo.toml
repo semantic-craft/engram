@@ -42,6 +42,7 @@ async-trait.workspace = true
 flate2.workspace = true
 tar.workspace = true
 tower.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

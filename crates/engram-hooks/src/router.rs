@@ -1534,6 +1534,8 @@ fn build_auto_handoff(
         open_questions,
         next_steps,
         files_touched: Vec::new(),
+        artifacts: vec![],
+        relationships: vec![],
     }
 }
 
@@ -4137,6 +4139,8 @@ mod tests {
                 open_questions: Vec::new(),
                 next_steps: vec!["continue".to_string()],
                 files_touched: Vec::new(),
+                artifacts: vec![],
+                relationships: vec![],
             })
             .await
             .unwrap();
@@ -4266,6 +4270,8 @@ mod tests {
                 open_questions: Vec::new(),
                 next_steps: Vec::new(),
                 files_touched: Vec::new(),
+                artifacts: vec![],
+                relationships: vec![],
             })
             .await
             .unwrap();
@@ -4378,6 +4384,8 @@ mod tests {
                 open_questions: Vec::new(),
                 next_steps: vec!["resume plain repo".to_string()],
                 files_touched: Vec::new(),
+                artifacts: vec![],
+                relationships: vec![],
             })
             .await
             .unwrap();
@@ -4456,6 +4464,8 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    artifacts: vec![],
+                    relationships: vec![],
                 })
                 .await
                 .unwrap();
