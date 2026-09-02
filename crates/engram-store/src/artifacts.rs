@@ -57,45 +57,15 @@ fn persist_one_artifact(
     let identity_hash: [u8; 32] = identity_hash.into();
     let artifact_id = artifact_id_from_hash(&identity_hash);
 
-    let existing: Option<(
-        Vec<u8>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        String,
-        Vec<u8>,
-        i64,
-    )> = tx
+    let existing: Option<(Vec<u8>, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT id, observed_revision, content_hash, repository_identity, git_ref, commit_id, \
-                    tree_hash, dirty, local_path_hint, provenance, source_run_id, observed_at \
-             FROM artifacts WHERE identity_hash = ?1",
+            "SELECT id, content_hash, tree_hash FROM artifacts WHERE identity_hash = ?1",
             params![identity_hash.as_slice()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
 
-    if let Some((existing_id, _, content_hash, _, _, _, tree_hash, _, _, _, _, _)) = existing {
+    if let Some((existing_id, content_hash, tree_hash)) = existing {
         if existing_id.as_slice() != artifact_id.as_bytes() {
             return Err(StoreError::MalformedRecord(
                 "artifact identity hash collided with a different id".into(),
@@ -129,7 +99,7 @@ fn persist_one_artifact(
                     normalized.git_ref,
                     normalized.commit_id,
                     normalized.tree_hash,
-                    normalized.dirty.map(|value| i64::from(value)),
+                    normalized.dirty.map(i64::from),
                     normalized.local_path_hint,
                     normalized.provenance,
                     source_run_id.as_bytes(),

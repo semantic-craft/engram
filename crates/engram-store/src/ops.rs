@@ -2318,6 +2318,7 @@ fn audit_continuity(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_continuity_with_refs(
     tx: &rusqlite::Transaction<'_>,
     op: &str,
