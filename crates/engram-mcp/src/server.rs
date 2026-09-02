@@ -1431,6 +1431,16 @@ impl EngramServer {
                 ResolvedHandoffRef::Omission(omission) => omissions.push(omission),
             }
         }
+        // A publisher-selected page need not match the handoff prose, so it can
+        // reach the package without ever appearing in the retrieval hits that
+        // get bumped there. Reinforce it here or the retention sweep sees
+        // continuation evidence that every claim consumes as cold.
+        self.spawn_access_bump(
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.context_ref.page_revision())
+                .collect(),
+        );
         candidates.extend(
             self.handoff_retrieval_candidates(handoff, 20)
                 .await

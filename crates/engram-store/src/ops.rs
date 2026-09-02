@@ -1239,13 +1239,21 @@ pub fn claim_handoff(
     let tx = conn.transaction()?;
     let mut handoff = load_handoff(&tx, input.handoff_id)?
         .ok_or_else(|| StoreError::NotFound(format!("handoff {}", input.handoff_id)))?;
-    let digest = canonical_digest(&serde_json::json!({
+    let mut identity = serde_json::json!({
         "handoff_id": input.handoff_id,
         "expected_revision": input.expected_revision,
         "run_id": input.run_id,
         "lease_seconds": input.lease_seconds,
-        "context_options": input.context_options,
-    }))?;
+    });
+    // Attempts recorded before the claim returned an assembled package hashed
+    // only the fields above. Their rows cannot be recomputed, so an otherwise
+    // identical lost-response retry must still match that shape or an
+    // in-flight claim becomes unreplayable across the upgrade. Those rows
+    // carry no assembly options to compare, which is the whole reason they
+    // need the older shape.
+    let legacy_digest = canonical_digest(&identity)?;
+    identity["context_options"] = input.context_options.clone();
+    let digest = canonical_digest(&identity)?;
     if let Some(replayed) = replay_attempt::<HandoffClaimResult>(
         &tx,
         input.attempt_id,
@@ -1257,7 +1265,7 @@ pub fn claim_handoff(
         Some(input.handoff_id),
         None,
         Some(input.expected_revision),
-        &digest,
+        &[digest, legacy_digest],
     )? {
         tx.commit()?;
         return replayed;
@@ -1468,7 +1476,7 @@ pub fn release_handoff(
         Some(input.handoff_id),
         None,
         Some(input.expected_revision),
-        &digest,
+        &[digest],
     )? {
         tx.commit()?;
         return replayed;
@@ -1710,7 +1718,7 @@ pub fn write_checkpoint(
         input.handoff_id,
         Some(input.expected_work_item_revision),
         input.expected_handoff_revision,
-        &digest,
+        &[digest],
     )? {
         tx.commit()?;
         return replayed;
@@ -2080,7 +2088,7 @@ fn replay_attempt<T: serde::de::DeserializeOwned>(
     handoff_id: Option<HandoffId>,
     expected_work_item_revision: Option<u64>,
     expected_handoff_revision: Option<u64>,
-    digest: &[u8; 32],
+    accepted_digests: &[[u8; 32]],
 ) -> StoreResult<Option<StoreResult<T>>> {
     let stored: Option<ContinuityAttemptRow> = tx
         .query_row(
@@ -2120,7 +2128,9 @@ fn replay_attempt<T: serde::de::DeserializeOwned>(
         && handoff_matches
         && stored_work_revision == expected_work_item_revision.map(|v| v as i64)
         && stored_handoff_revision == expected_handoff_revision.map(|v| v as i64)
-        && stored_digest.as_slice() == digest;
+        && accepted_digests
+            .iter()
+            .any(|accepted| stored_digest.as_slice() == accepted);
     if !binding_matches {
         return Err(StoreError::InvalidState(format!(
             "attempt {attempt_id} was already used with a different continuity request"
@@ -3639,6 +3649,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "page FTS should remain accent-insensitive");
+    }
+
+    /// A claim Attempt recorded before the claim returned an assembled
+    /// package hashed its request without `context_options`. Those rows cannot
+    /// be recomputed, so an otherwise identical lost-response retry must still
+    /// replay instead of being rejected as a different continuity request.
+    #[test]
+    fn legacy_claim_attempt_digests_still_replay() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let source_run = SessionId::new();
+        let published = publish_handoff(
+            &mut conn,
+            &NewHandoff {
+                work_item_id: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: source_run,
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "source".into(),
+                to_agent: None,
+                cwd: None,
+                objective: "Replay across the upgrade".into(),
+                acceptance_criteria: vec![],
+                summary: "recorded before context_options".into(),
+                brief: String::new(),
+                context_refs: vec![],
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
+            },
+        )
+        .unwrap();
+        let claim = HandoffClaim {
+            handoff_id: published.handoff_id,
+            workspace_id: ws,
+            project_id: proj,
+            expected_revision: 1,
+            run_id: SessionId::new(),
+            attempt_id: AttemptId::new(),
+            actor_key: "receiver".into(),
+            lease_seconds: 60,
+            context_options: serde_json::json!({ "context_budget": 4096 }),
+        };
+        let first = claim_handoff(&mut conn, &claim).unwrap();
+
+        // Rewrite the recorded digest to the pre-upgrade shape.
+        let legacy = canonical_digest(&serde_json::json!({
+            "handoff_id": claim.handoff_id,
+            "expected_revision": claim.expected_revision,
+            "run_id": claim.run_id,
+            "lease_seconds": claim.lease_seconds,
+        }))
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_attempts SET request_digest = ?1 WHERE id = ?2",
+            params![legacy.as_slice(), claim.attempt_id.as_bytes()],
+        )
+        .unwrap();
+
+        let replayed = claim_handoff(&mut conn, &claim).unwrap();
+        assert_eq!(replayed.claim_id, first.claim_id);
+        assert_eq!(replayed.revision, first.revision);
+
+        // A legacy row records no assembly options, so only the fields it did
+        // hash can still reject a changed request.
+        let mut changed = claim.clone();
+        changed.lease_seconds = 61;
+        let error = claim_handoff(&mut conn, &changed).unwrap_err().to_string();
+        assert!(error.contains("different continuity request"), "{error}");
     }
 
     #[test]
