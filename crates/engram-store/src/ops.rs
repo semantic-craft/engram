@@ -2123,65 +2123,6 @@ pub fn write_checkpoint(
         ));
     }
 
-    // Reaching a terminal state retires every offer still waiting on this
-    // WorkItem, in the same transaction that closes it. Otherwise a stale open
-    // Handoff stays claimable after the work is finished, and its claimant
-    // would only discover the WorkItem is closed when its own checkpoint is
-    // rejected. A `claimed` transfer is left alone: it belongs to a live
-    // receiver, who releases it rather than having it retired underneath them.
-    if matches!(
-        input.work_item_state,
-        WorkItemState::Completed | WorkItemState::Abandoned
-    ) {
-        let retired: Vec<(HandoffId, u64)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, revision FROM handoffs WHERE work_item_id = ?1 AND state = 'open' \
-                 ORDER BY created_at, rowid",
-            )?;
-            let rows = stmt.query_map(params![input.work_item_id.as_bytes()], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (handoff, revision) = row?;
-                let next = u64::try_from(revision)
-                    .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?
-                    .checked_add(1)
-                    .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
-                out.push((HandoffId::from_slice(&handoff)?, next));
-            }
-            out
-        };
-        if !retired.is_empty() {
-            let changed = tx.execute(
-                "UPDATE handoffs SET state = 'expired', revision = revision + 1 \
-                 WHERE work_item_id = ?1 AND state = 'open'",
-                params![input.work_item_id.as_bytes()],
-            )?;
-            if changed != retired.len() {
-                return Err(StoreError::InvalidState(
-                    "handoff expiry compare-and-set conflict".into(),
-                ));
-            }
-            for (handoff_id, revision) in &retired {
-                audit_continuity(
-                    &tx,
-                    "handoff_expire_terminal",
-                    input.workspace_id,
-                    input.project_id,
-                    input.work_item_id,
-                    input.run_id,
-                    Some(*handoff_id),
-                    Some(*revision),
-                    Some(input.attempt_id),
-                    &input.actor_key,
-                    "expired",
-                    now,
-                )?;
-            }
-        }
-    }
-
     let (handoff_revision, handoff_state) =
         if let Some((handoff, claim_id, expected)) = acknowledged_handoff {
             let next = expected
@@ -2221,6 +2162,73 @@ pub fn write_checkpoint(
         } else {
             (None, None)
         };
+
+    // Reaching a terminal state retires every transfer still live on this
+    // WorkItem, in the transaction that closes it. `open` and `claimed` both
+    // qualify: leaving a claimed one alone protects nothing once the work is
+    // finished (its holder's next checkpoint is rejected anyway), and it
+    // strands the transfer — an expired lease makes it discoverable again,
+    // while claim, release, and cancel all refuse it. Any live lease is
+    // resolved alongside. This runs after the acknowledgement above, so the
+    // transfer this checkpoint acknowledges is already terminal and excluded.
+    if matches!(
+        input.work_item_state,
+        WorkItemState::Completed | WorkItemState::Abandoned
+    ) {
+        let retired: Vec<(HandoffId, u64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, revision FROM handoffs \
+                 WHERE work_item_id = ?1 AND state IN ('open', 'claimed') \
+                 ORDER BY created_at, rowid",
+            )?;
+            let rows = stmt.query_map(params![input.work_item_id.as_bytes()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (handoff, revision) = row?;
+                let next = u64::try_from(revision)
+                    .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+                out.push((HandoffId::from_slice(&handoff)?, next));
+            }
+            out
+        };
+        if !retired.is_empty() {
+            let changed = tx.execute(
+                "UPDATE handoffs SET state = 'expired', revision = revision + 1 \
+                 WHERE work_item_id = ?1 AND state IN ('open', 'claimed')",
+                params![input.work_item_id.as_bytes()],
+            )?;
+            if changed != retired.len() {
+                return Err(StoreError::InvalidState(
+                    "handoff expiry compare-and-set conflict".into(),
+                ));
+            }
+            tx.execute(
+                "UPDATE handoff_claims SET state = 'expired', resolved_at = ?1 \
+                 WHERE work_item_id = ?2 AND state = 'live'",
+                params![now, input.work_item_id.as_bytes()],
+            )?;
+            for (handoff_id, revision) in &retired {
+                audit_continuity(
+                    &tx,
+                    "handoff_expire_terminal",
+                    input.workspace_id,
+                    input.project_id,
+                    input.work_item_id,
+                    input.run_id,
+                    Some(*handoff_id),
+                    Some(*revision),
+                    Some(input.attempt_id),
+                    &input.actor_key,
+                    "expired",
+                    now,
+                )?;
+            }
+        }
+    }
 
     let artifacts = persist_artifacts(
         &tx,

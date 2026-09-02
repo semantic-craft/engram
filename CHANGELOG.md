@@ -34,8 +34,9 @@ below start from the fork.
   contract — and nothing deletes a predecessor that a successor, Checkpoint,
   ArtifactRef, ContextRef, or audit record still refers to. Terminal WorkItems
   are irreversible: a checkpoint can no longer move one back to `active` or
-  `blocked`, reaching a terminal state retires any transfer still `open` in the
-  same transaction, and claiming a transfer against finished work fails closed.
+  `blocked`, reaching a terminal state retires every transfer still `open` or
+  `claimed` (resolving any live lease) in the same transaction, and claiming a
+  transfer against finished work fails closed.
 
 - The SessionStart continuation envelope now renders the *remaining*
   acceptance criteria (from the WorkItem's latest Checkpoint rather than the

@@ -215,8 +215,9 @@ lease expiry, and supersession — must stay distinguishable in the state machin
 and in `audit_log`, or a chain cannot be explained after the fact. A
 `completed` or `abandoned` WorkItem refuses further Handoffs, checkpoints, and
 claims rather than being silently reopened — reaching a terminal state retires
-any still-open transfer in the same transaction, so nothing stays claimable
-against finished work — and follow-up work is a new WorkItem joined by
+every still-live transfer, open or claimed, and resolves its lease in the same
+transaction, so nothing is left discoverable but unresolvable against finished
+work — and follow-up work is a new WorkItem joined by
 `depends_on`, `derived_from`, or `child_of`. Discovery reads the whole envelope
 (transfer, WorkItem, latest Checkpoint, chain) from one snapshot, so a
 successor published mid-read can never hand a receiver a superseded transfer

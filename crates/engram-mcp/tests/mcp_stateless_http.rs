@@ -3429,8 +3429,10 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         "cancellation is its own terminal state, not a lapsed offer"
     );
 
-    // Completing the WorkItem retires whatever transfer is still open, so no
-    // receiver can claim a lease against finished work.
+    // Completing the WorkItem retires whatever transfer is still live — open or
+    // claimed — so nothing stays discoverable against finished work. A held
+    // transfer is the trap: once its lease lapsed it would be discoverable
+    // again while claim, release, and cancel all refused it.
     let final_open = call_tool(
         &router,
         129,
@@ -3444,6 +3446,21 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         }),
     )
     .await;
+    call_tool(
+        &receiver,
+        133,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": final_open["handoff_id"],
+            "expected_revision": 1,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000028",
+            "lease_seconds": 1,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     call_tool(
         &router,
         130,
@@ -3465,7 +3482,7 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         &router,
         131,
         "memory_handoff_discover",
-        serde_json::json!({}),
+        serde_json::json!({ "include_claimed": true }),
     )
     .await;
     assert!(
@@ -3478,7 +3495,7 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         "memory_handoff_claim",
         serde_json::json!({
             "handoff_id": final_open["handoff_id"],
-            "expected_revision": 1,
+            "expected_revision": 3,
             "run_id": receiver_run,
             "attempt_id": "019f0043-0000-7000-8000-000000000027",
             "lease_seconds": 60,

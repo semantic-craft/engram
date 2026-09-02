@@ -813,31 +813,8 @@ fn render_handoff_markdown(
             buf.push_str(&format!("- [{box_mark}] {criterion}\n"));
         }
     }
-    if !h.artifacts.is_empty() {
-        buf.push_str("\n**Evidence**\n");
-        for artifact in &h.artifacts {
-            let revision = artifact
-                .observed_revision
-                .as_deref()
-                .map(|rev| format!(" @ `{rev}`"))
-                .unwrap_or_default();
-            buf.push_str(&format!(
-                "- {kind} `{locator}`{revision}\n",
-                kind = artifact.kind.as_str(),
-                locator = artifact.locator,
-            ));
-        }
-    }
-    if !work_item.relationships.is_empty() {
-        buf.push_str("\n**Related work**\n");
-        for relationship in &work_item.relationships {
-            buf.push_str(&format!(
-                "- {kind} `{target}`\n",
-                kind = relationship.kind.as_str(),
-                target = relationship.to_work_item_id,
-            ));
-        }
-    }
+    // ArtifactRef evidence and WorkItem relationships already have their own
+    // detailed sections further down; do not list them twice.
 
     if !h.open_questions.is_empty() {
         buf.push_str("\n**Open questions**\n");
@@ -4431,7 +4408,7 @@ mod tests {
             rendered.contains("**WorkItem state** `blocked`"),
             "{rendered}"
         );
-        assert!(rendered.contains("file `src/chain.rs`"), "{rendered}");
+        assert!(rendered.contains("`file` `src/chain.rs`"), "{rendered}");
         assert!(
             rendered.contains(&format!("Handoff `{}`", successor.handoff_id)),
             "the superseded transfer is history; the successor is injected: {rendered}"
