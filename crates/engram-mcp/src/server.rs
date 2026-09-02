@@ -1431,21 +1431,16 @@ impl EngramServer {
                 ResolvedHandoffRef::Omission(omission) => omissions.push(omission),
             }
         }
-        // A publisher-selected page need not match the handoff prose, so it can
-        // reach the package without ever appearing in the retrieval hits that
-        // get bumped there. Reinforce it here or the retention sweep sees
-        // continuation evidence that every claim consumes as cold.
-        self.spawn_access_bump(
-            candidates
-                .iter()
-                .filter_map(|candidate| candidate.context_ref.page_revision())
-                .collect(),
-        );
         candidates.extend(
             self.handoff_retrieval_candidates(handoff, 20)
                 .await
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?,
         );
+        // Same reinforcement term as every `memory_query` page path, so
+        // material reused only through claims does not look cold to the
+        // retention sweep. One bump per consumed revision: see
+        // `claim_access_bump_ids`.
+        self.spawn_access_bump(claim_access_bump_ids(&candidates));
         let mut assembled = ContextAssembler.assemble(
             candidates,
             ContextAssemblyRequest {
@@ -1477,10 +1472,6 @@ impl EngramServer {
                 limit,
             )
             .await?;
-        // Same reinforcement term as every `memory_query` page path: material
-        // reused only through claims must not look cold to the retention
-        // sweep.
-        self.spawn_access_bump(page_hits.iter().map(|hit| hit.id).collect());
         let observation_hits = if page_hits.is_empty() {
             self.reader
                 .search_observations_for_project(
@@ -1595,30 +1586,18 @@ impl EngramServer {
             .collect())
     }
 
-    /// Resolve every distinct encoded workspace/project pair in one reader
-    /// query. A pair with no existing scope maps to `None` so its references
-    /// are omitted, never substituted with another scope.
+    /// Resolve every distinct encoded workspace/project pair through the
+    /// shared scope framework's batched no-create lookup. A pair with no
+    /// existing scope is absent from the map, so its references are omitted
+    /// rather than substituted with another scope.
     async fn batch_lookup_context_scopes(
         &self,
         references: &[ContextRef],
-    ) -> Result<HashMap<(String, String), engram_store::ResolvedScope>, McpError> {
-        let resolved = self
-            .reader
-            .find_scopes_by_name(references.iter().map(scope_key).collect())
+    ) -> Result<HashMap<ScopeName, engram_store::ResolvedScope>, McpError> {
+        let scopes = references.iter().map(scope_key).collect::<Vec<_>>();
+        engram_store::lookup_existing_scopes(&self.reader, &scopes)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(resolved
-            .into_iter()
-            .map(|(names, (workspace_id, project_id))| {
-                (
-                    names,
-                    engram_store::ResolvedScope {
-                        workspace_id,
-                        project_id,
-                    },
-                )
-            })
-            .collect())
+            .map_err(Self::scope_error)
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -3471,11 +3450,25 @@ enum ResolvedHandoffRef {
     Omission(AssemblyOmission),
 }
 
-fn scope_key(reference: &ContextRef) -> (String, String) {
-    (
-        reference.workspace().to_owned(),
-        reference.project().to_owned(),
-    )
+/// Page revisions to reinforce for one claim, each at most once.
+///
+/// A publisher can repeat a ContextRef, and an explicitly referenced page can
+/// also match the handoff prose, so the same revision arrives as several
+/// candidates. The assembler collapses those into one package entry, and
+/// `bump_access_for_pages` increments once per supplied id — without the
+/// dedup a single claim could record one access per allowed reference plus
+/// its retrieval hit, inflating the page's retention score.
+fn claim_access_bump_ids(candidates: &[ContextCandidate]) -> Vec<PageId> {
+    let mut seen = HashSet::new();
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.context_ref.page_revision())
+        .filter(|revision| seen.insert(*revision))
+        .collect()
+}
+
+fn scope_key(reference: &ContextRef) -> ScopeName {
+    ScopeName::new(reference.workspace(), reference.project())
 }
 
 fn resolve_page_ref(
@@ -3916,6 +3909,69 @@ mod tests {
     use engram_store::Store;
     use engram_wiki::{Wiki, WritePageRequest};
     use tempfile::TempDir;
+
+    /// One claim must reinforce each consumed page revision exactly once.
+    /// A publisher may repeat a reference, and an explicitly referenced page
+    /// can also match the handoff prose; `bump_access_for_pages` increments
+    /// per supplied id, so without the dedup one claim inflates a page's
+    /// retention score by up to the reference limit plus its retrieval hit.
+    #[test]
+    fn claim_access_bump_records_each_page_revision_once() {
+        fn page_candidate(
+            path: &str,
+            revision: PageId,
+            priority: ContextPriority,
+        ) -> ContextCandidate {
+            context_candidate(ContextCandidateParts {
+                context_ref: ContextRef::page(
+                    "default",
+                    "scratch",
+                    PagePath::new(path).unwrap(),
+                    revision,
+                )
+                .unwrap(),
+                title: "t",
+                snippet: "",
+                priority,
+                score: 0.0,
+                deduplication_key: format!("sha256:{path}"),
+                retrieval_sources: vec!["fts".into()],
+                selection_reason: "test",
+                body: "b",
+            })
+        }
+
+        let repeated = PageId::new();
+        let other = PageId::new();
+        let observation = context_candidate(ContextCandidateParts {
+            context_ref: ContextRef::observation("default", "scratch", ObservationId::new())
+                .unwrap(),
+            title: "o",
+            snippet: "",
+            priority: ContextPriority::Retrieved,
+            score: -3.0,
+            deduplication_key: "sha256:o".into(),
+            retrieval_sources: vec!["fts".into()],
+            selection_reason: "test",
+            body: "b",
+        });
+        let candidates = vec![
+            // The publisher named the same revision twice ...
+            page_candidate("notes/a.md", repeated, ContextPriority::Explicit),
+            page_candidate("notes/a.md", repeated, ContextPriority::Explicit),
+            page_candidate("notes/b.md", other, ContextPriority::Explicit),
+            // ... and retrieval surfaced one of them again.
+            page_candidate("notes/a.md", repeated, ContextPriority::Retrieved),
+            observation,
+        ];
+
+        assert_eq!(
+            claim_access_bump_ids(&candidates),
+            vec![repeated, other],
+            "one bump per revision, in first-seen order, observations excluded"
+        );
+        assert!(claim_access_bump_ids(&[]).is_empty());
+    }
 
     async fn setup_server() -> (TempDir, Store, EngramServer, WorkspaceId, ProjectId) {
         let tmp = TempDir::new().unwrap();

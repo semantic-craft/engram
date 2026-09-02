@@ -6,7 +6,7 @@
 //! actor-scoped active-project pointer. Keeping those policies here prevents
 //! each surface from growing its own subtly different fallback chain.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use engram_core::{ActiveProject, ActorKey, ProjectId, WorkspaceId};
@@ -200,6 +200,58 @@ pub async fn lookup_existing_scope(
         workspace_id,
         project_id,
     })
+}
+
+/// Resolve many explicit workspace/project name pairs in one reader query,
+/// creating nothing.
+///
+/// This is the batched sibling of [`lookup_existing_scope`], for surfaces that
+/// receive a bounded list of already-encoded scopes — a Handoff's revisioned
+/// ContextRefs, say — and would otherwise pay a workspace read plus a project
+/// read per name pair.
+///
+/// It is a **no-create, fail-closed** lookup like its single-pair sibling, and
+/// it never consults the actor's active project: an encoded scope means that
+/// scope or nothing. A pair naming a missing workspace, or a missing project
+/// inside an existing workspace, is simply absent from the returned map;
+/// callers decide whether absence is an error or an omission. Names are
+/// trimmed exactly as [`resolve_many_existing_scopes`] trims them, and an
+/// empty workspace or project is an error rather than a miss. Results are
+/// keyed by the caller's original [`ScopeName`], so duplicate entries collapse
+/// and cross-workspace pairs stay distinct.
+///
+/// # Errors
+/// Returns [`ScopeResolutionError::ScopeWorkspaceEmpty`] or
+/// [`ScopeResolutionError::ScopeProjectEmpty`] for a blank coordinate, and
+/// propagates reader failures.
+pub async fn lookup_existing_scopes(
+    reader: &ReaderPool,
+    scopes: &[ScopeName],
+) -> Result<HashMap<ScopeName, ResolvedScope>, ScopeResolutionError> {
+    let mut pairs = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let workspace =
+            trimmed_opt(Some(&scope.workspace)).ok_or(ScopeResolutionError::ScopeWorkspaceEmpty)?;
+        let project =
+            trimmed_opt(Some(&scope.project)).ok_or(ScopeResolutionError::ScopeProjectEmpty)?;
+        pairs.push((workspace.to_owned(), project.to_owned()));
+    }
+    let found = reader.find_scopes_by_name(pairs.clone()).await?;
+    Ok(scopes
+        .iter()
+        .zip(pairs)
+        .filter_map(|(scope, pair)| {
+            found.get(&pair).map(|&(workspace_id, project_id)| {
+                (
+                    scope.clone(),
+                    ResolvedScope {
+                        workspace_id,
+                        project_id,
+                    },
+                )
+            })
+        })
+        .collect())
 }
 
 /// Create or fetch an explicit workspace/project pair.
@@ -665,5 +717,108 @@ mod tests {
         // Idempotent create.
         let again = create_global_scope(&store.writer).await.unwrap();
         assert_eq!(again, created);
+    }
+
+    #[tokio::test]
+    async fn batched_lookup_is_no_create_fail_closed_and_workspace_isolated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+        // Same project name in a second workspace: isolation must hold.
+        let other_scratch = store
+            .writer
+            .get_or_create_project(other_ws, "scratch", None)
+            .await
+            .unwrap();
+        // An active project must never stand in for an encoded scope.
+        let active = ActiveProject::new();
+        active.set(default_ws, scratch);
+
+        let requested = [
+            ScopeName::new("default", "scratch"),
+            ScopeName::new("other", "scratch"),
+            // Duplicate of the first: collapses, never resolved twice.
+            ScopeName::new("default", "scratch"),
+            // Existing workspace, missing project.
+            ScopeName::new("default", "absent"),
+            // Missing workspace entirely.
+            ScopeName::new("ghost", "scratch"),
+        ];
+        let resolved = lookup_existing_scopes(&store.reader, &requested)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.len(), 2, "misses are absent, not substituted");
+        assert_eq!(
+            resolved[&ScopeName::new("default", "scratch")],
+            ResolvedScope {
+                workspace_id: default_ws,
+                project_id: scratch,
+            }
+        );
+        assert_eq!(
+            resolved[&ScopeName::new("other", "scratch")],
+            ResolvedScope {
+                workspace_id: other_ws,
+                project_id: other_scratch,
+            },
+            "identically named projects must not cross workspaces"
+        );
+        assert!(!resolved.contains_key(&ScopeName::new("default", "absent")));
+        assert!(!resolved.contains_key(&ScopeName::new("ghost", "scratch")));
+
+        // No-create: a missed pair must not have been materialised.
+        assert!(
+            store
+                .reader
+                .find_workspace("ghost".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "a read-side lookup must never create a workspace"
+        );
+        assert!(
+            store
+                .reader
+                .find_project(default_ws, "absent".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "a read-side lookup must never create a project"
+        );
+
+        // A blank coordinate is an error, not a silent miss.
+        for (scope, expected) in [
+            (
+                ScopeName::new("   ", "scratch"),
+                ScopeResolutionError::ScopeWorkspaceEmpty,
+            ),
+            (
+                ScopeName::new("default", ""),
+                ScopeResolutionError::ScopeProjectEmpty,
+            ),
+        ] {
+            let error = lookup_existing_scopes(&store.reader, std::slice::from_ref(&scope))
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected, "{scope:?}");
+        }
+
+        assert!(
+            lookup_existing_scopes(&store.reader, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -308,9 +308,14 @@ handoff text to plain search terms first (`natural_language_terms`), so
 generated prose carrying `NOT`, `title:`, a lone `*`, quotes, or parentheses
 is never read as an FTS5 expression; the store's routed search then
 normalizes once and keeps its CJK legs. Pages surfaced by that leg take the
-same access bump as every other retrieval path, and the assembly options are
-part of the claim Attempt's identity, so reusing one Attempt id with a
-different budget is a conflicting request rather than a replay. Rendering or assembling
+same access bump as every other retrieval path — once per consumed revision,
+counting publisher-selected pages that retrieval never surfaced — and encoded
+ContextRef scopes resolve through the shared scope framework's batched
+no-create lookup, so a missing scope omits its reference instead of falling
+back to another. The assembly options are part of the claim Attempt's
+identity, so reusing one Attempt id with a different budget is a conflicting
+request rather than a replay; Attempts recorded before that field existed
+still replay under the digest shape they were written with. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
 Checkpoint accepts it. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.
