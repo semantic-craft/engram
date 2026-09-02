@@ -6,7 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2537,7 +2537,7 @@ impl ReaderPool {
                 "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                         from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                         files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                        acknowledged_by_session \
+                        acknowledged_by_session, brief, context_refs \
                  FROM handoffs h \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND (state = 'open' OR (state = 'claimed' AND \
@@ -2577,7 +2577,7 @@ impl ReaderPool {
                     "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                             from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                             files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                            acknowledged_by_session \
+                            acknowledged_by_session, brief, context_refs \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
@@ -3052,7 +3052,7 @@ impl ReaderPool {
                     "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                             from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                             files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                            acknowledged_by_session \
+                            acknowledged_by_session, brief, context_refs \
                      FROM handoffs \
                      WHERE workspace_id = ?1 AND state = 'open' \
                      ORDER BY created_at DESC LIMIT 1",
@@ -4687,6 +4687,71 @@ impl ReaderPool {
         .await
     }
 
+    /// Resolve many `(workspace_name, project_name)` pairs to ids in one
+    /// query, without creating anything.
+    ///
+    /// A pair that names a missing workspace or a missing project inside an
+    /// existing workspace is simply absent from the result: callers that must
+    /// fail closed check for its absence. This exists so batch paths (a
+    /// Handoff carrying up to 20 revisioned ContextRefs) do not pay a
+    /// workspace read plus a project read per name pair.
+    ///
+    /// # Errors
+    /// Propagates any SQL, identifier, or pool error.
+    pub async fn find_scopes_by_name(
+        &self,
+        pairs: Vec<(String, String)>,
+    ) -> StoreResult<HashMap<(String, String), (WorkspaceId, ProjectId)>> {
+        if pairs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut unique: Vec<(String, String)> = Vec::new();
+        for pair in pairs {
+            if !unique.contains(&pair) {
+                unique.push(pair);
+            }
+        }
+        self.with_conn(move |conn| {
+            // One statement over a row-value IN list: `(w.name, p.name) IN
+            // (VALUES (?,?), ...)`. The join is the only place the pairing is
+            // authoritative, so a project name is never matched against the
+            // wrong workspace.
+            let rows = unique.iter().map(|_| "(?,?)").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT w.name, p.name, w.id, p.id \
+                 FROM projects p JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE (w.name, p.name) IN (VALUES {rows})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let bound: Vec<&dyn rusqlite::ToSql> = unique
+                .iter()
+                .flat_map(|(workspace, project)| {
+                    [
+                        workspace as &dyn rusqlite::ToSql,
+                        project as &dyn rusqlite::ToSql,
+                    ]
+                })
+                .collect();
+            let mut resolved = HashMap::new();
+            let mut found = stmt.query(rusqlite::params_from_iter(bound))?;
+            while let Some(row) = found.next()? {
+                let workspace_name: String = row.get(0)?;
+                let project_name: String = row.get(1)?;
+                let workspace_bytes: Vec<u8> = row.get(2)?;
+                let project_bytes: Vec<u8> = row.get(3)?;
+                resolved.insert(
+                    (workspace_name, project_name),
+                    (
+                        WorkspaceId::from_slice(&workspace_bytes)?,
+                        ProjectId::from_slice(&project_bytes)?,
+                    ),
+                );
+            }
+            Ok(resolved)
+        })
+        .await
+    }
+
     /// Look up a project id by `(workspace_id, name)` without creating it.
     ///
     /// Returns `None` when no project with the given name exists in the workspace.
@@ -5771,6 +5836,8 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let acknowledged_by: Option<String> = row.get(17)?;
     let acknowledged_at_us: Option<i64> = row.get(18)?;
     let acknowledged_by_session_bytes: Option<Vec<u8>> = row.get(19)?;
+    let brief: String = row.get(20)?;
+    let context_refs_json: String = row.get(21)?;
     Ok(materialise_handoff(
         id_bytes,
         work_item_bytes,
@@ -5783,6 +5850,8 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
         to_agent,
         cwd,
         summary,
+        brief,
+        context_refs_json,
         open_q_json,
         next_s_json,
         files_json,
@@ -5808,6 +5877,8 @@ fn materialise_handoff(
     to_agent: Option<String>,
     cwd: Option<String>,
     summary: String,
+    brief: String,
+    context_refs_json: String,
     open_q_json: String,
     next_s_json: String,
     files_json: String,
@@ -5841,6 +5912,8 @@ fn materialise_handoff(
         to_agent: to_agent.as_deref().map(parse_agent),
         cwd,
         summary,
+        brief,
+        context_refs: serde_json::from_str(&context_refs_json)?,
         open_questions,
         next_steps,
         files_touched,
@@ -6424,6 +6497,8 @@ mod tests {
             to_agent: None,
             cwd: cwd.map(str::to_string),
             summary: summary.to_string(),
+            brief: summary.to_string(),
+            context_refs: vec![],
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
@@ -6634,6 +6709,8 @@ mod tests {
                 objective: "wrong workspace".into(),
                 acceptance_criteria: vec![],
                 summary: "wrong workspace".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
@@ -6657,6 +6734,8 @@ mod tests {
                 objective: "right project".into(),
                 acceptance_criteria: vec![],
                 summary: "right project".into(),
+                brief: String::new(),
+                context_refs: vec![],
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],

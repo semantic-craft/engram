@@ -41,6 +41,11 @@ below start from the fork.
   but cannot complete, abandon, claim, or supersede it. Engram records observed
   status and performs no Git or external mutation.
 
+### Fixed
+
+- Updated the `h2` crate to 0.4.19 to address RUSTSEC-2026-0258 (unbounded
+  empty DATA frames). This unblocks `cargo-deny` and `cargo-audit` on main.
+
 ### Changed
 
 - Handoff reads no longer consume or acknowledge work. The removed
@@ -60,6 +65,19 @@ below start from the fork.
   requiring an LLM provider. The desktop semantic-search client now supplies
   explicit budgets and maps navigable page entries from the package instead of
   parsing the removed flat hit arrays.
+
+- `memory_handoff_begin` accepts a bounded brief and revisioned ContextRefs
+  without copying canonical bodies into operational Handoff rows.
+  `memory_handoff_claim` requires the same `context_budget` unit as
+  `memory_query` and returns the continuation envelope plus that shared
+  ContextPackage and assembly trace. Explicit refs carry a selection priority
+  that puts them ahead of every retrieval candidate for quota and budget,
+  whatever the retrieval rank; missing or unauthorized refs stay bounded
+  diagnostics, and assembly never marks a Handoff accepted. The claim's
+  assembly options are part of its Attempt identity, so only a byte-identical
+  request replays. Compare-and-set failure does not
+  return a package; assembly failure after a recorded claim leaves the live
+  lease recoverable.
 
 - Replaced the geometric `e` / node-mark branding with the original Paper
   Muse spark across the README, embedded web UI and favicon, and Tauri desktop

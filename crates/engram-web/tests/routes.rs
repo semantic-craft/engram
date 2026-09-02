@@ -61,6 +61,8 @@ fn new_handoff(
         objective: summary.into(),
         acceptance_criteria: vec![],
         summary: summary.into(),
+        brief: String::new(),
+        context_refs: vec![],
         open_questions: vec![],
         next_steps: vec![],
         files_touched: vec![],

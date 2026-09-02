@@ -47,8 +47,8 @@ pub use artifact::{
 pub use context::{
     AssemblyOmission, AssemblyOmissionReason, AssemblyTrace, CONTEXT_BUDGET_UNIT, ContextAssembler,
     ContextAssemblyRequest, ContextAssemblyResult, ContextCandidate, ContextDetailTier,
-    ContextEntry, ContextKind, ContextPackage, ContextProvenance, ContextQuota, ContextRef,
-    ContextRefError, ContextRepresentations, ContextTruncation,
+    ContextEntry, ContextKind, ContextPackage, ContextPriority, ContextProvenance, ContextQuota,
+    ContextRef, ContextRefError, ContextRepresentations, ContextTruncation,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{

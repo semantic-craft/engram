@@ -815,9 +815,11 @@ fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
         "\n---\n\
          _**To the receiving agent:** rendering this envelope did not claim or \
          acknowledge it. Call `memory_handoff_claim` with the exact Handoff id, \
-         revision, Run/Session id, and a fresh Attempt id before continuing. \
-         Persist `memory_checkpoint_write` to acknowledge it; release the claim \
-         if you cannot proceed._\n",
+         revision, Run/Session id, a fresh Attempt id, and a `context_budget` \
+         in selected-content UTF-8 bytes before continuing. The claim returns \
+         the continuation ContextPackage assembled within that budget. Persist \
+         `memory_checkpoint_write` to acknowledge it; release the claim if you \
+         cannot proceed._\n",
     );
     buf
 }
@@ -1531,6 +1533,8 @@ fn build_auto_handoff(
         objective: summary.clone(),
         acceptance_criteria: Vec::new(),
         summary,
+        brief: String::new(),
+        context_refs: Vec::new(),
         open_questions,
         next_steps,
         files_touched: Vec::new(),
@@ -4136,6 +4140,8 @@ mod tests {
                 objective: "handoff summary".into(),
                 acceptance_criteria: Vec::new(),
                 summary: "handoff summary".to_string(),
+                brief: String::new(),
+                context_refs: Vec::new(),
                 open_questions: Vec::new(),
                 next_steps: vec!["continue".to_string()],
                 files_touched: Vec::new(),
@@ -4267,6 +4273,8 @@ mod tests {
                 objective: "resume the auth refactor".into(),
                 acceptance_criteria: Vec::new(),
                 summary: "resume the auth refactor".to_string(),
+                brief: String::new(),
+                context_refs: Vec::new(),
                 open_questions: Vec::new(),
                 next_steps: Vec::new(),
                 files_touched: Vec::new(),
@@ -4284,6 +4292,13 @@ mod tests {
         assert!(
             handoff_pos < brief_pos,
             "pending handoff must precede the brief"
+        );
+        // `context_budget` is a required claim argument: an injected call
+        // shape without it is rejected during argument deserialization,
+        // before the claim runs.
+        assert!(
+            rendered.contains("`context_budget`"),
+            "the injected claim instruction must name every required argument: {rendered}"
         );
     }
 
@@ -4381,6 +4396,8 @@ mod tests {
                 objective: "handoff summary".into(),
                 acceptance_criteria: Vec::new(),
                 summary: "handoff summary".to_string(),
+                brief: String::new(),
+                context_refs: Vec::new(),
                 open_questions: Vec::new(),
                 next_steps: vec!["resume plain repo".to_string()],
                 files_touched: Vec::new(),
@@ -4461,6 +4478,8 @@ mod tests {
                     objective: summary.into(),
                     acceptance_criteria: vec![],
                     summary: summary.into(),
+                    brief: String::new(),
+                    context_refs: Vec::new(),
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],

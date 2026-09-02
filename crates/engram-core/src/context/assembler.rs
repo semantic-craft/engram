@@ -32,6 +32,36 @@ pub enum ContextDetailTier {
     FullEvidence,
 }
 
+/// Selection precedence, independent of retrieval score.
+///
+/// Retrieval scores are lower-is-better and unbounded (SQLite bm25 ranks fall
+/// well below -1 for selective terms), so a synthetic score cannot express
+/// "consider this first". Publisher-selected sources carry
+/// [`ContextPriority::Explicit`] and enter quotas and budget before any
+/// retrieved candidate, whatever its rank.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPriority {
+    /// Caller-selected source. Ordered ahead of every retrieved candidate.
+    Explicit,
+    /// Ordinary retrieval candidate, ordered by score.
+    #[default]
+    Retrieved,
+}
+
 /// One retrieval source that contributed to a candidate.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContextProvenance {
@@ -59,6 +89,8 @@ pub struct ContextCandidate {
     pub context_ref: ContextRef,
     /// Human-readable source title.
     pub title: String,
+    /// Selection precedence. Compared before `score`.
+    pub priority: ContextPriority,
     /// Lower is better, matching current search ranks.
     pub score: f64,
     /// Content-equivalence key.
@@ -163,6 +195,12 @@ pub enum AssemblyOmissionReason {
     BudgetExhausted,
     /// Candidate larger than total budget.
     Oversized,
+    /// Explicit ContextRef is missing, deleted, or revision-stale in its
+    /// encoded existing scope.
+    UnresolvedContextRef,
+    /// Explicit ContextRef's encoded scope does not own the source. Another
+    /// scope was not substituted.
+    UnauthorizedContextRef,
 }
 
 /// Content-free omission marker.
@@ -453,8 +491,9 @@ fn selected_tier_counts(entries: &[ContextEntry]) -> BTreeMap<ContextDetailTier,
 }
 
 fn candidate_order(a: &ContextCandidate, b: &ContextCandidate) -> std::cmp::Ordering {
-    a.score
-        .total_cmp(&b.score)
+    a.priority
+        .cmp(&b.priority)
+        .then_with(|| a.score.total_cmp(&b.score))
         .then_with(|| a.context_ref.kind().cmp(&b.context_ref.kind()))
         .then_with(|| a.context_ref.cmp(&b.context_ref))
 }
@@ -557,6 +596,7 @@ mod tests {
         ContextCandidate {
             context_ref: context_ref.clone(),
             title: identity.into(),
+            priority: ContextPriority::Retrieved,
             score,
             deduplication_key: format!("body:{identity}"),
             provenance: vec![ContextProvenance {
@@ -749,5 +789,41 @@ mod tests {
             empty.trace.omissions[0].reason,
             AssemblyOmissionReason::EmptyRepresentation
         );
+    }
+
+    #[test]
+    fn explicit_priority_outranks_better_retrieval_scores_for_quota_and_budget() {
+        let mut explicit = candidate(ContextKind::WikiPage, "explicit", 0.0, "E", "EE", "EEE");
+        explicit.priority = ContextPriority::Explicit;
+        // Selective bm25 ranks are routinely far below -1, so no synthetic
+        // score could put the explicit reference first.
+        let retrieved = (0..6)
+            .map(|index| {
+                candidate(
+                    ContextKind::WikiPage,
+                    &format!("retrieved-{index}"),
+                    -12.0 + f64::from(index),
+                    "R",
+                    "RR",
+                    "RRR",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = retrieved;
+        candidates.push(explicit.clone());
+
+        let mut req = request(64);
+        req.quotas = vec![ContextQuota {
+            kind: ContextKind::WikiPage,
+            maximum: 6,
+        }];
+        let assembled = ContextAssembler.assemble(candidates, req);
+
+        assert_eq!(
+            assembled.package.entries[0].context_ref, explicit.context_ref,
+            "explicit references enter quota and budget before retrieval hits"
+        );
+        assert_eq!(assembled.package.entries.len(), 6);
+        assert_eq!(assembled.trace.quota_omitted_count, 1);
     }
 }

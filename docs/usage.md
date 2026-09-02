@@ -74,7 +74,7 @@ at the managed engram Agent Skills that carry detailed tool routing.
 | "Show the exact evidence for this result" | `memory_context_read` | Resolves the selected ContextRef's exact source revision through an existing, fail-closed scope. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_discover` if no block exists | Reads the latest claimable Handoff without mutation. |
-| "Continue that work" | `memory_handoff_claim`, then `memory_checkpoint_write` | Claims an exact revision and acknowledges receipt with the first durable checkpoint. |
+| "Continue that work" | `memory_handoff_claim` with `context_budget`, then `memory_checkpoint_write` | Claims an exact revision, returns the shared ContextPackage, and acknowledges receipt with the first durable checkpoint. |
 | "I cannot continue this claim" | `memory_handoff_release` | Reopens the exact live Claim for another receiver. |
 | "Save context for the next session" | `memory_handoff_begin` | Creates or continues a WorkItem and publishes a terse open Handoff. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Lets the source owner expire an exact open Handoff revision. |

@@ -24,7 +24,7 @@ mod scope;
 pub mod users;
 mod writer;
 
-pub use fts_query::prepare_fts5_query;
+pub use fts_query::{natural_language_terms, prepare_fts5_query};
 
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
@@ -57,8 +57,8 @@ pub use reader::{
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_global_scope,
-    resolve_many_existing_scopes,
+    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_scopes,
+    lookup_global_scope, resolve_many_existing_scopes,
 };
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;
