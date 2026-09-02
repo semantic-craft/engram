@@ -554,7 +554,8 @@ async fn fetch_handoff_context(
                     .work_item_by_id(h.work_item_id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("handoff {} has no WorkItem", h.id))?;
-                Some(render_handoff_markdown(&h, &work_item))
+                let checkpoint = state.reader.latest_checkpoint(h.work_item_id).await?;
+                Some(render_handoff_markdown(&h, &work_item, checkpoint.as_ref()))
             }
             None => None,
         }
@@ -755,7 +756,11 @@ fn render_session_brief(
     Some(buf)
 }
 
-fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
+fn render_handoff_markdown(
+    h: &Handoff,
+    work_item: &WorkItem,
+    checkpoint: Option<&engram_core::Checkpoint>,
+) -> String {
     // Layout goal: TUI-renderable + agent-friendly. The previous
     // shape put a paragraph-long `## Summary` first, which made the
     // hook output look like a wall of text in Codex's "completed"
@@ -776,13 +781,63 @@ fn render_handoff_markdown(h: &Handoff, work_item: &WorkItem) -> String {
         ts = h.created_at,
     ));
 
+    if let Some(predecessor) = h.predecessor_handoff_id {
+        buf.push_str(&format!(
+            "> continues Handoff `{predecessor}`{checkpoint}\n",
+            checkpoint = h
+                .source_checkpoint_revision
+                .map(|revision| format!(" · built from Checkpoint revision `{revision}`"))
+                .unwrap_or_default(),
+        ));
+    }
+
     buf.push_str("\n**Objective**\n");
     buf.push_str(work_item.objective.trim());
     buf.push('\n');
+    if work_item.state != engram_core::WorkItemState::Active {
+        buf.push_str(&format!(
+            "\n**WorkItem state** `{}`\n",
+            work_item.state.as_str()
+        ));
+    }
     if !work_item.acceptance_criteria.is_empty() {
+        // Render what is still outstanding, not the original wish list: the
+        // latest Checkpoint owns per-criterion status, so a mid-chain receiver
+        // sees the remaining work rather than an all-unchecked list.
         buf.push_str("\n**Acceptance criteria**\n");
         for criterion in &work_item.acceptance_criteria {
-            buf.push_str(&format!("- [ ] {criterion}\n"));
+            let satisfied = checkpoint.is_some_and(|c| {
+                c.acceptance_criteria
+                    .iter()
+                    .any(|status| status.criterion == *criterion && status.satisfied)
+            });
+            let box_mark = if satisfied { "x" } else { " " };
+            buf.push_str(&format!("- [{box_mark}] {criterion}\n"));
+        }
+    }
+    if !h.artifacts.is_empty() {
+        buf.push_str("\n**Evidence**\n");
+        for artifact in &h.artifacts {
+            let revision = artifact
+                .observed_revision
+                .as_deref()
+                .map(|rev| format!(" @ `{rev}`"))
+                .unwrap_or_default();
+            buf.push_str(&format!(
+                "- {kind} `{locator}`{revision}\n",
+                kind = artifact.kind.as_str(),
+                locator = artifact.locator,
+            ));
+        }
+    }
+    if !work_item.relationships.is_empty() {
+        buf.push_str("\n**Related work**\n");
+        for relationship in &work_item.relationships {
+            buf.push_str(&format!(
+                "- {kind} `{target}`\n",
+                kind = relationship.kind.as_str(),
+                target = relationship.to_work_item_id,
+            ));
         }
     }
 
@@ -1550,6 +1605,8 @@ fn build_auto_handoff(
     };
     NewHandoff {
         work_item_id: None,
+        expected_work_item_revision: None,
+        expected_checkpoint_revision: None,
         workspace_id,
         project_id,
         from_session_id: Some(session_id),
@@ -4157,6 +4214,8 @@ mod tests {
             .writer
             .publish_handoff(NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
@@ -4219,6 +4278,166 @@ mod tests {
             links: Vec::new(),
             author_id: None,
         }
+    }
+
+    /// Issue #43: the SessionStart envelope is the continuation envelope. A
+    /// mid-chain receiver must see what is still outstanding, the evidence the
+    /// predecessor left, and which transfer this one continues — not the
+    /// original all-unchecked wish list.
+    #[tokio::test]
+    async fn handoff_envelope_carries_remaining_criteria_and_chain_position() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/chained-repo";
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &engram_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        let run = SessionId::new();
+        let published = state
+            .writer
+            .publish_handoff(NewHandoff {
+                brief: String::new(),
+                context_refs: Vec::new(),
+                work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: run,
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "user:source".into(),
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: "land the successor chain".into(),
+                acceptance_criteria: vec!["chain reads".into(), "history survives".into()],
+                summary: "first transfer".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                artifacts: Vec::new(),
+                relationships: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        state
+            .writer
+            .write_checkpoint(engram_core::CheckpointWrite {
+                work_item_id: published.work_item_id,
+                workspace_id: ws,
+                project_id: proj,
+                run_id: run,
+                expected_work_item_revision: published.work_item_revision,
+                handoff_id: None,
+                claim_id: None,
+                expected_handoff_revision: None,
+                summary: "half done".into(),
+                work_item_state: engram_core::WorkItemState::Blocked,
+                acceptance_criteria: vec![
+                    engram_core::AcceptanceCriterionStatus {
+                        criterion: "chain reads".into(),
+                        satisfied: true,
+                    },
+                    engram_core::AcceptanceCriterionStatus {
+                        criterion: "history survives".into(),
+                        satisfied: false,
+                    },
+                ],
+                actor_key: "user:source".into(),
+                attempt_id: engram_core::AttemptId::new(),
+                artifacts: Vec::new(),
+                relationships: Vec::new(),
+                parent_result: None,
+            })
+            .await
+            .unwrap();
+
+        let successor = state
+            .writer
+            .publish_handoff(NewHandoff {
+                brief: String::new(),
+                context_refs: Vec::new(),
+                work_item_id: Some(published.work_item_id),
+                expected_work_item_revision: Some(published.work_item_revision + 1),
+                expected_checkpoint_revision: Some(published.work_item_revision + 1),
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: run,
+                from_agent: AgentKind::ClaudeCode,
+                source_actor: "user:source".into(),
+                to_agent: None,
+                cwd: Some(std::path::PathBuf::from(cwd)),
+                objective: String::new(),
+                acceptance_criteria: Vec::new(),
+                summary: "second transfer".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                artifacts: vec![engram_core::ArtifactInput {
+                    kind: engram_core::ArtifactKind::File,
+                    locator: "src/chain.rs".into(),
+                    observed_revision: None,
+                    content_hash: None,
+                    repository_identity: None,
+                    git_ref: None,
+                    commit_id: None,
+                    tree_hash: None,
+                    dirty: None,
+                    local_path_hint: None,
+                    provenance: "edited while blocked".into(),
+                    delivery: engram_core::DeliveryFacts::default(),
+                    verification: Vec::new(),
+                }],
+                relationships: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.predecessor_handoff_id,
+            Some(published.handoff_id),
+            "successor must name the transfer it continues"
+        );
+
+        let rendered = fetch_handoff_context(
+            &state,
+            HandoffQuery {
+                cwd: Some(cwd.into()),
+                workspace: None,
+                project: None,
+                project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
+            },
+            &ActorKey::default(),
+        )
+        .await
+        .unwrap()
+        .expect("the successor is the pending handoff");
+        assert!(
+            rendered.contains(&format!("continues Handoff `{}`", published.handoff_id)),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- [x] chain reads"), "{rendered}");
+        assert!(rendered.contains("- [ ] history survives"), "{rendered}");
+        assert!(
+            rendered.contains("**WorkItem state** `blocked`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("file `src/chain.rs`"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Handoff `{}`", successor.handoff_id)),
+            "the superseded transfer is history; the successor is injected: {rendered}"
+        );
     }
 
     /// `briefing=true` on the `/handoff` query returns the compiled project
@@ -4290,6 +4509,8 @@ mod tests {
             .writer
             .publish_handoff(NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
@@ -4351,6 +4572,8 @@ mod tests {
         let target = state
             .writer
             .publish_handoff(NewHandoff {
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
@@ -4377,6 +4600,8 @@ mod tests {
         let published = state
             .writer
             .publish_handoff(NewHandoff {
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 work_item_id: None,
                 workspace_id: ws,
                 project_id: proj,
@@ -4540,6 +4765,8 @@ mod tests {
             .writer
             .publish_handoff(NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
@@ -4622,6 +4849,8 @@ mod tests {
                 .writer
                 .publish_handoff(NewHandoff {
                     work_item_id: None,
+                    expected_work_item_revision: None,
+                    expected_checkpoint_revision: None,
                     workspace_id: state.workspace_id,
                     project_id,
                     from_session_id: None,

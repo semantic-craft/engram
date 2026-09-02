@@ -127,6 +127,14 @@ priors are at the [bottom](#influences-and-prior-art).
   `memory_handoff_discover`, then claim the exact revision with a
   `context_budget` before resuming. The claim returns the same ContextPackage
   contract as `memory_query`; use `memory_context_read` for exact full evidence.
+- **"Pass the same task through a third agent."** A receiving agent
+  publishes a *successor* handoff from the Checkpoint it just wrote, asserting
+  the WorkItem and Checkpoint revisions it saw. The transfer it replaces
+  becomes `superseded` history rather than being overwritten, and
+  `memory_handoff_discover` returns the ordered transfer `chain` with source
+  and receiving Run/Session provenance. A `completed` or `abandoned` WorkItem
+  refuses further handoffs — follow-up work creates a new WorkItem with an
+  explicit `depends_on` / `derived_from` / `child_of` relationship.
 - **"What did we decide about X six weeks ago?"** Type
   `memory_query` with the question and a context budget from the agent (or
   `engram search X` from a terminal). Existing FTS/vector/link retrieval feeds

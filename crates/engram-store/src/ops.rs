@@ -1019,11 +1019,20 @@ pub fn hard_delete_decayed_pages(
     Ok(n)
 }
 
-/// Create or continue a WorkItem and publish one open Handoff transactionally.
+/// Create a WorkItem with its first Handoff, or publish a successor Handoff
+/// for an existing one, transactionally.
+///
+/// A successor asserts the exact state it continues from: the caller's
+/// `expected_work_item_revision` and the `work_item_revision` of the WorkItem's
+/// latest Checkpoint. Either being stale aborts before any mutation. On success
+/// the successor records its predecessor and source Checkpoint, and atomically
+/// supersedes the still-unclaimed transfers it replaces; claimed, acknowledged,
+/// expired, cancelled, and already-superseded transfers are immutable history
+/// and are never touched.
 pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<PublishedHandoff> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let (work_item_id, work_item_revision) = if let Some(id) = h.work_item_id {
+    let (work_item_id, work_item_revision, source_checkpoint) = if let Some(id) = h.work_item_id {
         let current: Option<WorkItemOwnershipRow> = tx
             .query_row(
                 "SELECT workspace_id, project_id, state, revision, owner_actor, owner_run_id \
@@ -1074,6 +1083,41 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
                 "only the current WorkItem owner Run may publish a continuation".into(),
             ));
         }
+        let current_revision = u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative work item revision".into()))?;
+        let Some(expected_work_item_revision) = h.expected_work_item_revision else {
+            return Err(StoreError::InvalidState(format!(
+                "publishing a successor requires expected_work_item_revision \
+                 (current {current_revision})"
+            )));
+        };
+        if expected_work_item_revision != current_revision {
+            return Err(StoreError::InvalidState(format!(
+                "stale work item revision: expected {expected_work_item_revision}, \
+                 current {current_revision}"
+            )));
+        }
+        let source_checkpoint = latest_checkpoint(&tx, id)?;
+        match (source_checkpoint, h.expected_checkpoint_revision) {
+            (Some((_, current)), None) => {
+                return Err(StoreError::InvalidState(format!(
+                    "publishing a successor requires expected_checkpoint_revision \
+                     (latest checkpoint revision {current})"
+                )));
+            }
+            (None, Some(expected)) => {
+                return Err(StoreError::InvalidState(format!(
+                    "stale checkpoint revision: expected {expected}, \
+                     but this work item has no checkpoint"
+                )));
+            }
+            (Some((_, current)), Some(expected)) if current != expected => {
+                return Err(StoreError::InvalidState(format!(
+                    "stale checkpoint revision: expected {expected}, current {current}"
+                )));
+            }
+            _ => {}
+        }
         let next = revision
             .checked_add(1)
             .ok_or_else(|| StoreError::InvalidState("work item revision overflow".into()))?;
@@ -1090,8 +1134,15 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
             id,
             u64::try_from(next)
                 .map_err(|_| StoreError::MalformedRecord("negative work item revision".into()))?,
+            source_checkpoint,
         )
     } else {
+        if h.expected_work_item_revision.is_some() || h.expected_checkpoint_revision.is_some() {
+            return Err(StoreError::InvalidState(
+                "expected revisions apply to a successor; omit them when creating a WorkItem"
+                    .into(),
+            ));
+        }
         if h.objective.trim().is_empty() {
             return Err(StoreError::InvalidState(
                 "new WorkItem objective must not be empty".into(),
@@ -1114,7 +1165,7 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
                 now,
             ],
         )?;
-        (id, 1)
+        (id, 1, None)
     };
 
     let id = HandoffId::new();
@@ -1129,6 +1180,42 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         h.brief.clone()
     };
     let context_refs = serde_json::to_string(&h.context_refs)?;
+    // The predecessor is the WorkItem's most recent existing transfer in any
+    // state, so an acknowledged hop still links its successor. Superseding is
+    // narrower: only transfers still sitting at `open` are replaced, which
+    // leaves claimed and terminal history immutable. Both use the same
+    // (created_at, rowid) order so a chain read reproduces publication order
+    // even when two rows share a microsecond.
+    let predecessor_handoff_id: Option<HandoffId> = tx
+        .query_row(
+            "SELECT id FROM handoffs WHERE work_item_id = ?1 \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![work_item_id.as_bytes()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .as_deref()
+        .map(HandoffId::from_slice)
+        .transpose()?;
+    let superseded: Vec<(HandoffId, u64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, revision FROM handoffs WHERE work_item_id = ?1 AND state = 'open' \
+             ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map(params![work_item_id.as_bytes()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (superseded_id, revision) = row?;
+            let next = u64::try_from(revision)
+                .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+            out.push((HandoffId::from_slice(&superseded_id)?, next));
+        }
+        out
+    };
     let open_q = serde_json::to_string(&h.open_questions)?;
     let next_s = serde_json::to_string(&h.next_steps)?;
     let files = serde_json::to_string(&h.files_touched)?;
@@ -1153,8 +1240,10 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         "INSERT INTO handoffs \
          (id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, from_agent, \
           source_actor, to_agent, cwd, summary, open_questions, next_steps, files_touched, state, \
-          revision, created_at, brief, context_refs) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'open', 1, ?15, ?16, ?17)",
+          revision, created_at, brief, context_refs, predecessor_handoff_id, \
+          source_checkpoint_id, source_checkpoint_revision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'open', 1, ?15, \
+                 ?16, ?17, ?18, ?19, ?20)",
         params![
             id.as_bytes(),
             work_item_id.as_bytes(),
@@ -1173,8 +1262,43 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
             now,
             brief,
             context_refs,
+            predecessor_handoff_id.map(|p| p.as_bytes().to_vec()),
+            source_checkpoint.map(|(checkpoint, _)| checkpoint.as_bytes().to_vec()),
+            source_checkpoint.map(|(_, revision)| revision),
         ],
     )?;
+    // Supersede in one statement so a successor and the offers it replaces
+    // always commit together; the ids were collected above under the same
+    // transaction, so the count must match exactly.
+    if !superseded.is_empty() {
+        let changed = tx.execute(
+            "UPDATE handoffs SET state = 'superseded', revision = revision + 1, \
+             superseded_by_handoff_id = ?1, superseded_at = ?2 \
+             WHERE work_item_id = ?3 AND state = 'open' AND id != ?1",
+            params![id.as_bytes(), now, work_item_id.as_bytes()],
+        )?;
+        if changed != superseded.len() {
+            return Err(StoreError::InvalidState(
+                "handoff supersede compare-and-set conflict".into(),
+            ));
+        }
+        for (superseded_id, revision) in &superseded {
+            audit_continuity(
+                &tx,
+                "handoff_supersede",
+                h.workspace_id,
+                h.project_id,
+                work_item_id,
+                h.source_run_id,
+                Some(*superseded_id),
+                Some(*revision),
+                None,
+                &h.source_actor,
+                "superseded",
+                now,
+            )?;
+        }
+    }
     let artifacts = persist_artifacts(
         &tx,
         "handoff",
@@ -1220,9 +1344,40 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         handoff_id: id,
         work_item_revision,
         handoff_revision: 1,
+        predecessor_handoff_id,
+        source_checkpoint_id: source_checkpoint.map(|(checkpoint, _)| checkpoint),
+        source_checkpoint_revision: source_checkpoint.map(|(_, revision)| revision),
+        superseded_handoff_ids: superseded
+            .into_iter()
+            .map(|(superseded_id, _)| superseded_id)
+            .collect(),
         artifacts,
         relationships,
     })
+}
+
+/// Latest Checkpoint of a WorkItem as `(id, work_item_revision)`.
+fn latest_checkpoint(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StoreResult<Option<(CheckpointId, u64)>> {
+    let row: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT id, work_item_revision FROM checkpoints WHERE work_item_id = ?1 \
+             ORDER BY sequence DESC LIMIT 1",
+            params![work_item_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(id, revision)| {
+        Ok((
+            CheckpointId::from_slice(&id)?,
+            u64::try_from(revision).map_err(|_| {
+                StoreError::MalformedRecord("negative checkpoint work item revision".into())
+            })?,
+        ))
+    })
+    .transpose()
 }
 
 /// Atomically claim an exact eligible Handoff revision.
@@ -1600,6 +1755,9 @@ pub fn release_handoff(
 }
 
 /// Source-only cancellation of an exact open Handoff.
+///
+/// Cancellation is its own terminal state so it stays distinguishable from a
+/// lapsed offer, a released Claim, and a superseded predecessor.
 pub fn cancel_handoff(
     conn: &mut Connection,
     input: &HandoffCancel,
@@ -1629,7 +1787,7 @@ pub fn cancel_handoff(
         .revision
         .checked_add(1)
         .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
-    let changed = tx.execute("UPDATE handoffs SET state = 'expired', revision = ?1 WHERE id = ?2 AND revision = ?3 AND state = 'open'",
+    let changed = tx.execute("UPDATE handoffs SET state = 'cancelled', revision = ?1 WHERE id = ?2 AND revision = ?3 AND state = 'open'",
         params![next_revision, input.handoff_id.as_bytes(), input.expected_revision])?;
     if changed != 1 {
         return Err(StoreError::InvalidState(
@@ -1647,7 +1805,7 @@ pub fn cancel_handoff(
         Some(next_revision),
         None,
         &input.actor_key,
-        "expired",
+        "cancelled",
         now,
     )?;
     tx.commit()?;
@@ -1655,7 +1813,7 @@ pub fn cancel_handoff(
         work_item_id: handoff.work_item_id,
         handoff_id: handoff.id,
         revision: next_revision,
-        state: HandoffState::Expired,
+        state: HandoffState::Cancelled,
     })
 }
 
@@ -2256,59 +2414,80 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
             "SELECT id, work_item_id, workspace_id, project_id, from_session_id, source_run_id, \
                 from_agent, source_actor, to_agent, cwd, summary, open_questions, next_steps, \
                 files_touched, state, revision, created_at, acknowledged_by, acknowledged_at, \
-                acknowledged_by_session, brief, context_refs FROM handoffs WHERE id = ?1",
+                acknowledged_by_session, brief, context_refs, predecessor_handoff_id, \
+                source_checkpoint_id, source_checkpoint_revision, superseded_by_handoff_id, \
+                superseded_at \
+             FROM handoffs WHERE id = ?1",
             params![handoff_id.as_bytes()],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, i64>(16)?,
-                    row.get::<_, Option<String>>(17)?,
-                    row.get::<_, Option<i64>>(18)?,
-                    row.get::<_, Option<Vec<u8>>>(19)?,
-                    row.get::<_, String>(20)?,
-                    row.get::<_, String>(21)?,
+                    (
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, i64>(15)?,
+                    ),
+                    (
+                        row.get::<_, i64>(16)?,
+                        row.get::<_, Option<String>>(17)?,
+                        row.get::<_, Option<i64>>(18)?,
+                        row.get::<_, Option<Vec<u8>>>(19)?,
+                        row.get::<_, String>(20)?,
+                        row.get::<_, String>(21)?,
+                        row.get::<_, Option<Vec<u8>>>(22)?,
+                        row.get::<_, Option<Vec<u8>>>(23)?,
+                        row.get::<_, Option<i64>>(24)?,
+                        row.get::<_, Option<Vec<u8>>>(25)?,
+                        row.get::<_, Option<i64>>(26)?,
+                    ),
                 ))
             },
         )
         .optional()?;
     let Some((
-        id,
-        work_item,
-        ws,
-        project,
-        from_session,
-        source_run,
-        from_agent,
-        source_actor,
-        to_agent,
-        cwd,
-        summary,
-        open_questions,
-        next_steps,
-        files_touched,
-        state,
-        revision,
-        created_at,
-        acknowledged_by,
-        acknowledged_at,
-        acknowledged_by_session,
-        brief,
-        context_refs,
+        (
+            id,
+            work_item,
+            ws,
+            project,
+            from_session,
+            source_run,
+            from_agent,
+            source_actor,
+            to_agent,
+            cwd,
+            summary,
+            open_questions,
+            next_steps,
+            files_touched,
+            state,
+            revision,
+        ),
+        (
+            created_at,
+            acknowledged_by,
+            acknowledged_at,
+            acknowledged_by_session,
+            brief,
+            context_refs,
+            predecessor,
+            source_checkpoint,
+            source_checkpoint_revision,
+            superseded_by,
+            superseded_at,
+        ),
     )) = row
     else {
         return Ok(None);
@@ -2347,6 +2526,26 @@ fn load_handoff(conn: &Connection, handoff_id: HandoffId) -> StoreResult<Option<
             .as_deref()
             .map(SessionId::from_slice)
             .transpose()?,
+        predecessor_handoff_id: predecessor
+            .as_deref()
+            .map(HandoffId::from_slice)
+            .transpose()?,
+        source_checkpoint_id: source_checkpoint
+            .as_deref()
+            .map(CheckpointId::from_slice)
+            .transpose()?,
+        source_checkpoint_revision: source_checkpoint_revision
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::MalformedRecord("negative checkpoint revision".into()))?,
+        superseded_by_handoff_id: superseded_by
+            .as_deref()
+            .map(HandoffId::from_slice)
+            .transpose()?,
+        superseded_at: superseded_at
+            .map(Timestamp::from_microsecond)
+            .transpose()
+            .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
         artifacts: Vec::new(),
     };
     handoff.artifacts = load_owner_artifacts(conn, "handoff", handoff.id.as_bytes())?;
@@ -3669,6 +3868,8 @@ mod tests {
             &mut conn,
             &NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: ws,
                 project_id: proj,
                 from_session_id: None,
@@ -3790,6 +3991,8 @@ mod tests {
             &mut conn,
             &NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: src_ws,
                 project_id: proj,
                 from_session_id: Some(sid),
@@ -4533,6 +4736,8 @@ mod tests {
             &mut conn,
             &NewHandoff {
                 work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
                 workspace_id: ws,
                 project_id: scratch,
                 from_session_id: None,
@@ -4682,6 +4887,8 @@ mod tests {
         // a corrected pair lands cleanly.
         let mismatched_handoff = NewHandoff {
             work_item_id: None,
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
             workspace_id: other_ws,
             project_id: proj,
             from_session_id: None,
@@ -4706,6 +4913,10 @@ mod tests {
             "handoff insert with mismatched workspace must abort"
         );
         let good_handoff = NewHandoff {
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            brief: String::new(),
+            context_refs: Vec::new(),
             workspace_id: ws,
             ..mismatched_handoff
         };

@@ -336,8 +336,10 @@ mod tests {
     }
 
     /// Issue #44 stores bounded briefs and revisioned ContextRefs on Handoffs.
-    /// V103 (ArtifactRefs, #42) is already on main; this layer is V104, and the
-    /// #42 follow-up stacks V105 strictly above it.
+    /// V103 (ArtifactRefs, #42) is already on main; this layer is V104, the #42
+    /// follow-up stacks V105 above it, and #43's successor chain is V106. That
+    /// last one rebuilds `handoffs` wholesale, so this test doubles as the
+    /// regression that the rebuild carries `brief` / `context_refs` forward.
     #[test]
     fn v104_adds_handoff_context_columns_after_v103() {
         let versions: Vec<u32> = migrations::runner()
@@ -351,8 +353,9 @@ mod tests {
         );
         assert!(versions.contains(&104), "issue #44 must embed V104");
         assert!(
-            !versions.contains(&106),
-            "do not invent V106 ahead of the unreleased V105"
+            versions.contains(&105),
+            "the #42 follow-up's V105 must stay embedded, so V106 is the next \
+             number rather than a pre-allocation over a gap"
         );
 
         let tmp = tempfile::TempDir::new().unwrap();

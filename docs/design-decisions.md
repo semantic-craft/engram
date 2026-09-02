@@ -164,7 +164,7 @@ Relationship   explicit depends_on / derived_from / child_of between WorkItems
 ```
 
 `memory_handoff_begin` creates a WorkItem plus open Handoff, or publishes a
-continuation for an exact existing WorkItem owned by the same authenticated
+successor for an exact existing WorkItem owned by the same authenticated
 actor and source Run. SessionStart and `memory_handoff_discover` are read-only.
 The receiver uses compare-and-set `memory_handoff_claim` with a caller
 `context_budget`; the claim returns the same ContextPackage and assembly
@@ -198,6 +198,26 @@ supersede its parent. Cross-project links require a complete existing
 workspace/project pair and fail closed. Engram records these observations; it
 does not check out, commit, push, merge, release, deploy, submit, or approve
 Git or external systems.
+
+A WorkItem outlives any one transfer, so continuation *appends* rather than
+overwrites. A successor Handoff asserts the state it was built from — the
+caller's expected WorkItem revision and the `work_item_revision` of the latest
+Checkpoint — and a stale value aborts before any mutation. On success it stores
+its predecessor Handoff, that exact Checkpoint, and its own source Run/Session,
+and atomically supersedes only the transfer still sitting at `open`. Claimed and
+terminal transfers are immutable history: `acknowledged`, `expired`,
+`cancelled`, and `superseded` all stay readable, and `memory_handoff_discover`
+returns the WorkItem's chain ordered oldest-to-newest with source and receiving
+provenance while only ever offering the newest non-superseded eligible
+transfer. Cancellation was split out of `expired` for exactly this reason: the
+four ways a transfer ends — source cancellation, claim release back to `open`,
+lease expiry, and supersession — must stay distinguishable in the state machine
+and in `audit_log`, or a chain cannot be explained after the fact. A
+`completed` or `abandoned` WorkItem refuses further Handoffs rather than being
+silently reopened; follow-up work is a new WorkItem joined by `depends_on`,
+`derived_from`, or `child_of`. Nothing deletes a predecessor: retention operates
+on wiki pages, and Handoff rows are only ever removed by an explicit project
+purge that removes the whole scope.
 
 The cwd is matched by path-boundary: a Handoff left in `/repo` is discovered by
 a session in `/repo/api`, but never `/repo-other`. Manual project-wide Handoffs

@@ -159,6 +159,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 .writer
                 .publish_handoff(NewHandoff {
                     work_item_id: None,
+                    expected_work_item_revision: None,
+                    expected_checkpoint_revision: None,
                     workspace_id: ws,
                     project_id: proj,
                     from_session_id: Some(sid),

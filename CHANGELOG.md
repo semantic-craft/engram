@@ -12,6 +12,34 @@ below start from the fork.
 
 ### Added
 
+- A WorkItem can now cross many agents and Runs without overwriting earlier
+  transfers. `memory_handoff_begin` publishes a *successor* Handoff for an
+  existing WorkItem, requiring the caller's `expected_work_item_revision` and
+  `expected_checkpoint_revision` (the `work_item_revision` of the latest
+  Checkpoint); either being stale is a conflict that mutates nothing, and
+  concurrent successors at the same revision produce exactly one successor and
+  one explicit conflict. A successor records its predecessor Handoff, the exact
+  Checkpoint it was built from, and its source Run/Session, and atomically
+  supersedes only the older transfer still sitting at `open`. Handoff state
+  gains `superseded` and splits `cancelled` out of `expired`, so source
+  cancellation, claim release, lease expiry, and supersession are four
+  distinct, separately audited outcomes; `memory_handoff_cancel` now leaves a
+  Handoff `cancelled`. `memory_handoff_discover` never delivers a superseded,
+  cancelled, or expired transfer and returns `latest_checkpoint` — the
+  outstanding acceptance criteria and the revision a successor must assert —
+  plus `chain`: the WorkItem's ordered predecessor-to-successor history with
+  source and receiving Run/Session provenance. A `completed` or `abandoned`
+  WorkItem rejects further Handoffs — follow-up work creates a distinct
+  WorkItem through the explicit `depends_on` / `derived_from` / `child_of`
+  contract — and nothing deletes a predecessor that a successor, Checkpoint,
+  ArtifactRef, ContextRef, or audit record still refers to.
+
+- The SessionStart continuation envelope now renders the *remaining*
+  acceptance criteria (from the WorkItem's latest Checkpoint rather than the
+  original wish list), a non-`active` WorkItem state, the transfer's
+  ArtifactRef evidence, its explicit WorkItem relationships, and the
+  predecessor Handoff plus Checkpoint revision it continues.
+
 - Recoverable task continuity now models stable WorkItems separately from
   Runs/Sessions, revisioned Handoffs, lease-bound Claims, append-only
   Checkpoints, caller-supplied retry Attempts, and BackgroundJob identities.
