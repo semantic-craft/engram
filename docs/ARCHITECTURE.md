@@ -315,7 +315,12 @@ no-create lookup, so a missing scope omits its reference instead of falling
 back to another. The assembly options are part of the claim Attempt's
 identity, so reusing one Attempt id with a different budget is a conflicting
 request rather than a replay; Attempts recorded before that field existed
-still replay under the digest shape they were written with. Rendering or assembling
+still replay under the digest shape they were written with. What an identical
+retry replays is the claim transition — the same Claim id, lease and
+revision, with no second audit transition. The package is assembled again
+against current evidence rather than frozen with the Attempt: entries name
+exact revisions, so a snapshot taken at first claim could hand a retrying
+agent refs that have since been superseded or deleted. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
 Checkpoint accepts it. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.

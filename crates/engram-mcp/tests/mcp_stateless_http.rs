@@ -2209,6 +2209,53 @@ async fn explicit_handoff_context_refs_precede_retrieval_candidates_at_claim() {
             <= 260,
         "the tight budget must still be respected: {claimed}"
     );
+
+    // What an identical retry replays is the claim transition. The package is
+    // assembled again, against current evidence — freezing it at first claim
+    // would hand a retrying agent a view of a corpus that has moved on. The
+    // publisher's reference is pinned to an exact revision, so it stays put
+    // while the retrieval leg picks up the new page.
+    store
+        .writer
+        .upsert_pages_batch(vec![seed(
+            "notes/peregrine-06.md".to_string(),
+            "Peregrine Ledger Rehearsal 06".to_string(),
+            "peregrine ledger rehearsal notes 6, written after the first claim \
+             response was lost. Peregrine ledger rehearsal, variant 6."
+                .to_string(),
+        )])
+        .await
+        .unwrap();
+    let retried = call_tool(
+        &router,
+        203,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": published["handoff_id"],
+            "expected_revision": 1,
+            "run_id": "019f0044-0000-7000-8000-000000000002",
+            "attempt_id": "019f0044-0000-7000-8000-000000000003",
+            "context_budget": 260,
+            "lease_seconds": 30
+        }),
+    )
+    .await;
+    for field in ["claim_id", "lease_expires_at", "revision", "handoff"] {
+        assert_eq!(
+            retried[field], claimed[field],
+            "an identical retry must replay the claim transition ({field}): {retried}"
+        );
+    }
+    assert_eq!(
+        retried["package"]["entries"][0]["context_ref"], explicit_ref,
+        "a revisioned reference is pinned, so it survives the re-assembly: {retried}"
+    );
+    assert!(
+        retried["trace"]["candidate_count"].as_u64().unwrap()
+            > claimed["trace"]["candidate_count"].as_u64().unwrap(),
+        "the retry must assemble against current evidence, not a frozen package: \
+         {retried}"
+    );
 }
 
 /// Tracer for the claim-side retrieval query (#44): handoff text reaches the

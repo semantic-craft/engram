@@ -41,7 +41,7 @@ match the intent to the tool. They do not need to name the tool.
 | "where did we leave off?" — and you see a `📥 engram: pending handoff` block in your context | already discovered — answer from that block; before continuing, claim its exact revision with `memory_handoff_claim` |
 | "where did we leave off?" — and no such block is visible | `memory_handoff_discover` (read-only; pass `workspace` + `project` together only for a named sibling workspace/project) |
 | "save context for the next session" / wrapping up / ending this session | `memory_handoff_begin` (session-end only; create or continue a WorkItem; terse summary; put detail in `open_questions` + `next_steps`) |
-| start receiving work | `memory_handoff_claim` (exact Handoff revision, current Run, fresh Attempt, `context_budget`; returns the shared ContextPackage + trace; identical retries replay the claim) |
+| start receiving work | `memory_handoff_claim` (exact Handoff revision, current Run, fresh Attempt, `context_budget`; returns the shared ContextPackage + trace; an identical retry replays the claim and lease, then re-assembles against current evidence) |
 | save durable task progress / acknowledge receipt | `memory_checkpoint_write` (first receiver checkpoint acknowledges; record WorkItem state and criterion status explicitly) |
 | stop receiving claimed work | `memory_handoff_release` (returns an exact live Claim to open; expired leases are recoverable) |
 | "discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` (source-only exact-id/revision/Run cancellation; distinct from claimant release) |
