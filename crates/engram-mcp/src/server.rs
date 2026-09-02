@@ -2825,38 +2825,18 @@ impl EngramServer {
                 &aps_actor,
             )
             .await?;
-        let handoff = self
+        let envelope = self
             .reader
-            .latest_claimable_handoff(ws, proj, args.cwd, args.include_claimed)
+            .discover_continuation(ws, proj, args.cwd, args.include_claimed)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        match handoff {
-            Some(handoff) => {
-                let work_item = self
-                    .reader
-                    .work_item_by_id(handoff.work_item_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                    .ok_or_else(|| {
-                        McpError::internal_error("discovered handoff has no WorkItem", None)
-                    })?;
-                let chain = self
-                    .reader
-                    .handoff_chain(handoff.work_item_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                let latest_checkpoint =
-                    self.reader
-                        .latest_checkpoint(handoff.work_item_id)
-                        .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                ok_json(&serde_json::json!({
-                    "handoff": handoff,
-                    "work_item": work_item,
-                    "latest_checkpoint": latest_checkpoint,
-                    "chain": chain,
-                }))
-            }
+        match envelope {
+            Some(envelope) => ok_json(&serde_json::json!({
+                "handoff": envelope.handoff,
+                "work_item": envelope.work_item,
+                "latest_checkpoint": envelope.latest_checkpoint,
+                "chain": envelope.chain,
+            })),
             None => ok_json(&serde_json::json!({
                 "handoff": null,
                 "work_item": null,

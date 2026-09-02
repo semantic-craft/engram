@@ -3195,6 +3195,31 @@ async fn successor_handoffs_chain_across_three_runs_without_overwriting_history(
     .await;
     assert_eq!(completed["work_item_state"], "completed");
 
+    // Terminal is terminal: the WorkItem cannot be checkpointed back to
+    // `active` to route around the publish-side rejection below.
+    let reopen = call_tool_failure(
+        &router_c,
+        113,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": run_c,
+            "attempt_id": "019f0043-0000-7000-8000-000000000014",
+            "expected_work_item_revision": completed["work_item_revision"],
+            "summary": "Reopening finished work.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {"criterion": "chain is readable", "satisfied": true},
+                {"criterion": "history is immutable", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        reopen.contains("terminal work item state"),
+        "a completed WorkItem must not be reopened: {reopen}"
+    );
+
     let terminal = call_tool_failure(
         &router_c,
         111,
@@ -3404,6 +3429,68 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         "cancellation is its own terminal state, not a lapsed offer"
     );
 
+    // Completing the WorkItem retires whatever transfer is still open, so no
+    // receiver can claim a lease against finished work.
+    let final_open = call_tool(
+        &router,
+        129,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "expected_work_item_revision": 3,
+            "expected_checkpoint_revision": 2,
+            "summary": "Still outstanding when the work finishes."
+        }),
+    )
+    .await;
+    call_tool(
+        &router,
+        130,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": owner_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000026",
+            "expected_work_item_revision": 4,
+            "summary": "Owner finished the work.",
+            "work_item_state": "completed",
+            "acceptance_criteria": [
+                {"criterion": "exactly one successor wins", "satisfied": true}
+            ]
+        }),
+    )
+    .await;
+    let nothing_pending = call_tool(
+        &router,
+        131,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        nothing_pending["handoff"].is_null(),
+        "a finished WorkItem leaves nothing claimable: {nothing_pending}"
+    );
+    let claim_terminal = call_tool_failure(
+        &receiver,
+        132,
+        "memory_handoff_claim",
+        serde_json::json!({
+            "handoff_id": final_open["handoff_id"],
+            "expected_revision": 1,
+            "run_id": receiver_run,
+            "attempt_id": "019f0043-0000-7000-8000-000000000027",
+            "lease_seconds": 60,
+            "context_budget": 4096
+        }),
+    )
+    .await;
+    assert!(
+        claim_terminal.contains("work item is completed"),
+        "{claim_terminal}"
+    );
+
     let conn = rusqlite::Connection::open(store.db_path()).unwrap();
     let mut stmt = conn
         .prepare("SELECT op, detail FROM audit_log WHERE op LIKE 'handoff%'")
@@ -3418,6 +3505,7 @@ async fn concurrent_successors_conflict_and_transfer_outcomes_stay_distinct() {
         ("handoff_cancel", "cancelled"),
         ("handoff_release", "released"),
         ("handoff_claim_expire", "expired"),
+        ("handoff_expire_terminal", "expired"),
     ] {
         assert!(
             rows.iter().any(|(logged_op, detail)| logged_op == op

@@ -543,22 +543,20 @@ async fn fetch_handoff_context(
         return Ok(None);
     };
     let handoff_md = {
-        let handoff = state
+        // One snapshot: the injected envelope must not mix a transfer with a
+        // WorkItem or Checkpoint that a concurrent successor has already moved
+        // past.
+        state
             .reader
-            .latest_claimable_handoff(ws, proj, query.cwd, false)
-            .await?;
-        match handoff {
-            Some(h) => {
-                let work_item = state
-                    .reader
-                    .work_item_by_id(h.work_item_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("handoff {} has no WorkItem", h.id))?;
-                let checkpoint = state.reader.latest_checkpoint(h.work_item_id).await?;
-                Some(render_handoff_markdown(&h, &work_item, checkpoint.as_ref()))
-            }
-            None => None,
-        }
+            .discover_continuation(ws, proj, query.cwd, false)
+            .await?
+            .map(|envelope| {
+                render_handoff_markdown(
+                    &envelope.handoff,
+                    &envelope.work_item,
+                    envelope.latest_checkpoint.as_ref(),
+                )
+            })
     };
     // The brief and handoff are both non-destructive and may be rendered again.
     let brief_md = if crate::payload::query_flag_truthy(query.briefing.as_deref()) {

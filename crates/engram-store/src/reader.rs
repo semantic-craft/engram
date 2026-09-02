@@ -261,7 +261,7 @@ type PageContextRow = (
 
 type ObservationContextRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, String, String, String);
 
-/// `checkpoints` row shape read by [`ReaderPool::latest_checkpoint`].
+/// `checkpoints` row shape read by [`load_latest_checkpoint`].
 type CheckpointRow = (
     Vec<u8>,
     i64,
@@ -679,6 +679,20 @@ pub struct SessionSummary {
     pub observations: u64,
     /// Path of the session's summary page, when one was synthesised.
     pub summary_path: Option<String>,
+}
+
+/// Everything a receiver needs to decide whether to take a transfer, read
+/// from one snapshot. Returned by [`ReaderPool::discover_continuation`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinuationEnvelope {
+    /// The transfer being offered.
+    pub handoff: Handoff,
+    /// Stable work behind it, with relationships and child results.
+    pub work_item: WorkItem,
+    /// Latest durable progress, or `None` before the first Checkpoint.
+    pub latest_checkpoint: Option<Checkpoint>,
+    /// Ordered predecessor-to-successor history, oldest first.
+    pub chain: Vec<HandoffChainEntry>,
 }
 
 /// One handoff with the fields a history view needs. The full record
@@ -2565,39 +2579,63 @@ impl ReaderPool {
         include_claimed: bool,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {HANDOFF_COLUMNS} \
-                 FROM handoffs h \
-                 WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND (state = 'open' OR (state = 'claimed' AND \
-                        (?3 = 1 OR EXISTS (SELECT 1 FROM handoff_claims c \
-                                          WHERE c.handoff_id = h.id AND c.state = 'live' \
-                                            AND c.lease_expires_at <= ?4)))) \
-                 ORDER BY created_at DESC",
-            ))?;
-            let rows = stmt.query_map(
-                params![
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    include_claimed,
-                    Timestamp::now().as_microsecond()
-                ],
-                row_to_handoff,
-            )?;
-            let mut selected: Option<Handoff> = None;
-            for r in rows {
-                let handoff = r??;
-                if is_handoff_candidate(&handoff, cwd_filter.as_deref())
-                    && selected
-                        .as_ref()
-                        .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
-                {
-                    selected = Some(handoff);
-                }
-            }
-            selected
-                .map(|handoff| hydrate_handoff(conn, handoff))
-                .transpose()
+            select_claimable_handoff(
+                conn,
+                workspace_id,
+                project_id,
+                cwd_filter.as_deref(),
+                include_claimed,
+            )
+        })
+        .await
+    }
+
+    /// Read the whole continuation envelope from a single consistent snapshot.
+    ///
+    /// The four reads are one deferred read transaction on one pooled
+    /// connection. Issuing them separately let a successor published in
+    /// between return a now-superseded Handoff next to a chain, Checkpoint,
+    /// and WorkItem revision that already describe its replacement - an
+    /// envelope that contradicts the "superseded transfers are never
+    /// delivered" guarantee. `cwd_filter` and `include_claimed` carry the
+    /// eligibility rules documented on [`Self::latest_claimable_handoff`].
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
+    pub async fn discover_continuation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd_filter: Option<String>,
+        include_claimed: bool,
+    ) -> StoreResult<Option<ContinuationEnvelope>> {
+        self.with_conn(move |conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let Some(handoff) = select_claimable_handoff(
+                &snapshot,
+                workspace_id,
+                project_id,
+                cwd_filter.as_deref(),
+                include_claimed,
+            )?
+            else {
+                return Ok(None);
+            };
+            let work_item_id = handoff.work_item_id;
+            let Some(work_item) = load_work_item(&snapshot, work_item_id)? else {
+                return Err(StoreError::MalformedRecord(format!(
+                    "handoff {} has no work item",
+                    handoff.id
+                )));
+            };
+            let latest_checkpoint = load_latest_checkpoint(&snapshot, work_item_id)?;
+            let chain = load_handoff_chain(&snapshot, work_item_id)?;
+            Ok(Some(ContinuationEnvelope {
+                handoff,
+                work_item,
+                latest_checkpoint,
+                chain,
+            }))
         })
         .await
     }
@@ -2622,248 +2660,13 @@ impl ReaderPool {
         .await
     }
 
-    /// Ordered predecessor-to-successor transfer chain for one WorkItem.
-    ///
-    /// Ordering is `(created_at, rowid)` — the same order `publish_handoff`
-    /// uses to pick a predecessor — so the sequence reproduces publication
-    /// order deterministically even when two transfers share a microsecond.
-    /// Every transfer is returned in every state: superseded, cancelled, and
-    /// expired hops stay readable history rather than disappearing from the
-    /// chain. Receiving provenance comes from `handoff_claims` (the
-    /// acknowledged claim when one exists, otherwise the most recent), read in
-    /// a single pass so the chain never issues one query per transfer.
-    ///
-    /// The caller supplies a WorkItem already resolved through an existing
-    /// scope, so this read never crosses workspace/project boundaries.
-    ///
-    /// # Errors
-    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
-    pub async fn handoff_chain(
-        &self,
-        work_item_id: WorkItemId,
-    ) -> StoreResult<Vec<HandoffChainEntry>> {
-        self.with_conn(move |conn| {
-            let mut claims: HashMap<HandoffId, (String, SessionId, String)> = HashMap::new();
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT handoff_id, actor_key, run_id, state FROM handoff_claims \
-                     WHERE work_item_id = ?1 ORDER BY claimed_at, rowid",
-                )?;
-                let rows = stmt.query_map(params![work_item_id.as_bytes()], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (handoff, actor, run, state) = row?;
-                    let handoff_id = HandoffId::from_slice(&handoff)?;
-                    let run_id = SessionId::from_slice(&run)?;
-                    // Later claims overwrite earlier ones, except that an
-                    // acknowledged claim is the transfer's real receiver and is
-                    // never displaced by a subsequent lease.
-                    let acknowledged_already = claims
-                        .get(&handoff_id)
-                        .is_some_and(|(_, _, existing)| existing == "acknowledged");
-                    if !acknowledged_already {
-                        claims.insert(handoff_id, (actor, run_id, state));
-                    }
-                }
-            }
-
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE work_item_id = ?1 \
-                 ORDER BY created_at, rowid"
-            ))?;
-            let rows = stmt.query_map(params![work_item_id.as_bytes()], row_to_handoff)?;
-            let mut out = Vec::new();
-            for row in rows {
-                let handoff = row??;
-                let claim = claims.get(&handoff.id);
-                out.push(HandoffChainEntry {
-                    handoff_id: handoff.id,
-                    state: handoff.state,
-                    revision: handoff.revision,
-                    created_at: handoff.created_at,
-                    predecessor_handoff_id: handoff.predecessor_handoff_id,
-                    superseded_by_handoff_id: handoff.superseded_by_handoff_id,
-                    source_checkpoint_id: handoff.source_checkpoint_id,
-                    source_checkpoint_revision: handoff.source_checkpoint_revision,
-                    source_actor: handoff.source_actor,
-                    source_run_id: handoff.source_run_id,
-                    source_session_id: handoff.from_session_id,
-                    from_agent: handoff.from_agent,
-                    to_agent: handoff.to_agent,
-                    receiving_actor: claim.map(|(actor, _, _)| actor.clone()),
-                    receiving_run_id: claim.map(|(_, run, _)| *run),
-                    receiving_claim_state: claim.map(|(_, _, state)| state.clone()),
-                    acknowledged_at: handoff.acknowledged_at,
-                });
-            }
-            Ok(out)
-        })
-        .await
-    }
-
-    /// The WorkItem's latest durable Checkpoint — the state a successor
-    /// Handoff must be published from.
-    ///
-    /// Returns the acceptance-criterion status a receiver needs to see what is
-    /// still outstanding and the exact `work_item_revision` that
-    /// `memory_handoff_begin` asserts as `expected_checkpoint_revision`.
-    ///
-    /// # Errors
-    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
-    pub async fn latest_checkpoint(
-        &self,
-        work_item_id: WorkItemId,
-    ) -> StoreResult<Option<Checkpoint>> {
-        self.with_conn(move |conn| {
-            let row: Option<CheckpointRow> = conn
-                .query_row(
-                    "SELECT id, sequence, work_item_revision, work_item_state, summary, \
-                            acceptance_criteria, actor_key, run_id, handoff_id, created_at \
-                     FROM checkpoints WHERE work_item_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                    params![work_item_id.as_bytes()],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                            row.get(8)?,
-                            row.get(9)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((
-                id,
-                sequence,
-                work_item_revision,
-                work_item_state,
-                summary,
-                criteria_json,
-                actor_key,
-                run_id,
-                handoff_id,
-                created_at,
-            )) = row
-            else {
-                return Ok(None);
-            };
-            let id = CheckpointId::from_slice(&id)?;
-            let non_negative = |value: i64, what: &str| {
-                u64::try_from(value)
-                    .map_err(|_| StoreError::MalformedRecord(format!("negative {what}")))
-            };
-            Ok(Some(Checkpoint {
-                id,
-                work_item_id,
-                sequence: non_negative(sequence, "checkpoint sequence")?,
-                work_item_revision: non_negative(work_item_revision, "work item revision")?,
-                work_item_state: work_item_state.parse()?,
-                summary,
-                acceptance_criteria: serde_json::from_str(&criteria_json)?,
-                actor_key,
-                run_id: SessionId::from_slice(&run_id)?,
-                handoff_id: handoff_id
-                    .as_deref()
-                    .map(HandoffId::from_slice)
-                    .transpose()?,
-                created_at: Timestamp::from_microsecond(created_at)
-                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
-                artifacts: crate::artifacts::load_owner_artifacts(
-                    conn,
-                    "checkpoint",
-                    id.as_bytes(),
-                )?,
-            }))
-        })
-        .await
-    }
-
     /// Look up the stable WorkItem behind a discovered Handoff.
     ///
     /// # Errors
     /// Propagates SQL, identity, timestamp, or persisted JSON errors.
     pub async fn work_item_by_id(&self, work_item_id: WorkItemId) -> StoreResult<Option<WorkItem>> {
-        self.with_conn(move |conn| {
-            let row = conn
-                .query_row(
-                    "SELECT id, workspace_id, project_id, objective, acceptance_criteria, state, \
-                            revision, owner_actor, owner_run_id, created_at, updated_at \
-                     FROM work_items WHERE id = ?1",
-                    params![work_item_id.as_bytes()],
-                    |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, Option<Vec<u8>>>(8)?,
-                            row.get::<_, i64>(9)?,
-                            row.get::<_, i64>(10)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((
-                id,
-                workspace,
-                project,
-                objective,
-                criteria,
-                state,
-                revision,
-                owner_actor,
-                owner_run,
-                created_at,
-                updated_at,
-            )) = row
-            else {
-                return Ok(None);
-            };
-            Ok(Some(WorkItem {
-                id: WorkItemId::from_slice(&id)?,
-                workspace_id: WorkspaceId::from_slice(&workspace)?,
-                project_id: ProjectId::from_slice(&project)?,
-                objective,
-                acceptance_criteria: serde_json::from_str(&criteria)?,
-                state: state.parse()?,
-                revision: u64::try_from(revision).map_err(|_| {
-                    StoreError::MalformedRecord("negative work item revision".into())
-                })?,
-                owner_actor,
-                owner_run_id: owner_run
-                    .as_deref()
-                    .map(SessionId::from_slice)
-                    .transpose()?,
-                created_at: Timestamp::from_microsecond(created_at)
-                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
-                updated_at: Timestamp::from_microsecond(updated_at)
-                    .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
-                relationships: crate::artifacts::load_work_item_relationships(
-                    conn,
-                    WorkItemId::from_slice(&id)?,
-                )?,
-                child_results: crate::artifacts::load_child_results(
-                    conn,
-                    WorkItemId::from_slice(&id)?,
-                )?,
-            }))
-        })
-        .await
+        self.with_conn(move |conn| load_work_item(conn, work_item_id))
+            .await
     }
 
     /// Snapshot the database to `dest_path` using SQLite's online backup
@@ -5951,6 +5754,274 @@ fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     // Byte-prefix plus a `/` boundary right after it. `starts_with` is
     // byte-exact and `/` is ASCII, so this is UTF-8 safe.
     d.starts_with(a.as_ref()) && d.as_bytes().get(a.len()) == Some(&b'/')
+}
+
+/// Materialize the stable WorkItem behind a discovered Handoff, with its
+/// relationships and child results.
+fn load_work_item(conn: &Connection, work_item_id: WorkItemId) -> StoreResult<Option<WorkItem>> {
+    let row = conn
+        .query_row(
+            "SELECT id, workspace_id, project_id, objective, acceptance_criteria, state, \
+                        revision, owner_actor, owner_run_id, created_at, updated_at \
+                 FROM work_items WHERE id = ?1",
+            params![work_item_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        workspace,
+        project,
+        objective,
+        criteria,
+        state,
+        revision,
+        owner_actor,
+        owner_run,
+        created_at,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(WorkItem {
+        id: WorkItemId::from_slice(&id)?,
+        workspace_id: WorkspaceId::from_slice(&workspace)?,
+        project_id: ProjectId::from_slice(&project)?,
+        objective,
+        acceptance_criteria: serde_json::from_str(&criteria)?,
+        state: state.parse()?,
+        revision: u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative work item revision".into()))?,
+        owner_actor,
+        owner_run_id: owner_run
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?,
+        created_at: Timestamp::from_microsecond(created_at)
+            .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+        updated_at: Timestamp::from_microsecond(updated_at)
+            .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+        relationships: crate::artifacts::load_work_item_relationships(
+            conn,
+            WorkItemId::from_slice(&id)?,
+        )?,
+        child_results: crate::artifacts::load_child_results(conn, WorkItemId::from_slice(&id)?)?,
+    }))
+}
+
+/// Pick the transfer a project's next receiver should be offered.
+///
+/// Shared by [`ReaderPool::latest_claimable_handoff`] and
+/// [`ReaderPool::discover_continuation`] so both apply the identical
+/// eligibility and preference rules against one connection.
+fn select_claimable_handoff(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    cwd_filter: Option<&str>,
+    include_claimed: bool,
+) -> StoreResult<Option<Handoff>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {HANDOFF_COLUMNS} \
+             FROM handoffs h \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND (state = 'open' OR (state = 'claimed' AND \
+                    (?3 = 1 OR EXISTS (SELECT 1 FROM handoff_claims c \
+                                      WHERE c.handoff_id = h.id AND c.state = 'live' \
+                                        AND c.lease_expires_at <= ?4)))) \
+             ORDER BY created_at DESC",
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            include_claimed,
+            Timestamp::now().as_microsecond()
+        ],
+        row_to_handoff,
+    )?;
+    let mut selected: Option<Handoff> = None;
+    for r in rows {
+        let handoff = r??;
+        if is_handoff_candidate(&handoff, cwd_filter)
+            && selected
+                .as_ref()
+                .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
+        {
+            selected = Some(handoff);
+        }
+    }
+    selected
+        .map(|handoff| hydrate_handoff(conn, handoff))
+        .transpose()
+}
+
+/// Ordered predecessor-to-successor transfer chain for one WorkItem.
+///
+/// Ordering is `(created_at, rowid)` — the same order `publish_handoff`
+/// uses to pick a predecessor — so the sequence reproduces publication
+/// order deterministically even when two transfers share a microsecond.
+/// Every transfer is returned in every state: superseded, cancelled, and
+/// expired hops stay readable history rather than disappearing from the
+/// chain. Receiving provenance comes from `handoff_claims` (the
+/// acknowledged claim when one exists, otherwise the most recent), read in
+/// a single pass so the chain never issues one query per transfer.
+///
+/// The caller supplies a WorkItem already resolved through an existing
+/// scope, so this read never crosses workspace/project boundaries.
+///
+/// # Errors
+/// Propagates SQL, identity, timestamp, or persisted JSON errors.
+fn load_handoff_chain(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StoreResult<Vec<HandoffChainEntry>> {
+    let mut claims: HashMap<HandoffId, (String, SessionId, String)> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT handoff_id, actor_key, run_id, state FROM handoff_claims \
+                 WHERE work_item_id = ?1 ORDER BY claimed_at, rowid",
+        )?;
+        let rows = stmt.query_map(params![work_item_id.as_bytes()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (handoff, actor, run, state) = row?;
+            let handoff_id = HandoffId::from_slice(&handoff)?;
+            let run_id = SessionId::from_slice(&run)?;
+            // Later claims overwrite earlier ones, except that an
+            // acknowledged claim is the transfer's real receiver and is
+            // never displaced by a subsequent lease.
+            let acknowledged_already = claims
+                .get(&handoff_id)
+                .is_some_and(|(_, _, existing)| existing == "acknowledged");
+            if !acknowledged_already {
+                claims.insert(handoff_id, (actor, run_id, state));
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE work_item_id = ?1 \
+             ORDER BY created_at, rowid"
+    ))?;
+    let rows = stmt.query_map(params![work_item_id.as_bytes()], row_to_handoff)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let handoff = row??;
+        let claim = claims.get(&handoff.id);
+        out.push(HandoffChainEntry {
+            handoff_id: handoff.id,
+            state: handoff.state,
+            revision: handoff.revision,
+            created_at: handoff.created_at,
+            predecessor_handoff_id: handoff.predecessor_handoff_id,
+            superseded_by_handoff_id: handoff.superseded_by_handoff_id,
+            source_checkpoint_id: handoff.source_checkpoint_id,
+            source_checkpoint_revision: handoff.source_checkpoint_revision,
+            source_actor: handoff.source_actor,
+            source_run_id: handoff.source_run_id,
+            source_session_id: handoff.from_session_id,
+            from_agent: handoff.from_agent,
+            to_agent: handoff.to_agent,
+            receiving_actor: claim.map(|(actor, _, _)| actor.clone()),
+            receiving_run_id: claim.map(|(_, run, _)| *run),
+            receiving_claim_state: claim.map(|(_, _, state)| state.clone()),
+            acknowledged_at: handoff.acknowledged_at,
+        });
+    }
+    Ok(out)
+}
+
+/// The WorkItem's latest durable Checkpoint - the state a successor Handoff
+/// must be published from.
+///
+/// Carries the acceptance-criterion status a receiver needs to see what is
+/// still outstanding and the exact `work_item_revision` that
+/// `memory_handoff_begin` asserts as `expected_checkpoint_revision`.
+fn load_latest_checkpoint(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StoreResult<Option<Checkpoint>> {
+    let row: Option<CheckpointRow> = conn
+        .query_row(
+            "SELECT id, sequence, work_item_revision, work_item_state, summary, \
+                        acceptance_criteria, actor_key, run_id, handoff_id, created_at \
+                 FROM checkpoints WHERE work_item_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            params![work_item_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        sequence,
+        work_item_revision,
+        work_item_state,
+        summary,
+        criteria_json,
+        actor_key,
+        run_id,
+        handoff_id,
+        created_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let id = CheckpointId::from_slice(&id)?;
+    let non_negative = |value: i64, what: &str| {
+        u64::try_from(value).map_err(|_| StoreError::MalformedRecord(format!("negative {what}")))
+    };
+    Ok(Some(Checkpoint {
+        id,
+        work_item_id,
+        sequence: non_negative(sequence, "checkpoint sequence")?,
+        work_item_revision: non_negative(work_item_revision, "work item revision")?,
+        work_item_state: work_item_state.parse()?,
+        summary,
+        acceptance_criteria: serde_json::from_str(&criteria_json)?,
+        actor_key,
+        run_id: SessionId::from_slice(&run_id)?,
+        handoff_id: handoff_id
+            .as_deref()
+            .map(HandoffId::from_slice)
+            .transpose()?,
+        created_at: Timestamp::from_microsecond(created_at)
+            .map_err(|error| StoreError::MalformedRecord(error.to_string()))?,
+        artifacts: crate::artifacts::load_owner_artifacts(conn, "checkpoint", id.as_bytes())?,
+    }))
 }
 
 fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {

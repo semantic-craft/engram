@@ -213,9 +213,14 @@ transfer. Cancellation was split out of `expired` for exactly this reason: the
 four ways a transfer ends — source cancellation, claim release back to `open`,
 lease expiry, and supersession — must stay distinguishable in the state machine
 and in `audit_log`, or a chain cannot be explained after the fact. A
-`completed` or `abandoned` WorkItem refuses further Handoffs rather than being
-silently reopened; follow-up work is a new WorkItem joined by `depends_on`,
-`derived_from`, or `child_of`. Nothing deletes a predecessor: retention operates
+`completed` or `abandoned` WorkItem refuses further Handoffs, checkpoints, and
+claims rather than being silently reopened — reaching a terminal state retires
+any still-open transfer in the same transaction, so nothing stays claimable
+against finished work — and follow-up work is a new WorkItem joined by
+`depends_on`, `derived_from`, or `child_of`. Discovery reads the whole envelope
+(transfer, WorkItem, latest Checkpoint, chain) from one snapshot, so a
+successor published mid-read can never hand a receiver a superseded transfer
+beside a chain that already describes its replacement. Nothing deletes a predecessor: retention operates
 on wiki pages, and Handoff rows are only ever removed by an explicit project
 purge that removes the whole scope.
 

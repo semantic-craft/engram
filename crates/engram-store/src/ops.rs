@@ -1356,6 +1356,21 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
     })
 }
 
+/// The WorkItem's state when it is terminal, else `None`.
+fn terminal_work_item_state(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StoreResult<Option<String>> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM work_items WHERE id = ?1",
+            params![work_item_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(state.filter(|state| matches!(state.as_str(), "completed" | "abandoned")))
+}
+
 /// Latest Checkpoint of a WorkItem as `(id, work_item_revision)`.
 fn latest_checkpoint(
     conn: &Connection,
@@ -1432,6 +1447,14 @@ pub fn claim_handoff(
             || handoff.project_id != input.project_id
         {
             Some("handoff does not belong to the resolved scope".to_string())
+        } else if let Some(terminal) = terminal_work_item_state(&tx, handoff.work_item_id)? {
+            // Belt and braces with the retirement in `write_checkpoint`: the
+            // invariant "no claim against finished work" is enforced here too,
+            // so a row that reached `open` by any other route still fails
+            // closed rather than handing out a lease on closed work.
+            Some(format!(
+                "work item is {terminal}; claim a handoff on an active work item instead"
+            ))
         } else if handoff.revision != input.expected_revision {
             Some(format!(
                 "stale handoff revision: expected {}, current {}",
@@ -1844,7 +1867,7 @@ pub fn write_checkpoint(
             },
         )
         .optional()?;
-    let Some((ws, project, _state, revision, owner_actor, owner_run, criteria_json)) = work_item
+    let Some((ws, project, state, revision, owner_actor, owner_run, criteria_json)) = work_item
     else {
         return Err(StoreError::NotFound(format!(
             "work item {}",
@@ -1903,6 +1926,14 @@ pub fn write_checkpoint(
             || project.as_slice() != input.project_id.as_bytes()
         {
             Some("work item does not belong to the resolved scope".to_string())
+        } else if matches!(state.as_str(), "completed" | "abandoned") {
+            // Terminal is terminal. Without this, an owner could checkpoint a
+            // finished WorkItem back to `active` and then publish a successor,
+            // routing around the terminal check in `publish_handoff`.
+            Some(format!(
+                "cannot checkpoint a terminal work item state {state}; \
+                 create a related work item instead"
+            ))
         } else if u64::try_from(revision).ok() != Some(input.expected_work_item_revision) {
             Some(format!(
                 "stale work item revision: expected {}, current {}",
@@ -2090,6 +2121,65 @@ pub fn write_checkpoint(
         return Err(StoreError::InvalidState(
             "checkpoint work item compare-and-set conflict".into(),
         ));
+    }
+
+    // Reaching a terminal state retires every offer still waiting on this
+    // WorkItem, in the same transaction that closes it. Otherwise a stale open
+    // Handoff stays claimable after the work is finished, and its claimant
+    // would only discover the WorkItem is closed when its own checkpoint is
+    // rejected. A `claimed` transfer is left alone: it belongs to a live
+    // receiver, who releases it rather than having it retired underneath them.
+    if matches!(
+        input.work_item_state,
+        WorkItemState::Completed | WorkItemState::Abandoned
+    ) {
+        let retired: Vec<(HandoffId, u64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, revision FROM handoffs WHERE work_item_id = ?1 AND state = 'open' \
+                 ORDER BY created_at, rowid",
+            )?;
+            let rows = stmt.query_map(params![input.work_item_id.as_bytes()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (handoff, revision) = row?;
+                let next = u64::try_from(revision)
+                    .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+                out.push((HandoffId::from_slice(&handoff)?, next));
+            }
+            out
+        };
+        if !retired.is_empty() {
+            let changed = tx.execute(
+                "UPDATE handoffs SET state = 'expired', revision = revision + 1 \
+                 WHERE work_item_id = ?1 AND state = 'open'",
+                params![input.work_item_id.as_bytes()],
+            )?;
+            if changed != retired.len() {
+                return Err(StoreError::InvalidState(
+                    "handoff expiry compare-and-set conflict".into(),
+                ));
+            }
+            for (handoff_id, revision) in &retired {
+                audit_continuity(
+                    &tx,
+                    "handoff_expire_terminal",
+                    input.workspace_id,
+                    input.project_id,
+                    input.work_item_id,
+                    input.run_id,
+                    Some(*handoff_id),
+                    Some(*revision),
+                    Some(input.attempt_id),
+                    &input.actor_key,
+                    "expired",
+                    now,
+                )?;
+            }
+        }
     }
 
     let (handoff_revision, handoff_state) =
