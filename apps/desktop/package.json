@@ -1,6 +1,6 @@
 {
   "name": "engram-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Engram desktop app — browse, search, and curate your agents' long-term memory",
   "type": "module",
   "scripts": {
