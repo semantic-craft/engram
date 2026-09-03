@@ -7,8 +7,9 @@ managed routing snippet + Agent Skills package.
 ## Cross-agent handoff
 
 You normally do not create handoffs by hand. With lifecycle hooks
-installed, session-end capture writes a WorkItem/Handoff and the next
-session start picks it up.
+installed, session-end capture publishes a Handoff — continuing the
+WorkItem this session owns or claimed, or creating one if there is
+nothing to continue — and the next session start picks it up.
 
 ```text
 $ claude

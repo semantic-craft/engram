@@ -60,11 +60,13 @@ from hook paths.
    enqueues a `WriteCmd` to the writer actor. `log.md` gets an
    appended `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
-   `sessions/<id>.md` summary page (rule-based, no LLM) and creates a stable
-   `WorkItem` plus an open, revisioned `Handoff` for the next agent. The next
-   session's SessionStart *claims* that Handoff when the Agent Adapter can
-   deliver session-start output — see "Agent Adapters and session-start
-   recovery" below.
+   `sessions/<id>.md` summary page (rule-based, no LLM) and publishes an open,
+   revisioned `Handoff`. If this run already owns the active WorkItem, or still
+   holds the SessionStart claim (live or lapsed), the Handoff is a successor of
+   that WorkItem; otherwise a new WorkItem is created. The next session's
+   SessionStart *claims* that Handoff when the Agent Adapter can deliver
+   session-start output — see "Agent Adapters and session-start recovery"
+   below.
    Auto-commits the wiki. Clients
    without a true session-end hook (currently Antigravity CLI) should call
    `memory_handoff_begin` before quitting when a handoff is needed.
