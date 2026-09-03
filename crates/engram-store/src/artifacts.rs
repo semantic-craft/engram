@@ -385,13 +385,19 @@ fn persist_one_relationship(
     // V103's UNIQUE(kind, from, to) stops the same parent being recorded
     // twice but not two *different* parents, which would make
     // `parent_of_child` pick one arbitrarily. A child has exactly one
-    // parent, enforced here rather than by a migration (#54).
+    // parent, enforced here rather than by a migration (#54). Re-declaring
+    // the parent it already has is excluded so that stays a UNIQUE
+    // violation rather than a misleading "two parents" refusal.
     if input.kind == WorkItemRelationshipKind::ChildOf {
         let existing_parent: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT to_work_item_id FROM work_item_relationships \
-                 WHERE kind = 'child_of' AND from_work_item_id = ?1 LIMIT 1",
-                params![from_work_item_id.as_bytes()],
+                 WHERE kind = 'child_of' AND from_work_item_id = ?1 \
+                   AND to_work_item_id != ?2 LIMIT 1",
+                params![
+                    from_work_item_id.as_bytes(),
+                    input.target_work_item_id.as_bytes()
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -900,6 +906,22 @@ mod tests {
             "{error}"
         );
         assert_eq!(parent_of_child(&conn, child).unwrap(), Some(first_parent));
+
+        // Re-declaring the parent it already has is a different failure: the
+        // V103 UNIQUE constraint, not a misleading "second parent" refusal.
+        let duplicate = link(
+            &mut conn,
+            child,
+            (ws, proj),
+            ("agent:alice", run),
+            WorkItemRelationshipKind::ChildOf,
+            first_parent,
+        )
+        .expect_err("the same child_of row cannot be inserted twice");
+        assert!(
+            !duplicate.to_string().contains(SECOND_PARENT_FORBIDDEN),
+            "{duplicate}"
+        );
 
         // Other relationship kinds stay unrestricted.
         link(

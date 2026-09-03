@@ -461,8 +461,9 @@ Useful entry points:
   POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
   ```
 
-  `overview` bundles the open handoff + briefing + memory-health for a workspace
-  or project in one call (the data a project overview screen needs).
+  `overview` bundles the claimable handoff (open, or claimed with an expired
+  lease) + briefing + memory-health for a workspace or project in one call (the
+  data a project overview screen needs).
 
   **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
   for auth setup, response schemas, error model, limits/pagination,

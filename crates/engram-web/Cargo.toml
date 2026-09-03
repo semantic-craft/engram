@@ -34,6 +34,9 @@ anyhow.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+# Route tests reach into the store's SQLite file to age a lease
+# deterministically instead of sleeping on the wall clock.
+rusqlite.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 

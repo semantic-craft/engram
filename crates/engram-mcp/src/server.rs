@@ -305,7 +305,8 @@ the conversation calls for them:\n\
   acknowledgement is not completion. \
   Changed/verified/committed/pushed/reviewed/merged/released/deployed/\
   submitted/approved facts stay independent and are never inferred. \
-  A child cannot complete, abandon, claim, or supersede its parent.\n\
+  A child cannot complete, abandon, claim, or supersede its parent. \
+  A WorkItem has at most one `child_of` parent; a second one is rejected.\n\
 - `memory_handoff_release` — return a live Claim to `open` when the \
   receiver will not continue. Supply a fresh Attempt; expired leases become \
   claimable without a manual release.\n\

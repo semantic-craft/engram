@@ -394,6 +394,10 @@ fn nonempty_opt(value: Option<&str>) -> Option<String> {
 /// repository file reported as `src\lib.rs` from Windows and `src/lib.rs`
 /// from macOS is one object, so both must produce one key. Every locator
 /// leaving this function therefore uses `/` exclusively.
+///
+/// The cost is that a literal `\` inside a POSIX filename is no longer
+/// expressible: it is read as a separator. Cross-machine identity for the
+/// overwhelmingly common case is worth more than that pathological name.
 fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

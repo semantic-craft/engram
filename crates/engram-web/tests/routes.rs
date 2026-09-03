@@ -1407,9 +1407,7 @@ async fn api_workspace_overview_includes_expired_lease_claimed_handoff() {
             run_id: SessionId::new(),
             attempt_id: AttemptId::new(),
             actor_key: "receiver".into(),
-            // The shortest lease the store accepts, so the crash the test
-            // simulates becomes observable without stubbing the clock.
-            lease_seconds: 1,
+            lease_seconds: 30,
             context_options: serde_json::Value::Null,
         })
         .await
@@ -1438,7 +1436,17 @@ async fn api_workspace_overview_includes_expired_lease_claimed_handoff() {
         "a live lease means the work is being carried: {while_leased}"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    // Simulate the crashed receiver: the lease elapses with the claim still
+    // `live` and the transfer still `claimed`. Ageing the row beats sleeping
+    // on the wall clock — the assertion below is then deterministic.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let expired = conn
+        .execute(
+            "UPDATE handoff_claims SET lease_expires_at = 0 WHERE state = 'live'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(expired, 1);
 
     let after_expiry = overview(api_router(store.reader.clone(), wiki.clone())).await;
     assert_eq!(
