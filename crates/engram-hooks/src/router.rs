@@ -7225,7 +7225,7 @@ mod tests {
         );
     }
 
-    fn session_hook_for(agent: &str, event: &str, session_id: &str) -> HookEnvelope {
+    fn session_hook(event: &str, session_id: &str) -> HookEnvelope {
         let mut body = serde_json::json!({ "session_id": session_id });
         if event == "user-prompt" {
             body["prompt"] = serde_json::json!("Continue the auth cookie rotation");
@@ -7233,15 +7233,11 @@ mod tests {
         HookEnvelope::from_query_and_body(
             HookQuery {
                 event: event.into(),
-                agent: Some(agent.into()),
+                agent: Some("claude-code".into()),
                 ..Default::default()
             },
             body,
         )
-    }
-
-    fn session_hook(event: &str, session_id: &str) -> HookEnvelope {
-        session_hook_for("claude-code", event, session_id)
     }
 
     /// Two consecutive SessionEnds for the same project/actor produce one
@@ -7487,132 +7483,5 @@ mod tests {
         );
         assert!(!envelope.handoff.brief.is_empty());
         assert!(!envelope.handoff.context_refs.is_empty());
-    }
-
-    /// Automatic SessionEnd then SessionStart across two output-capable
-    /// adapters continues one WorkItem (#47).
-    ///
-    /// Claude Code ends a session; Cursor starts a different Run, claims the
-    /// transfer, acknowledges it with the first checkpoint, and ends still on
-    /// the same chain. Briefing counts observe the chain.
-    #[tokio::test]
-    async fn automatic_session_end_then_session_start_continues_same_work_item() {
-        let tmp = TempDir::new().unwrap();
-        let state = make_state(&tmp).await;
-        let claude_sid = "11111111-1111-4111-8111-111111111111";
-        let cursor_sid = "22222222-2222-4222-8222-222222222222";
-
-        for event in ["session-start", "user-prompt", "session-end"] {
-            process(
-                &state,
-                session_hook_for("claude-code", event, claude_sid),
-                alice(),
-            )
-            .await
-            .unwrap();
-        }
-        let first = state
-            .reader
-            .latest_claimable_handoff(state.workspace_id, state.project_id, None, false)
-            .await
-            .unwrap()
-            .expect("Claude Code SessionEnd publishes an open handoff");
-        let work_item_id = first.work_item_id;
-
-        let rendered =
-            fetch_continuation(&state, session_start_query("cursor", cursor_sid), &alice())
-                .await
-                .unwrap()
-                .expect("Cursor SessionStart must claim the Claude Code handoff");
-        assert!(rendered.contains("continuation CLAIMED"), "{rendered}");
-        assert!(rendered.contains("adapter `cursor:injected`"), "{rendered}");
-
-        let envelope = state
-            .reader
-            .discover_continuation(state.workspace_id, state.project_id, None, None, true)
-            .await
-            .unwrap()
-            .expect("the claimed transfer is still inspectable");
-        assert_eq!(envelope.work_item.id, work_item_id);
-        let claim_id = engram_core::ClaimId::from_str(&rendered_claim_id(&rendered))
-            .expect("the injected block carries a usable Claim id");
-        state
-            .writer
-            .write_checkpoint(engram_core::CheckpointWrite {
-                work_item_id,
-                workspace_id: state.workspace_id,
-                project_id: state.project_id,
-                run_id: SessionId::from_agent_session(cursor_sid),
-                handoff_id: Some(first.id),
-                claim_id: Some(claim_id),
-                expected_handoff_revision: Some(first.revision + 1),
-                expected_work_item_revision: envelope.work_item.revision,
-                attempt_id: engram_core::AttemptId::new(),
-                actor_key: "user:alice".into(),
-                summary: "picked it up in Cursor".into(),
-                work_item_state: engram_core::WorkItemState::Active,
-                acceptance_criteria: envelope
-                    .work_item
-                    .acceptance_criteria
-                    .iter()
-                    .map(|criterion| engram_core::AcceptanceCriterionStatus {
-                        criterion: criterion.clone(),
-                        satisfied: false,
-                    })
-                    .collect(),
-                artifacts: vec![],
-                relationships: vec![],
-                parent_result: None,
-            })
-            .await
-            .expect("Cursor's first checkpoint acknowledges the automatic claim");
-        assert_eq!(
-            state
-                .reader
-                .handoff_by_id(first.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            engram_core::HandoffState::Acknowledged,
-        );
-
-        for event in ["session-start", "user-prompt", "session-end"] {
-            process(
-                &state,
-                session_hook_for("cursor", event, cursor_sid),
-                alice(),
-            )
-            .await
-            .unwrap();
-        }
-
-        let successor = state
-            .reader
-            .discover_continuation(state.workspace_id, state.project_id, None, None, false)
-            .await
-            .unwrap()
-            .expect("Cursor SessionEnd publishes a successor");
-        assert_eq!(successor.work_item.id, work_item_id);
-        assert_eq!(successor.chain.len(), 2, "{:?}", successor.chain);
-        assert_eq!(
-            successor.chain[1].predecessor_handoff_id,
-            Some(successor.chain[0].handoff_id)
-        );
-        assert_eq!(
-            successor.chain[0].state,
-            engram_core::HandoffState::Acknowledged
-        );
-        assert_eq!(successor.chain[1].state, engram_core::HandoffState::Open);
-
-        let briefing = state
-            .reader
-            .briefing_for_project(state.workspace_id, state.project_id, 5)
-            .await
-            .unwrap();
-        assert_eq!(briefing.work_items.active, 1);
-        assert_eq!(briefing.handoffs.acknowledged, 1);
-        assert_eq!(briefing.handoffs.open, 1);
-        assert_eq!(briefing.pending_handoff_count, 1);
     }
 }

@@ -57,13 +57,14 @@ below start from the fork.
 
 ### Changed
 
-- The automatic SessionEnd → SessionStart journey is closed: two
-  output-capable adapters, one WorkItem. SessionEnd publishes a successor
-  for the active WorkItem; the next SessionStart claims it; the receiver's
-  first checkpoint acknowledges the transfer; a further SessionEnd stays
-  on that chain. Current README, architecture, design-decisions, usage,
-  and agent-integration docs no longer describe cwd as identity, flat
-  retrieval as a complete ContextPackage, or the retired
+- The automatic SessionEnd → SessionStart contract now has one public
+  hook/MCP/admin HTTP regression journey across two output-capable adapters
+  and one WorkItem. It proves successor publication, SessionStart claim,
+  first-checkpoint acknowledgement, ownership transfer, completion, terminal
+  refusal, explicit related follow-up work, briefing counts, and audit
+  reconstruction without an LLM provider. Current README, architecture,
+  design-decisions, usage, and agent-integration docs no longer describe cwd
+  as identity, flat retrieval as a complete ContextPackage, or the retired
   `memory_handoff_accept` / read-and-consume baton as live behaviour.
   Historical mentions in `docs/upstream-changelog.md` and
   `docs/prior-art-implementation-findings.md` are labelled as past.

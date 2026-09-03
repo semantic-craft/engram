@@ -75,7 +75,11 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Recoverable cross-agent work.** A stable WorkItem survives Run and agent
   boundaries. Revisioned Handoffs use optimistic claims with bounded leases;
   lost receivers can be replaced, retries are Attempt-idempotent, and only an
-  explicit checkpoint completes or abandons the WorkItem.
+  explicit checkpoint completes or abandons the WorkItem. Implementation,
+  WorkItem checkpoints, pull requests, and artifact delivery facts are separate
+  stages. ArtifactRefs record changed, verified, committed, pushed, reviewed,
+  merged, released, deployed, submitted, and approved independently; Engram
+  never performs those external actions.
 - **Per-project isolation by construction.** Each project lives at
   `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
   Workspace defaults to `"default"`. Project is derived from `$cwd`:
