@@ -32,6 +32,18 @@ pub enum ContextDetailTier {
     FullEvidence,
 }
 
+impl ContextDetailTier {
+    /// Canonical snake_case wire string, matching the serde representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Brief => "brief",
+            Self::Overview => "overview",
+            Self::FullEvidence => "full_evidence",
+        }
+    }
+}
+
 /// Selection precedence, independent of retrieval score.
 ///
 /// Retrieval scores are lower-is-better and unbounded (SQLite bm25 ranks fall

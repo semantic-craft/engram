@@ -165,10 +165,10 @@ Relationship   explicit depends_on / derived_from / child_of between WorkItems
 
 `memory_handoff_begin` creates a WorkItem plus open Handoff, or publishes a
 successor for an exact existing WorkItem owned by the same authenticated
-actor and source Run. SessionStart and `memory_handoff_discover` are read-only.
-The receiver uses compare-and-set `memory_handoff_claim` with a caller
-`context_budget`; the claim returns the same ContextPackage and assembly
-trace as `memory_query`. Its first
+actor and source Run. `memory_handoff_discover` is read-only. The receiver
+uses compare-and-set `memory_handoff_claim` with a caller `context_budget`;
+the claim returns the same ContextPackage and assembly trace as
+`memory_query`. Its first
 `memory_checkpoint_write` acknowledges the Claim and Handoff transactionally
 and may attach typed ArtifactRefs and explicit WorkItem relationships on that
 ack checkpoint. Acknowledgement is not completion: only an explicit checkpoint
@@ -232,6 +232,46 @@ the most recent. SQLite is the operational coordination source of truth behind
 the single writer actor; Markdown remains the durable knowledge source of truth.
 
 agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
+
+### 9a. Why SessionStart claims instead of reading
+
+The original session-start injection was a read: it rendered the open Handoff
+and told the agent to claim it over MCP. In practice the agent had already been
+handed the context, so the claim was a second, easily-skipped step, and two
+agents starting in the same directory could each be shown the same "pending"
+work.
+
+Automatic recovery therefore takes the same claim as the on-demand path. The
+part that made a claim unsafe to automate is capability, not policy: claiming
+for a harness that then discards the rendered output consumes a transfer nobody
+read and leaves a lease no Run can acknowledge. So the decision is expressed as
+a typed **Agent Adapter contract** in `engram_core::adapter` — one capability
+(does this harness deliver SessionStart output?) gating one behaviour (may it
+claim automatically?). Harnesses that discard it, and harnesses engram has not
+established, do nothing automatically at all; that is why an unknown adapter
+degrades to a no-op read rather than a best-effort claim.
+
+Three consequences follow deliberately:
+
+- **The claim binds to the real Run.** The `/handoff` request carries the
+  harness's own session id, mapped through the same
+  `SessionId::from_agent_session` the capture path uses. Without a reported Run
+  the server renders read-only instead of claiming, because a lease bound to no
+  Run can never be acknowledged.
+- **Rendering never accepts.** Injection leaves the transfer `claimed`. A
+  session that dies before its first checkpoint leaves recoverable work, not
+  lost work, and the lease expiry rule is shared with every other claim path.
+- **One assembler, two callers.** Continuation assembly moved into
+  `engram_store::continuation` so the hook path and the MCP tool cannot drift
+  on quotas, priority, deduplication, omission reporting, or scope resolution.
+  The hook path passes no embedding — SessionStart must make no synchronous
+  model call — which is the same BM25 degradation `memory_query` takes with no
+  provider configured.
+
+Adapter identity dimensions stay distinct throughout: the authenticated actor
+authorizes, the harness kind and delivery capability decide behaviour, the Run
+owns the lease, and the WorkItem/cwd/target values are selection hints that
+narrow inside an already-resolved scope and grant nothing.
 
 ## 10. MCP tool surface - narrow on purpose
 

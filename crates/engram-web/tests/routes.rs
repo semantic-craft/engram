@@ -1409,6 +1409,7 @@ async fn api_workspace_overview_includes_expired_lease_claimed_handoff() {
             actor_key: "receiver".into(),
             lease_seconds: 30,
             context_options: serde_json::Value::Null,
+            delivery_path: "test:on-demand".into(),
         })
         .await
         .unwrap();

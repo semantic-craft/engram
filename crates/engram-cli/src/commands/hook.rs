@@ -15,12 +15,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use engram_core::AgentKind;
+use engram_core::AdapterContract;
 use engram_llm::OidcToken;
 
 use crate::cli::HookArgs;
 
-use super::hook_capture::{build_client, extract_cwd, get_handoff, marker_query_suffix};
+use super::hook_capture::{
+    build_client, extract_cwd, extract_session_id, get_handoff, marker_query_suffix, url_encode,
+};
 use super::hook_drain_process;
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
@@ -263,14 +265,19 @@ where
             drain_event_timeout(),
         )
         .await;
-        // Only fetch the handoff for agents that inject the session-start
-        // hook's stdout as context. Grok ignores it, so the read-only fetch
-        // would be wasted; those agents discover the same still-open Handoff
-        // on demand via the MCP `memory_handoff_discover` tool.
-        if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
+        // The shared Agent Adapter contract decides whether this harness may
+        // recover automatically. A harness that discards SessionStart output
+        // (Grok) or whose delivery is not established performs NO handoff read
+        // or mutation here and leaves the transfer open for the on-demand MCP
+        // `memory_handoff_claim`. Delivery-capable harnesses forward their own
+        // session id so the server binds the claim to the real receiving Run.
+        if AdapterContract::from_wire(Some(&args.agent)).may_claim_on_session_start() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let handoff_url = format!("{base}/handoff?agent={}{qs}", args.agent);
+            let run_qs = extract_session_id(&json)
+                .map(|id| format!("&session_id={}", url_encode(&id)))
+                .unwrap_or_default();
+            let handoff_url = format!("{base}/handoff?agent={}{qs}{run_qs}", args.agent);
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {

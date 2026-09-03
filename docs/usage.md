@@ -8,7 +8,7 @@ managed routing snippet + Agent Skills package.
 
 You normally do not create handoffs by hand. With lifecycle hooks
 installed, session-end capture writes a WorkItem/Handoff and the next
-session-start hook discovers it without changing state.
+session start picks it up.
 
 ```text
 $ claude
@@ -17,16 +17,44 @@ $ claude
 > /exit
 
 $ codex   # in the same directory, later
-[SessionStart hook discovers the handoff; Codex sees it before your prompt.]
+[SessionStart claims the continuation for this session and injects it,
+ with a budgeted context package, before your prompt.]
 > Picking up: you were investigating session cookies as an alternative...
 ```
 
+### Automatic versus on-demand recovery
+
+Which of the two happens depends on one property of your harness: does it
+deliver session-start hook output into the model's context?
+
+- **It does** (Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Antigravity
+  CLI, OpenClaw, OMP, Pi): the session start *claims* the continuation for
+  that session and injects a block headed **continuation CLAIMED**, carrying
+  the envelope, the claim ids, and the same budgeted ContextPackage
+  `memory_handoff_claim` returns. Use it directly — do not claim it again.
+  Acknowledge it with your first `memory_checkpoint_write` for that WorkItem,
+  passing the `handoff_id`, `claim_id`, `expected_handoff_revision`,
+  `expected_work_item_revision`, and `run_id` the block names.
+- **It does not** (Grok, and any harness whose behaviour engram has not
+  established): nothing is read or claimed automatically — the transfer stays
+  `open`. Recover on demand with `memory_handoff_discover`, then
+  `memory_handoff_claim` with a `context_budget`.
+
+A block headed **pending handoff** instead means the adapter could not report
+its own Run, so nothing was claimed; claim it explicitly before continuing.
+
+Injection never *accepts* a transfer. It stays `claimed` until the receiving
+Run writes its first valid checkpoint, so a session that crashes or loses its
+output before checkpointing leaves recoverable work: the lease elapses and the
+transfer returns to `open` for the next receiver. Automatic and on-demand
+claims share one compare-and-set, so exactly one claimant ever wins.
+`memory_handoff_release` returns a claim early. Bounds live in the
+server's `[continuity]` config: package budget, wall-clock timeout, and lease
+length. See "Agent Adapters and session-start recovery" in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the per-harness table.
+
 If an agent has MCP but no lifecycle hook surface, ask it to call
-`memory_handoff_begin` before quitting. The next agent discovers the open
-Handoff, claims its exact revision for the current Run, and acknowledges it
-only by writing the first durable checkpoint. Merely reading or claiming does
-not complete the WorkItem. Claims have bounded leases, so another receiver can
-recover the task if the first disappears.
+`memory_handoff_begin` before quitting.
 
 `memory_handoff_begin` and `memory_checkpoint_write` can attach typed
 ArtifactRefs and explicit WorkItem relationships, and both responses return
@@ -39,8 +67,8 @@ Absolute cwd is a hint, not identity, and is rejected as a worktree locator.
 Observation metadata (source Run, timestamp, provenance, dirty, local-path
 hint, git ref, content hash, tree hash) belongs to the attachment, not the
 shared identity. Deleting the first writer's project does not CASCADE through
-the shared identity into another project's attachments. SessionStart
-pending-handoff markdown lists artifacts (kind, locator, repository/revision,
+the shared identity into another project's attachments. The SessionStart
+continuation markdown lists artifacts (kind, locator, repository/revision,
 id) and relationships (kind, from/to ids) without copying claim ids or treating
 cwd as identity. Delivery facts stay independent: committed does not imply
 pushed, and verified evidence that names an older revision is stale. Related
@@ -100,8 +128,8 @@ at the managed engram Agent Skills that carry detailed tool routing.
 | Before proposing architecture | `memory_query` with `context_budget` | Checks prior decisions and gotchas within a caller-bounded context package. |
 | "Show the exact evidence for this result" | `memory_context_read` | Resolves the selected ContextRef's exact source revision through an existing, fail-closed scope. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
-| "Where did we leave off?" | Existing handoff block, or `memory_handoff_discover` if no block exists | Reads the latest claimable Handoff without mutation. |
-| "Continue that work" | `memory_handoff_claim` with `context_budget`, then `memory_checkpoint_write` | Claims an exact revision, returns the shared ContextPackage, and acknowledges receipt with the first durable checkpoint. |
+| "Where did we leave off?" | Injected continuation block, or `memory_handoff_discover` if no block exists | An injected "continuation CLAIMED" block already holds this session's claim; discovery reads without mutating. |
+| "Continue that work" | The injected block's ids, then `memory_checkpoint_write`; or `memory_handoff_claim` with `context_budget` first when nothing was injected | Claims an exact revision, returns the shared ContextPackage, and acknowledges receipt with the first durable checkpoint. |
 | "I cannot continue this claim" | `memory_handoff_release` | Reopens the exact live Claim for another receiver. |
 | "Save context for the next session" | `memory_handoff_begin` | Creates or continues a WorkItem and publishes a terse open Handoff. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Lets the source owner expire an exact open Handoff revision. |

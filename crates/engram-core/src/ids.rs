@@ -88,6 +88,21 @@ id_newtype!(pub ArtifactId, "Identifier for one typed, verifiable artifact refer
 id_newtype!(pub WorkItemRelationshipId, "Identifier for one explicit WorkItem relationship.");
 id_newtype!(pub ClaimId, "Opaque identifier for one temporary handoff claim.");
 id_newtype!(pub CheckpointId, "Identifier for one durable WorkItem checkpoint.");
+
+impl SessionId {
+    /// Map a harness's raw session identifier onto engram's Run identity.
+    ///
+    /// Canonical UUIDs are taken as-is; anything else hashes to a deterministic
+    /// UUID v5. Both the capture path (`POST /hook`) and the continuity path
+    /// (`GET /handoff`) resolve through here, so a SessionStart claim binds to
+    /// exactly the Run that the same session's observations land under.
+    #[must_use]
+    pub fn from_agent_session(raw: &str) -> Self {
+        Uuid::from_str(raw)
+            .map(Self)
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
 id_newtype!(pub AttemptId, "Caller-supplied identifier for one retryable continuity mutation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
@@ -248,21 +263,6 @@ impl AgentKind {
             _ => Self::Other,
         }
     }
-
-    /// Whether this agent injects the native `session-start` hook's stdout
-    /// into the resuming session as context. Agents that consume it return
-    /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
-    ///
-    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), so
-    /// the native hook need not perform a read whose rendered result would be
-    /// discarded. Such agents can call the read-only MCP
-    /// `memory_handoff_discover` tool instead. Unknown future agents return
-    /// `false` until their SessionStart stdout semantics are known.
-    #[must_use]
-    pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Other)
-    }
 }
 
 #[cfg(test)]
@@ -302,12 +302,6 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
-        // Grok cannot inject the session-start handoff (ignores hook stdout);
-        // every other agent can.
-        assert!(!AgentKind::Grok.session_start_injects_handoff());
-        assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
-        assert!(AgentKind::Codex.session_start_injects_handoff());
-        assert!(!AgentKind::Other.session_start_injects_handoff());
     }
 
     #[test]

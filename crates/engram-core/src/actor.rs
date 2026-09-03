@@ -85,6 +85,30 @@ pub struct ActorContext {
     pub client: Option<String>,
 }
 
+impl ActorContext {
+    /// The continuity actor key: the single string every WorkItem, Handoff,
+    /// Claim, and Checkpoint transition is recorded against.
+    ///
+    /// Both the MCP tool surface and the SessionStart adapter path derive the
+    /// key here, so a Handoff claimed automatically on session start is owned
+    /// by exactly the actor whose later `memory_checkpoint_write` acknowledges
+    /// it. Divergent derivations would strand every automatic claim as "claim
+    /// belongs to a different actor".
+    #[must_use]
+    pub fn continuity_key(&self) -> String {
+        if let Some(user) = &self.user {
+            return format!("user:{user}");
+        }
+        if let Some(sub) = &self.sub {
+            return format!("sub:{sub}");
+        }
+        if let Some(client) = &self.client {
+            return format!("client:{client}");
+        }
+        "anonymous".to_string()
+    }
+}
+
 /// Authorization tier the auth middleware resolved this request to.
 ///
 /// Identity ([`ActorContext`]) carries *who* the request is from;

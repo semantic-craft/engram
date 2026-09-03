@@ -61,7 +61,10 @@ from hook paths.
    appended `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and creates a stable
-   `WorkItem` plus an open, revisioned `Handoff` for the next agent.
+   `WorkItem` plus an open, revisioned `Handoff` for the next agent. The next
+   session's SessionStart *claims* that Handoff when the Agent Adapter can
+   deliver session-start output — see "Agent Adapters and session-start
+   recovery" below.
    Auto-commits the wiki. Clients
    without a true session-end hook (currently Antigravity CLI) should call
    `memory_handoff_begin` before quitting when a handoff is needed.
@@ -126,6 +129,77 @@ nullable observation metadata; `kind` stays canonical. This is an
 extension seam, not a runtime plugin system: external processors must use
 the existing HTTP/MCP APIs and cannot bypass the sanitizer, hook
 backpressure, or single-writer SQLite actor.
+
+## Agent Adapters and session-start recovery
+
+An **Agent Adapter** is the thin, harness-specific layer that turns one coding
+agent's lifecycle events into engram's continuity protocol. Adapter-specific
+code translates lifecycle events and delivery capability only. Selection,
+claim, assembly, acknowledgement, scope, and authorization are shared server
+semantics; an adapter cannot change claim, lease, revision, acknowledgement, or
+ContextPackage selection.
+
+The capability table lives in `engram_core::adapter`, not in per-harness
+scripts. One field decides everything: does this harness deliver a SessionStart
+hook's output into the resuming model context?
+
+| Adapter | SessionStart output | Automatic claim | How recovery happens |
+|---|---|---|---|
+| `claude-code` | injected (`hookSpecificOutput.additionalContext`) | yes | automatic on session start |
+| `codex` | injected (session-start stdout prepended) | yes | automatic on session start |
+| `cursor` | injected (session-start stdout prepended) | yes | automatic on session start |
+| `gemini-cli` | injected (session-start stdout prepended) | yes | automatic on session start |
+| `open-code` | injected (`experimental.chat.system.transform`) | yes | automatic on session start |
+| `antigravity-cli` | injected (`injectSteps[].ephemeralMessage`) | yes | automatic on session start |
+| `openclaw` | injected (`prependContext`) | yes | automatic on session start |
+| `omp` / `pi` | injected (`before_agent_start` message) | yes | automatic on session start |
+| `grok` | **ignored** — Grok's hook docs state SessionStart stdout is discarded | **no** | on demand: `memory_handoff_discover` then `memory_handoff_claim` |
+| `claude-desktop` | **unknown** — no lifecycle hook surface | **no** | on demand |
+| anything else | **unknown** | **no** | on demand |
+
+A claim is a mutation, so it is only safe for a harness that will actually show
+the result. Claiming for a harness that discards the render would consume a
+transfer nobody read and leave a lease no Run could acknowledge. Unknown
+harnesses therefore default to non-destructive: `GET /handoff` performs no
+Handoff read and no mutation for them, and the transfer stays `open`.
+
+**Automatic recovery** (`GET /handoff`, output-capable adapter that reported its
+Run):
+
+1. Resolve the workspace/project through the shared scope framework's no-create
+   lookup, failing closed on missing or partial explicit scope, honouring
+   active-project and multi-user isolation.
+2. Discover one eligible transfer. The optional `.engram.toml` `work_item` hint
+   narrows selection *inside* that resolved scope; cwd remains a local routing
+   hint. Neither is task identity and neither authorizes anything.
+3. Claim it through `engram_store`'s single writer and the same compare-and-set
+   path as `memory_handoff_claim`, binding the claim to the actual receiving
+   Run. The Attempt id is derived from `(handoff, revision, run)`, so a hook
+   that fires twice replays rather than races itself.
+4. Assemble the ContextPackage through the shared
+   `engram_store::continuation` module — the same call `memory_handoff_claim`
+   makes — under a strict byte budget, with no embedder and therefore no
+   synchronous model call.
+5. Render the envelope, claim metadata, package, and provenance.
+
+The whole sequence runs under one wall-clock timeout (`[continuity]`). The
+Handoff is left **claimed, never accepted**: only the receiving Run's first
+valid Checkpoint acknowledges it. A receiver that exits or loses its output
+before checkpointing leaves a live claim that returns to `open` at lease
+expiry, so lost work is recoverable rather than lost. A second SessionStart
+inside the *same* Run (Claude Code re-fires it on `/clear`) re-renders that
+Run's own live claim as a pure read.
+
+Concurrent automatic and on-demand claims meet at the same compare-and-set, so
+exactly one claimant wins; the loser injects nothing. Claim audit records name
+the adapter and its delivery path (`<agent>:<delivery>` for automatic,
+`<agent>:on-demand` for the tool surface) alongside actor, Run, WorkItem,
+Handoff revision, and outcome, and never record the Claim capability itself.
+
+Hook clients encode the same table: the six delivery-capable
+`hooks/*/session-start.sh` and `.ps1` bundles forward their session id and fetch
+`/handoff`; Grok's bundle captures only; and the generated OpenCode / OMP / Pi /
+OpenClaw integrations forward their session id from the harness SDK.
 
 ## Storage architecture
 
@@ -312,7 +386,9 @@ truncated or omitted, and the trace reports counts and reasons without source
 content.
 
 Handoff publish stores only the bounded brief and revisioned ContextRefs.
-Claim assembly uses that same assembler: explicit Handoff refs are combined
+Claim assembly lives in `engram_store::continuation` and is called by both the
+on-demand `memory_handoff_claim` tool and automatic SessionStart recovery, so
+the two continuation paths cannot drift. It uses that same assembler: explicit Handoff refs are combined
 with retrieval candidates under the same quotas but carry a selection priority
 compared before the retrieval score, so a publisher-selected source enters
 quota and budget ahead of any rank; unresolved or unauthorized refs become
@@ -331,12 +407,16 @@ identity, so reusing one Attempt id with a different budget is a conflicting
 request rather than a replay; Attempts recorded before that field existed
 still replay under the digest shape they were written with. What an identical
 retry replays is the claim transition — the same Claim id, lease and
-revision, with no second audit transition. The package is assembled again
+revision, with no second audit transition. The MCP path embeds the retrieval
+query when an embedder is configured; the hook path never does, because
+SessionStart must make no synchronous model call. That is the same BM25
+degradation `memory_query` takes without a provider and changes nothing about
+selection, budgeting, or trace semantics. The package is assembled again
 against current evidence rather than frozen with the Attempt: entries name
 exact revisions, so a snapshot taken at first claim could hand a retrying
 agent refs that have since been superseded or deleted. Rendering or assembling
 a package leaves the Handoff `claimed`; only the first valid receiving
-Checkpoint accepts it. If assembly fails after the claim is recorded, the
+Checkpoint accepts it — automatic session-start injection included. If assembly fails after the claim is recorded, the
 live lease remains visible and recoverable.
 
 The managed Agent Skills are a narrow prompt-packaging exception to the
@@ -510,6 +590,11 @@ sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
+
+[continuity]                       # automatic session-start recovery bounds
+session_start_context_budget = 8000    # ContextPackage budget, UTF-8 bytes
+session_start_timeout_ms = 750         # discover + claim + assemble + render
+session_start_lease_seconds = 900      # lease an automatic claim receives
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

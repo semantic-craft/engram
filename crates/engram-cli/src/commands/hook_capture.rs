@@ -21,6 +21,28 @@ pub fn extract_cwd(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Top-level session identifier under the spellings agent harnesses actually
+/// send: Claude Code `session_id`, Codex `sessionId`, OpenCode `sessionID`,
+/// Antigravity CLI `conversationId`. Mirrors the server-side extraction in
+/// `engram_hooks::payload`; the native `session-start` hook forwards the value
+/// on `GET /handoff` so an automatic claim binds to the real receiving Run.
+pub fn extract_session_id(payload: &serde_json::Value) -> Option<String> {
+    for key in [
+        "session_id",
+        "sessionId",
+        "sessionID",
+        "session",
+        "conversationId",
+    ] {
+        if let Some(value) = payload.get(key).and_then(|v| v.as_str())
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
 /// Percent-encode everything outside the RFC 3986 unreserved set
 /// (`A-Z a-z 0-9 - _ . ~`), byte-wise, so multibyte UTF-8 is encoded
 /// per byte. Parity with `engram_url_encode` in `hooks/_lib.sh`.

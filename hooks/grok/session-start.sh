@@ -1,8 +1,13 @@
 #!/bin/sh
-# Grok Build CLI SessionStart hook.
-# Grok ignores SessionStart stdout, so this hook captures the event only.
-# Do NOT fetch /handoff here: Grok discards SessionStart stdout, so the
-# read-only response would be wasted. It can discover the Handoff via MCP.
+# Grok Build CLI SessionStart hook. Capture only.
+#
+# Agent Adapter contract: Grok IGNORES SessionStart stdout ("For events like
+# SessionStart or PostToolUse, stdout is ignored"), so this adapter performs no
+# automatic Handoff read and no mutation — a claim nobody could read would
+# consume a transfer and leave a lease no Run can acknowledge. The Handoff stays
+# `open` for an explicit on-demand `memory_handoff_claim` (discover it first
+# with `memory_handoff_discover`). The server enforces the same rule from
+# `engram_core::adapter`, so deleting this comment does not change behaviour.
 _lib_dir="$(dirname "$0")"
 [ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
 . "$_lib_dir/_lib.sh"

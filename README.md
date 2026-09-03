@@ -43,7 +43,7 @@ source and license provenance are recorded in
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
-| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/engram.json`, Grok-specific hook bundle, native `--agent grok`). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via read-only MCP `memory_handoff_discover`. |
+| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/engram.json`, Grok-specific hook bundle, native `--agent grok`). Capture works; **no automatic continuation** — Grok ignores `SessionStart` stdout, so its adapter performs no automatic Handoff read or mutation. Recover on demand with `memory_handoff_discover` then `memory_handoff_claim`. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
@@ -54,10 +54,13 @@ LLM coding agents lose all context when a session ends. engram
 gives them a shared, persistent wiki: every prompt, tool call, and
 decision is captured automatically; when a session ends, the relevant
 pages get rewritten as a coherent narrative; when the next agent
-starts (Claude Code, Codex, OpenCode, …) it sees a handoff with
-  "where you left off" already prepended. That read is non-destructive: the
-  receiver explicitly claims the Handoff and acknowledges it with its first
-  durable WorkItem checkpoint.
+starts (Claude Code, Codex, OpenCode, …) it sees the continuation for
+  "where you left off" already prepended — **already claimed for that
+  session**, with a budgeted context package. The transfer stays `claimed`,
+  never accepted, until that session writes its first durable WorkItem
+  checkpoint; a session that dies first leaves a recoverable claim that
+  returns to `open` at lease expiry. Harnesses that discard session-start
+  output (Grok) get no automatic read or mutation and claim on demand.
 
 The wiki is plain markdown in a git repo - `grep`-able, openable in
 Obsidian, backed up with `rsync`. No vector database to babysit, no
@@ -121,12 +124,16 @@ priors are at the [bottom](#influences-and-prior-art).
 ## Use cases
 
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
-  classic. SessionStart hook in the next supported hook client prepends a
-  typed handoff with open questions, next steps, artifact evidence, and a session summary. Grok
-  captures lifecycle events but ignores SessionStart stdout, so ask it to call
+  classic. The SessionStart hook in the next supported hook client claims the
+  pending continuation for that session and prepends the envelope — open
+  questions, next steps, artifact evidence, session summary — plus the same
+  budgeted ContextPackage the on-demand `memory_handoff_claim` returns. The
+  agent uses that block directly and acknowledges it with its first
+  `memory_checkpoint_write`; `memory_context_read` resolves any reference to
+  exact full evidence. Grok captures lifecycle events but ignores SessionStart
+  stdout, so nothing is read or claimed for it automatically — ask it to call
   `memory_handoff_discover`, then claim the exact revision with a
-  `context_budget` before resuming. The claim returns the same ContextPackage
-  contract as `memory_query`; use `memory_context_read` for exact full evidence.
+  `context_budget` before resuming.
 - **"Pass the same task through a third agent."** A receiving agent
   publishes a *successor* handoff from the Checkpoint it just wrote, asserting
   the WorkItem and Checkpoint revisions it saw. The transfer it replaces
@@ -432,12 +439,17 @@ four-rung auth ladder.
 
 Day to day, you mostly do not think about engram. Lifecycle hooks
 capture prompts, tool calls, compaction checkpoints, and session
-boundaries. SessionStart hooks fetch pending handoffs before your first
-prompt in the next agent.
+boundaries. SessionStart hooks claim and inject the pending continuation
+before your first prompt in the next agent (for harnesses that deliver
+session-start output; the others recover on demand). See "Agent Adapters and
+session-start recovery" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
+the per-harness table.
 
 Useful entry points:
 
-- Ask "where did we leave off?" to continue from the pending handoff.
+- Ask "where did we leave off?" to continue from the injected continuation
+  (or, on a harness that ignores session-start output, from
+  `memory_handoff_discover`).
 - Ask "have we discussed X?" or "search memory for Y" to query the wiki.
 - Ask "catch me up" for a prose digest of recent project activity.
 - Run `engram bootstrap` once when adopting engram in an existing

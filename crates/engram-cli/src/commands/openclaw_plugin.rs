@@ -219,12 +219,14 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
+    const workItem = tomlKey(body, "work_item");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
     if (briefing) url.searchParams.set("briefing", briefing);
     if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+    if (workItem) url.searchParams.set("work_item", workItem);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -243,6 +245,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let dropSubagent: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
+  let workItem: string | undefined;
   const marker = findMarker(cwd);
   if (marker) {
     try {
@@ -253,6 +256,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
       dropSubagent = tomlKey(body, "drop_subagent_captures");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
+      workItem = tomlKey(body, "work_item");
     } catch (_e) {
     }
   }
@@ -267,6 +271,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
   if (briefing) url.searchParams.set("briefing", briefing);
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+  if (workItem) url.searchParams.set("work_item", workItem);
 }"#;
     format!(
         "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{body}",
@@ -432,6 +437,11 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (!currentCwd) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
+  // This harness delivers session-start output, so the server may claim the
+  // continuation. Forward the Run so the claim binds to the session that is
+  // actually starting and its first checkpoint can acknowledge it.
+  const runId = sessionID(event, ctx);
+  if (runId) url.searchParams.set("session_id", runId);
   applyMarkerParams(url, currentCwd);
   try {{
     const response = await fetch(url, {{
@@ -558,6 +568,10 @@ mod tests {
         ));
         assert!(plugin.contains("applyMarkerParams(url, currentCwd);"));
         assert!(plugin.contains("fetchHandoff"));
+        // Output-capable adapter: it forwards the Run so the server binds the
+        // automatic claim to the session that is actually starting.
+        assert!(plugin.contains("url.searchParams.set(\"session_id\", runId)"));
+        assert!(plugin.contains("tomlKey(body, \"work_item\")"));
         assert!(plugin.contains("prependContext: handoff"));
         assert!(plugin.contains("Bearer ${TOKEN}"));
         assert!(plugin.contains("tok"));

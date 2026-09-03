@@ -112,6 +112,8 @@ pub struct Config {
     pub decay: engram_store::DecayParams,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// `[continuity]` — strict bounds for automatic SessionStart recovery.
+    pub continuity: ContinuitySettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -347,6 +349,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: engram_store::DecayParams::default(),
             maintenance: MaintenanceSettings::default(),
+            continuity: ContinuitySettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: engram_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -499,6 +502,53 @@ impl Default for AutoImproveSettings {
             include_raw_fallback: false,
             proposal_actor: engram_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: engram_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
+        }
+    }
+}
+
+/// `[continuity]` bounds for automatic SessionStart recovery.
+///
+/// Automatic recovery runs on the agent's critical path, so all three limits
+/// are strict and operator-tunable. Values are clamped when converted into the
+/// hook router's [`engram_hooks::SessionStartContinuity`] so a mistyped config
+/// cannot make session start unbounded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuitySettings {
+    /// ContextPackage budget for the SessionStart continuation, in
+    /// selected-content UTF-8 bytes (the `memory_query` unit).
+    pub session_start_context_budget: usize,
+    /// Wall-clock cap in milliseconds for discover + claim + assemble + render.
+    pub session_start_timeout_ms: u64,
+    /// Lease granted to an automatic SessionStart claim, in seconds.
+    pub session_start_lease_seconds: u64,
+}
+
+impl Default for ContinuitySettings {
+    fn default() -> Self {
+        Self {
+            session_start_context_budget: engram_hooks::DEFAULT_SESSION_START_CONTEXT_BUDGET,
+            session_start_timeout_ms: engram_hooks::DEFAULT_SESSION_START_TIMEOUT_MS,
+            session_start_lease_seconds: engram_hooks::DEFAULT_SESSION_START_LEASE_SECONDS,
+        }
+    }
+}
+
+impl ContinuitySettings {
+    /// Clamped, typed view used by the hook router.
+    ///
+    /// The budget floor keeps a package meaningful, the ceiling stops one
+    /// config line from injecting a novel into every session start, and the
+    /// timeout stays under the client-side `GET /handoff` budget so the server
+    /// gives up before the hook does.
+    #[must_use]
+    pub fn resolved(&self) -> engram_hooks::SessionStartContinuity {
+        engram_hooks::SessionStartContinuity {
+            context_budget: self.session_start_context_budget.clamp(500, 100_000),
+            timeout: std::time::Duration::from_millis(
+                self.session_start_timeout_ms.clamp(50, 10_000),
+            ),
+            lease_seconds: self.session_start_lease_seconds.clamp(1, 3_600),
         }
     }
 }

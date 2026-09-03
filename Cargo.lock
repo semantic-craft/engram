@@ -709,6 +709,7 @@ dependencies = [
  "git2",
  "jiff",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_urlencoded",

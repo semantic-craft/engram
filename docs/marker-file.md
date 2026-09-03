@@ -63,15 +63,26 @@ project_strategy = "repo-root"
 # server. Off by default (absent / "false").
 drop_subagent_captures = "true"
 
+# Optional. WorkItem selection hint for a checkout pinned to ONE task (a
+# worktree dedicated to an issue, say). Automatic session-start recovery
+# then only offers a continuation for that exact WorkItem instead of the
+# project's newest one. It is a hint, not an authorization: the server
+# narrows selection inside the workspace/project it already resolved, so a
+# WorkItem living in another scope simply matches nothing. Omit it and the
+# newest eligible transfer wins as usual.
+work_item = "0195f1a1-...-...."
+
 # Optional. Inject a compiled project brief at session start (and after a
 # context clear — Claude Code re-fires SessionStart on /clear): the
-# session-start handoff fetch also returns this project's pinned /
+# session-start continuation fetch also returns this project's pinned /
 # `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
 # page titles, so the agent starts with the architecture context instead
 # of re-exploring the codebase. Appended AFTER any pending handoff, and
-# unlike the handoff it is not consumed — it is recomposed every opted-in
-# session start. Only agents whose session-start hook injects stdout as
-# context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
+# unlike the continuation it is never claimed — it is recomposed every
+# opted-in session start. Only Agent Adapters whose harness delivers
+# session-start output benefit (Claude Code, Codex, OpenCode, …); see
+# "Agent Adapters and session-start recovery" in docs/ARCHITECTURE.md.
+# Off by default: the
 # brief costs tokens on EVERY session start, so opt in per repo.
 [briefing]
 inject_on_session_start = "true"
@@ -105,6 +116,11 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 (`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
+
+`work_item` must be a WorkItem UUID as returned by `memory_handoff_begin`,
+`memory_handoff_discover`, or an injected continuation block. An
+unparseable value is ignored with a server-side warning; a well-formed one
+that names work outside the resolved scope selects nothing.
 
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's

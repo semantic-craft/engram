@@ -20,6 +20,28 @@ function Get-EngramCwd {
     return $null
 }
 
+# The harness's own session identifier, under the spellings agent harnesses
+# actually send. Mirrors `engram_extract_session_id` in `hooks/_lib.sh` and the
+# server-side extraction in `engram_hooks::payload`. Forwarded on /handoff so an
+# automatic Handoff claim binds to the Run that is actually starting.
+function Get-EngramSessionId {
+    param([string] $Payload)
+    if (-not $Payload) { return $null }
+    try {
+        $Parsed = $Payload | ConvertFrom-Json -ErrorAction Stop
+        foreach ($Name in @("session_id", "sessionId", "sessionID", "session", "conversationId")) {
+            $Value = $Parsed.$Name
+            if ($Value -is [string] -and $Value.Trim().Length -gt 0) { return $Value }
+        }
+    } catch {
+    }
+    foreach ($Name in @("session_id", "sessionId", "sessionID", "session", "conversationId")) {
+        $m = [regex]::Match($Payload, "`"$Name`"\s*:\s*`"([^`"]*)`"")
+        if ($m.Success -and $m.Groups[1].Value.Trim().Length -gt 0) { return $m.Groups[1].Value }
+    }
+    return $null
+}
+
 function Get-EngramMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -72,12 +94,14 @@ function Get-EngramMarkerQuery {
     $proj = $null
     $strategy = $null
     $dropSubagent = $null
+    $workItem = $null
     $marker = Get-EngramMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-EngramTomlKey -File $marker -Key "workspace"
         $proj = Get-EngramTomlKey -File $marker -Key "project"
         $strategy = Get-EngramTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-EngramTomlKey -File $marker -Key "drop_subagent_captures"
+        $workItem = Get-EngramTomlKey -File $marker -Key "work_item"
     }
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
@@ -96,6 +120,9 @@ function Get-EngramMarkerQuery {
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
+    # Optional WorkItem selection hint for a checkout pinned to one task. It
+    # narrows discovery inside the already-resolved scope and authorizes nothing.
+    if ($workItem) { $qs += "&work_item=$([uri]::EscapeDataString($workItem))" }
     return $qs
 }
 
@@ -119,6 +146,10 @@ function Read-EngramStdin {
 }
 
 function Invoke-EngramHook {
+    # `-FetchHandoff` is set only for harnesses the shared Agent Adapter
+    # contract classifies as delivering SessionStart output. A harness that
+    # discards it (Grok) omits the switch and performs no Handoff read or
+    # mutation; the server enforces the same rule from `engram_core::adapter`.
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
         [Parameter(Mandatory = $true)] [string] $Agent,
@@ -150,10 +181,15 @@ function Invoke-EngramHook {
 
     if ($FetchHandoff) {
         try {
+            # Forward the Run this session is starting so the server can bind
+            # the automatic Handoff claim to the actual receiving Run.
+            $SessionId = Get-EngramSessionId -Payload $Payload
+            $RunQS = ""
+            if ($SessionId) { $RunQS = "&session_id=$([uri]::EscapeDataString($SessionId))" }
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$RunQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
                 if ($AntigravityPreInvocationOutput) {

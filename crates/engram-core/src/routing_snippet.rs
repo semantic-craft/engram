@@ -62,7 +62,10 @@ Memory retrieval uses caller-budgeted context packages with stable,
 revisioned references; load the retrieval skill for the exact package and
 full-evidence workflow. Handoffs chain: a receiver publishes a successor
 from the latest Checkpoint, earlier transfers stay readable history, and a
-finished WorkItem takes follow-up work as a new related WorkItem.
+finished WorkItem takes follow-up work as a new related WorkItem. A
+session-start block headed "continuation CLAIMED" already holds this Run's
+claim and its context: use it directly, never re-claim it, and acknowledge
+it with your first checkpoint using the ids it names.
 
 ### When you write a project rule, write it here
 
@@ -133,7 +136,7 @@ mod tests {
             );
         }
         assert!(
-            SNIPPET_BODY.lines().count() <= 73,
+            SNIPPET_BODY.lines().count() <= 76,
             "the always-loaded block must remain concise"
         );
     }

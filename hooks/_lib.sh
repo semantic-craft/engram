@@ -66,6 +66,38 @@ engram_extract_cwd() {
     engram_json_unescape_path "$raw"
 }
 
+# Extract the harness's own session identifier from a JSON payload on stdin or
+# in $1. Mirrors the server-side extraction in `engram_hooks::payload`: Claude
+# Code sends `session_id`, Codex `sessionId`, OpenCode `sessionID`, Antigravity
+# CLI `conversationId`. Same intentionally-tiny sed approach as
+# `engram_extract_cwd` — POSIX shell, no jq.
+#
+# `session-start.sh` forwards the value on `GET /handoff` so the server can bind
+# the automatic Handoff claim to the Run that is actually starting; without it
+# the server renders read-only and the agent must claim through MCP.
+engram_extract_session_id() {
+    payload="${1:-$(cat)}"
+    for _k in session_id sessionId sessionID session conversationId; do
+        rest=${payload#*\"$_k\"}
+        [ "$rest" = "$payload" ] && continue
+        raw=$(printf '%s' "$rest" \
+            | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+            | head -n 1)
+        if [ -n "$raw" ]; then
+            printf '%s' "$raw"
+            return 0
+        fi
+    done
+}
+
+# Build the `&session_id=...` suffix for "$1" (a raw payload). Empty when the
+# harness sends no recognizable session identifier.
+engram_session_qs() {
+    sid=$(engram_extract_session_id "$1")
+    [ -z "$sid" ] && return 0
+    printf '&session_id=%s' "$(engram_url_encode "$sid")"
+}
+
 # URL-encode the minimal set of characters that have meaning in a query
 # string. Sufficient for the schema's value regex (`^[a-z0-9][a-z0-9._-]*$`)
 # plus a defensive pass for anything a hand-edited marker might contain.
@@ -131,12 +163,14 @@ engram_marker_qs() {
     pr=""
     st=""
     ds=""
+    wi=""
     marker=$(engram_find_marker "$cwd")
     if [ -n "$marker" ]; then
         ws=$(engram_parse_toml_key "$marker" workspace)
         pr=$(engram_parse_toml_key "$marker" project)
         st=$(engram_parse_toml_key "$marker" project_strategy)
         ds=$(engram_parse_toml_key "$marker" drop_subagent_captures)
+        wi=$(engram_parse_toml_key "$marker" work_item)
     fi
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
@@ -161,6 +195,10 @@ engram_marker_qs() {
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(engram_url_encode "$ds")"
+    # Optional WorkItem hint for a checkout pinned to one task. A selection
+    # hint only: the server narrows discovery inside the already-resolved
+    # scope and the hint authorizes nothing.
+    [ -n "$wi" ] && qs="${qs}&work_item=$(engram_url_encode "$wi")"
     printf '%s' "$qs"
 }
 

@@ -7,6 +7,7 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod adapter;
 pub mod artifact;
 pub mod context;
 pub mod error;
@@ -40,6 +41,9 @@ pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
 pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
+pub use adapter::{
+    AdapterContract, AdapterPeer, AdapterRequest, SessionStartDelivery, on_demand_delivery_path,
+};
 pub use artifact::{
     ArtifactInput, ArtifactKind, ArtifactRef, DeliveryFacts, NormalizedArtifact,
     VerificationEvidence, VerificationEvidenceInput,

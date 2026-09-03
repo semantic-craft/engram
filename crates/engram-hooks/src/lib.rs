@@ -28,7 +28,9 @@ pub mod synth;
 pub use engram_core::{SanitizeConfig, Sanitized, Sanitizer};
 pub use payload::{HookEnvelope, HookEvent};
 pub use router::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, ProjectCache,
-    ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_PROJECT_CACHE_MAX_ENTRIES,
+    DEFAULT_SESSION_START_CONTEXT_BUDGET, DEFAULT_SESSION_START_LEASE_SECONDS,
+    DEFAULT_SESSION_START_TIMEOUT_MS, HookState, ProjectCache, ProjectCacheStore,
+    SessionStartContinuity, SubagentSessionSet, SubagentSessions, hook_router,
 };
 pub use synth::synthesize_session_page;

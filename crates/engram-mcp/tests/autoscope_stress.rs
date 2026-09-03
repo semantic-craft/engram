@@ -158,6 +158,7 @@ impl Harness {
             consolidate_on_session_end: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,
+            continuity: engram_hooks::SessionStartContinuity::default(),
         });
 
         let router = Router::new()
