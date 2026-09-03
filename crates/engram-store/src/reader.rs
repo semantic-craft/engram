@@ -392,6 +392,57 @@ pub struct StatusCounts {
     pub observations: u64,
 }
 
+/// Per-state WorkItem counts for one scope. Bounded: one field per
+/// [`engram_core::WorkItemState`], never a list of WorkItems.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkItemStateCounts {
+    /// WorkItems still being worked.
+    pub active: u64,
+    /// WorkItems a checkpoint marked blocked.
+    pub blocked: u64,
+    /// WorkItems a checkpoint completed.
+    pub completed: u64,
+    /// WorkItems a checkpoint abandoned.
+    pub abandoned: u64,
+}
+
+/// Per-state Handoff counts for one scope. Bounded: one field per
+/// [`engram_core::HandoffState`], never a list of transfers.
+///
+/// `acknowledged` counts *accepted transfers* — a receiver persisted its first
+/// checkpoint. It says nothing about whether the underlying work finished;
+/// that is [`WorkItemStateCounts::completed`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HandoffStateCounts {
+    /// Pending work nobody holds.
+    pub open: u64,
+    /// Actively claimed under a live (or lapsed-but-not-yet-recovered) lease.
+    pub claimed: u64,
+    /// Accepted transfers (receiver checkpointed).
+    pub acknowledged: u64,
+    /// Lapsed offers.
+    pub expired: u64,
+    /// Source-owner discards.
+    pub cancelled: u64,
+    /// Unclaimed predecessors replaced by a successor.
+    pub superseded: u64,
+}
+
+/// One `audit_log` row returned by [`ReaderPool::audit_log_entries`].
+///
+/// `detail` is the stored JSON object as-is. Continuity writers already omit
+/// claim ids from that object.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditLogEntry {
+    /// When the row was written, ISO-8601.
+    pub at: String,
+    /// Operation name (`handoff_publish`, `handoff_claim`, …).
+    pub op: String,
+    /// Stored detail JSON, parsed so callers see the object rather than a
+    /// double-encoded string.
+    pub detail: serde_json::Value,
+}
+
 /// One likely cross-project contamination finding from
 /// [`ReaderPool::audit_contamination`]. Advisory only — it flags STRUCTURAL
 /// mislandings (an entity whose identity disagrees with the bucket it landed
@@ -575,7 +626,7 @@ pub struct ActivityWindow {
 /// Snapshot used by `memory_briefing` and the LLM-driven
 /// `memory_explore`. Pure SQL aggregation; no LLM, no schema reads
 /// outside the existing `pages` / `sessions` / `observations` /
-/// `handoffs` tables.
+/// `handoffs` / `work_items` / `handoff_claims` tables.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BriefingSnapshot {
     /// Lifetime totals — same shape `memory_status` returns today.
@@ -591,6 +642,13 @@ pub struct BriefingSnapshot {
     /// Number of handoffs a receiver could still claim: open transfers plus
     /// claimed ones whose live lease has expired.
     pub pending_handoff_count: u64,
+    /// WorkItems in this scope, grouped by [`engram_core::WorkItemState`].
+    pub work_items: WorkItemStateCounts,
+    /// Handoffs in this scope, grouped by [`engram_core::HandoffState`].
+    pub handoffs: HandoffStateCounts,
+    /// Live claims whose `lease_expires_at` has already elapsed. These
+    /// recover at the next continuity transition; no sweeper collects them.
+    pub lapsed_awaiting_recovery: u64,
     /// All pages currently under `_rules/` — small, surfaced verbatim
     /// because they're the highest-signal type of memory.
     pub rules: Vec<BriefingPage>,
@@ -2939,6 +2997,8 @@ impl ReaderPool {
                 .map(|ts| ts.to_string());
 
             let pending_handoff_count = count_claimable_handoffs(conn, HandoffCountScope::Global)?;
+            let (work_items, handoffs, lapsed_awaiting_recovery) =
+                continuity_state_counts(conn, HandoffCountScope::Global)?;
 
             // Rules: any `is_latest = 1` page under `_rules/`.
             // Routed there automatically by the consolidator when
@@ -3008,6 +3068,9 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                work_items,
+                handoffs,
+                lapsed_awaiting_recovery,
                 rules,
                 slots,
                 recent_pages,
@@ -3082,6 +3145,8 @@ impl ReaderPool {
                 conn,
                 HandoffCountScope::Project(workspace_id, project_id),
             )?;
+            let (work_items, handoffs, lapsed_awaiting_recovery) =
+                continuity_state_counts(conn, HandoffCountScope::Project(workspace_id, project_id))?;
 
             let mut rules_stmt = conn.prepare_cached(
                 "SELECT path, title, \
@@ -3150,6 +3215,9 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                work_items,
+                handoffs,
+                lapsed_awaiting_recovery,
                 rules,
                 slots,
                 recent_pages,
@@ -3398,6 +3466,8 @@ impl ReaderPool {
 
             let pending_handoff_count =
                 count_claimable_handoffs(conn, HandoffCountScope::Workspace(workspace_id))?;
+            let (work_items, handoffs, lapsed_awaiting_recovery) =
+                continuity_state_counts(conn, HandoffCountScope::Workspace(workspace_id))?;
 
             let mut rules_stmt = conn.prepare_cached(
                 "SELECT path, title, \
@@ -3467,12 +3537,74 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                work_items,
+                handoffs,
+                lapsed_awaiting_recovery,
                 rules,
                 slots,
                 recent_pages,
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
             })
+        })
+        .await
+    }
+
+    /// Return `audit_log` rows for one existing scope, newest first.
+    ///
+    /// Requires `work_item_id` or `handoff_id` (or both). Rows are filtered by
+    /// the stored detail JSON plus `workspace_id`/`project_id` so a sibling
+    /// project's identifiers cannot leak. `limit` is applied as given; callers
+    /// cap it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn audit_log_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        work_item_id: Option<WorkItemId>,
+        handoff_id: Option<HandoffId>,
+        limit: usize,
+    ) -> StoreResult<Vec<AuditLogEntry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let work_item = work_item_id.map(|id| id.to_string());
+        let handoff = handoff_id.map(|id| id.to_string());
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT at, op, detail FROM audit_log \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND ( \
+                        (?3 IS NOT NULL AND json_extract(detail, '$.work_item_id') = ?3) \
+                     OR (?4 IS NOT NULL AND json_extract(detail, '$.handoff_id') = ?4) \
+                   ) \
+                 ORDER BY at DESC, id DESC \
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    work_item,
+                    handoff,
+                    limit
+                ],
+                |row| {
+                    let at_us: i64 = row.get(0)?;
+                    let op: String = row.get(1)?;
+                    let detail_text: String = row.get(2)?;
+                    Ok((at_us, op, detail_text))
+                },
+            )?;
+            let mut entries = Vec::new();
+            for row in rows {
+                let (at_us, op, detail_text) = row?;
+                let at = iso_timestamp(at_us).unwrap_or_default();
+                let detail = serde_json::from_str(&detail_text)
+                    .unwrap_or_else(|_| serde_json::Value::String(detail_text));
+                entries.push(AuditLogEntry { at, op, detail });
+            }
+            Ok(entries)
         })
         .await
     }
@@ -6116,6 +6248,155 @@ fn count_claimable_handoffs(conn: &Connection, scope: HandoffCountScope) -> Stor
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
+/// Scope-wide WorkItem/Handoff state counts plus lapsed live claims.
+///
+/// Salvaged from the abandoned `wip-46-reader` GROUP BY queries. Lapsed
+/// leases are *reported*, not collected — recovery happens at transition
+/// time in `claim_handoff`.
+fn continuity_state_counts(
+    conn: &Connection,
+    scope: HandoffCountScope,
+) -> StoreResult<(WorkItemStateCounts, HandoffStateCounts, u64)> {
+    let now_us = Timestamp::now().as_microsecond();
+    let mut work_items = WorkItemStateCounts::default();
+    let mut handoffs = HandoffStateCounts::default();
+
+    let (work_sql, handoff_sql, lapsed_sql) = match scope {
+        HandoffCountScope::Global => (
+            "SELECT state, COUNT(*) FROM work_items GROUP BY state",
+            "SELECT state, COUNT(*) FROM handoffs GROUP BY state",
+            "SELECT COUNT(*) FROM handoff_claims \
+             WHERE state = 'live' AND lease_expires_at <= ?1",
+        ),
+        HandoffCountScope::Workspace(_) => (
+            "SELECT state, COUNT(*) FROM work_items \
+             WHERE workspace_id = ?1 GROUP BY state",
+            "SELECT state, COUNT(*) FROM handoffs \
+             WHERE workspace_id = ?1 GROUP BY state",
+            "SELECT COUNT(*) FROM handoff_claims \
+             WHERE workspace_id = ?1 \
+               AND state = 'live' AND lease_expires_at <= ?2",
+        ),
+        HandoffCountScope::Project(_, _) => (
+            "SELECT state, COUNT(*) FROM work_items \
+             WHERE workspace_id = ?1 AND project_id = ?2 GROUP BY state",
+            "SELECT state, COUNT(*) FROM handoffs \
+             WHERE workspace_id = ?1 AND project_id = ?2 GROUP BY state",
+            "SELECT COUNT(*) FROM handoff_claims \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND state = 'live' AND lease_expires_at <= ?3",
+        ),
+    };
+
+    match scope {
+        HandoffCountScope::Global => {
+            fill_work_item_counts(conn, work_sql, (), &mut work_items)?;
+            fill_handoff_counts(conn, handoff_sql, (), &mut handoffs)?;
+        }
+        HandoffCountScope::Workspace(workspace_id) => {
+            fill_work_item_counts(
+                conn,
+                work_sql,
+                params![workspace_id.as_bytes()],
+                &mut work_items,
+            )?;
+            fill_handoff_counts(
+                conn,
+                handoff_sql,
+                params![workspace_id.as_bytes()],
+                &mut handoffs,
+            )?;
+        }
+        HandoffCountScope::Project(workspace_id, project_id) => {
+            fill_work_item_counts(
+                conn,
+                work_sql,
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                &mut work_items,
+            )?;
+            fill_handoff_counts(
+                conn,
+                handoff_sql,
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                &mut handoffs,
+            )?;
+        }
+    }
+
+    let lapsed: Option<i64> = match scope {
+        HandoffCountScope::Global => conn
+            .query_row(lapsed_sql, params![now_us], |row| row.get(0))
+            .optional()?,
+        HandoffCountScope::Workspace(workspace_id) => conn
+            .query_row(
+                lapsed_sql,
+                params![workspace_id.as_bytes(), now_us],
+                |row| row.get(0),
+            )
+            .optional()?,
+        HandoffCountScope::Project(workspace_id, project_id) => conn
+            .query_row(
+                lapsed_sql,
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
+                |row| row.get(0),
+            )
+            .optional()?,
+    };
+    let lapsed_awaiting_recovery = u64::try_from(lapsed.unwrap_or(0).max(0)).unwrap_or(0);
+    Ok((work_items, handoffs, lapsed_awaiting_recovery))
+}
+
+fn fill_work_item_counts(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    counts: &mut WorkItemStateCounts,
+) -> StoreResult<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let n = row_count(row, 1)?;
+        match state.as_str() {
+            "active" => counts.active = n,
+            "blocked" => counts.blocked = n,
+            "completed" => counts.completed = n,
+            "abandoned" => counts.abandoned = n,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn fill_handoff_counts(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    counts: &mut HandoffStateCounts,
+) -> StoreResult<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let n = row_count(row, 1)?;
+        match state.as_str() {
+            "open" => counts.open = n,
+            "claimed" => counts.claimed = n,
+            "acknowledged" => counts.acknowledged = n,
+            "expired" => counts.expired = n,
+            "cancelled" => counts.cancelled = n,
+            "superseded" => counts.superseded = n,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn row_count(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let n: i64 = row.get(idx)?;
+    Ok(u64::try_from(n.max(0)).unwrap_or(0))
+}
+
 /// Pick the transfer a project's next receiver should be offered.
 ///
 /// Shared by [`ReaderPool::latest_claimable_handoff`] and
@@ -7096,7 +7377,8 @@ mod tests {
     use crate::Store;
 
     use engram_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, ProjectId, SessionId, WorkspaceId,
+        AgentKind, AttemptId, CheckpointWrite, Handoff, HandoffClaim, HandoffId, HandoffState,
+        NewHandoff, ProjectId, SessionId, WorkItemState, WorkspaceId,
     };
 
     /// Build an open handoff for the pure-selection tests. `manual` toggles
@@ -7380,6 +7662,161 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(handoff.summary, "right project");
+    }
+
+    fn test_handoff(ws: WorkspaceId, proj: ProjectId, summary: &str) -> NewHandoff {
+        NewHandoff {
+            work_item_id: None,
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            source_run_id: SessionId::new(),
+            from_agent: AgentKind::ClaudeCode,
+            source_actor: "test".into(),
+            to_agent: None,
+            cwd: None,
+            objective: summary.into(),
+            acceptance_criteria: vec![],
+            summary: summary.into(),
+            brief: String::new(),
+            context_refs: vec![],
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            artifacts: vec![],
+            relationships: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn briefing_counts_work_items_and_handoffs_by_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        // Open transfer on an active WorkItem.
+        store
+            .writer
+            .publish_handoff(test_handoff(ws, proj, "open"))
+            .await
+            .unwrap();
+
+        // Claimed transfer whose live lease has already elapsed.
+        let claimed = store
+            .writer
+            .publish_handoff(test_handoff(ws, proj, "claimed-lapsed"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .claim_handoff(HandoffClaim {
+                handoff_id: claimed.handoff_id,
+                workspace_id: ws,
+                project_id: proj,
+                expected_revision: claimed.handoff_revision,
+                run_id: SessionId::new(),
+                attempt_id: AttemptId::new(),
+                actor_key: "receiver".into(),
+                lease_seconds: 30,
+                context_options: serde_json::Value::Null,
+                delivery_path: "test:on-demand".into(),
+            })
+            .await
+            .unwrap();
+        let expired = rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute(
+                "UPDATE handoff_claims SET lease_expires_at = 0 WHERE state = 'live'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(expired, 1);
+
+        // Accepted transfer on a completed WorkItem.
+        let accepted = store
+            .writer
+            .publish_handoff(test_handoff(ws, proj, "accepted"))
+            .await
+            .unwrap();
+        let receiver = SessionId::new();
+        let claim = store
+            .writer
+            .claim_handoff(HandoffClaim {
+                handoff_id: accepted.handoff_id,
+                workspace_id: ws,
+                project_id: proj,
+                expected_revision: accepted.handoff_revision,
+                run_id: receiver,
+                attempt_id: AttemptId::new(),
+                actor_key: "receiver".into(),
+                lease_seconds: 60,
+                context_options: serde_json::Value::Null,
+                delivery_path: "test:on-demand".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .write_checkpoint(CheckpointWrite {
+                work_item_id: accepted.work_item_id,
+                workspace_id: ws,
+                project_id: proj,
+                run_id: receiver,
+                expected_work_item_revision: accepted.work_item_revision,
+                handoff_id: Some(accepted.handoff_id),
+                claim_id: Some(claim.claim_id),
+                expected_handoff_revision: Some(claim.revision),
+                summary: "done".into(),
+                work_item_state: WorkItemState::Completed,
+                acceptance_criteria: vec![],
+                actor_key: "receiver".into(),
+                attempt_id: AttemptId::new(),
+                artifacts: vec![],
+                relationships: vec![],
+                parent_result: None,
+            })
+            .await
+            .unwrap();
+
+        // Successor supersedes the unclaimed predecessor; both stay countable.
+        // Continuations must come from the current owner Run.
+        let owner_run = SessionId::new();
+        let mut first_offer = test_handoff(ws, proj, "to-supersede");
+        first_offer.source_run_id = owner_run;
+        let first = store.writer.publish_handoff(first_offer).await.unwrap();
+        let mut successor = test_handoff(ws, proj, "successor");
+        successor.work_item_id = Some(first.work_item_id);
+        successor.expected_work_item_revision = Some(first.work_item_revision);
+        successor.source_run_id = owner_run;
+        store.writer.publish_handoff(successor).await.unwrap();
+
+        let snap = store
+            .reader
+            .briefing_for_project(ws, proj, 5)
+            .await
+            .unwrap();
+        assert_eq!(snap.work_items.active, 3);
+        assert_eq!(snap.work_items.blocked, 0);
+        assert_eq!(snap.work_items.completed, 1);
+        assert_eq!(snap.work_items.abandoned, 0);
+        assert_eq!(snap.handoffs.open, 2);
+        assert_eq!(snap.handoffs.claimed, 1);
+        assert_eq!(snap.handoffs.acknowledged, 1);
+        assert_eq!(snap.handoffs.expired, 0);
+        assert_eq!(snap.handoffs.cancelled, 0);
+        assert_eq!(snap.handoffs.superseded, 1);
+        assert_eq!(snap.lapsed_awaiting_recovery, 1);
     }
 
     /// A stored `repo_path` equal to the operator's `$HOME` must never be

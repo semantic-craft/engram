@@ -8,6 +8,7 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/audit`          — bounded `audit_log` rows for one WorkItem or Handoff.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -55,7 +56,8 @@ use engram_consolidate::{
 };
 use engram_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    ObservationKind, PagePath, ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
+    HandoffId, ObservationKind, PagePath, ProjectId, Sanitizer, SessionId, Tier, WorkItemId,
+    WorkspaceId,
 };
 use engram_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use engram_store::{
@@ -525,6 +527,7 @@ fn sha256_to_hex(bytes: &[u8; 32]) -> String {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/audit`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -590,6 +593,7 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/audit", get(handle_audit_log))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -844,6 +848,98 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// audit
+// ---------------------------------------------------------------------
+
+const AUDIT_LIMIT_DEFAULT: usize = 50;
+const AUDIT_LIMIT_MAX: usize = 200;
+
+/// Query string for `GET /admin/audit`.
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    /// Workspace name. Must be provided together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project name. Must be provided together with `workspace`.
+    #[serde(default)]
+    project: Option<String>,
+    /// WorkItem whose continuity transitions to return.
+    #[serde(default)]
+    work_item_id: Option<String>,
+    /// Handoff whose continuity transitions to return.
+    #[serde(default)]
+    handoff_id: Option<String>,
+    /// Max rows. Default 50, capped at 200.
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    AUDIT_LIMIT_DEFAULT
+}
+
+async fn handle_audit_log(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<AuditQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (workspace, project) = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (Some(workspace), Some(project)) => (workspace.to_string(), project.to_string()),
+        (None, None) | (Some(_), None) | (None, Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            ));
+        }
+    };
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &workspace, &project).await?;
+
+    let work_item_id = match trimmed_opt(query.work_item_id.as_deref()) {
+        Some(raw) => Some(raw.parse::<WorkItemId>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid work_item_id: {e}") })),
+            )
+        })?),
+        None => None,
+    };
+    let handoff_id = match trimmed_opt(query.handoff_id.as_deref()) {
+        Some(raw) => Some(raw.parse::<HandoffId>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid handoff_id: {e}") })),
+            )
+        })?),
+        None => None,
+    };
+    if work_item_id.is_none() && handoff_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "work_item_id or handoff_id is required"
+            })),
+        ));
+    }
+
+    let limit = query.limit.clamp(1, AUDIT_LIMIT_MAX);
+    match state
+        .reader
+        .audit_log_entries(ws, proj, work_item_id, handoff_id, limit)
+        .await
+    {
+        Ok(entries) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "entries": entries })),
+        )),
+        Err(e) => Err(internal_err(e.to_string())),
     }
 }
 
@@ -6020,7 +6116,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
-    use engram_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use engram_core::{AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind};
     use engram_llm::{ChatRequest, ChatResponse, LlmResult};
     use engram_store::Store;
 
@@ -7755,6 +7851,11 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/audit?workspace=default&project=scratch&work_item_id=00000000-0000-0000-0000-000000000000",
+                serde_json::Value::Null,
+            ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
@@ -8000,6 +8101,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_audit_auth_is_root_only_in_multiuser_mode() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let uri = "/admin/audit?workspace=default&project=scratch&work_item_id=00000000-0000-0000-0000-000000000000";
+        let cases = [
+            (Some("root-token"), StatusCode::NOT_FOUND),
+            (Some("db-user-token"), StatusCode::FORBIDDEN),
+            (None, StatusCode::UNAUTHORIZED),
+        ];
+        for (token, expected) in cases {
+            let mut builder = Request::builder().uri(uri);
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            let resp = router
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                expected,
+                "token={token:?} must yield {expected}"
+            );
+        }
+    }
+
+    fn audit_test_handoff(ws: WorkspaceId, proj: ProjectId, summary: &str) -> NewHandoff {
+        NewHandoff {
+            work_item_id: None,
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            source_run_id: SessionId::new(),
+            from_agent: AgentKind::ClaudeCode,
+            source_actor: "test".into(),
+            to_agent: None,
+            cwd: None,
+            objective: summary.into(),
+            acceptance_criteria: vec![],
+            summary: summary.into(),
+            brief: String::new(),
+            context_refs: vec![],
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            artifacts: vec![],
+            relationships: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_audit_does_not_return_sibling_project_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let alpha = store
+            .writer
+            .get_or_create_project(ws, "alpha", None)
+            .await
+            .unwrap();
+        let beta = store
+            .writer
+            .get_or_create_project(ws, "beta", None)
+            .await
+            .unwrap();
+        let alpha_pub = store
+            .writer
+            .publish_handoff(audit_test_handoff(ws, alpha, "alpha"))
+            .await
+            .unwrap();
+        let beta_pub = store
+            .writer
+            .publish_handoff(audit_test_handoff(ws, beta, "beta"))
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let partial = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/audit?workspace=default&work_item_id={}",
+                        beta_pub.work_item_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
+
+        let missing = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/audit?workspace=missing&project=nope&work_item_id={}",
+                        alpha_pub.work_item_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let leak = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/audit?workspace=default&project=alpha&work_item_id={}",
+                        beta_pub.work_item_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(leak.status(), StatusCode::OK);
+        let leak_body = to_bytes(leak.into_body(), usize::MAX).await.unwrap();
+        let leak_json: serde_json::Value = serde_json::from_slice(&leak_body).unwrap();
+        assert_eq!(
+            leak_json["entries"].as_array().map(Vec::len),
+            Some(0),
+            "a sibling project's work_item_id must not leak through this scope: {leak_json}"
+        );
+
+        let own = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/audit?workspace=default&project=alpha&work_item_id={}",
+                        alpha_pub.work_item_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(own.status(), StatusCode::OK);
+        let own_body = to_bytes(own.into_body(), usize::MAX).await.unwrap();
+        let own_json: serde_json::Value = serde_json::from_slice(&own_body).unwrap();
+        let entries = own_json["entries"].as_array().unwrap();
+        assert!(
+            !entries.is_empty(),
+            "alpha's own work item must have audit rows: {own_json}"
+        );
+        let alpha_id = alpha_pub.work_item_id.to_string();
+        let beta_id = beta_pub.work_item_id.to_string();
+        for entry in entries {
+            assert_eq!(
+                entry["detail"]["work_item_id"].as_str(),
+                Some(alpha_id.as_str())
+            );
+            assert_ne!(
+                entry["detail"]["work_item_id"].as_str(),
+                Some(beta_id.as_str())
+            );
+        }
     }
 
     #[tokio::test]
