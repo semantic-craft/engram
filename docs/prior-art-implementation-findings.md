@@ -79,8 +79,11 @@ session, opens a typed handoff, and commits the wiki. `PreCompact`
 checkpoints state, using the LLM consolidator if configured and deterministic
 synthesis otherwise.
 
-The explicit `memory_handoff_begin` / `memory_handoff_accept` model is a
-cleaner version of agentmemory's informal handoff behavior.
+The original explicit `memory_handoff_begin` / `memory_handoff_accept`
+model was a cleaner version of agentmemory's informal handoff behavior.
+That single-use accept contract has since been replaced: discovery is
+read-only, claim is compare-and-set, and acknowledgement is the
+receiver's first durable Checkpoint.
 
 ### Consolidation Model
 

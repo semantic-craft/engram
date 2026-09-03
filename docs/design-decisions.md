@@ -186,8 +186,8 @@ metadata (source Run, timestamp, provenance, dirty, local-path hint, git ref,
 content hash, tree hash) is stored per attachment so a later observer does not
 inherit the first writer's facts. Shared artifact identity has no project-level
 CASCADE; attachments follow the observing project's lifecycle. SessionStart
-pending-handoff markdown lists artifacts and relationships without copying claim
-ids. Both Handoff and Checkpoint responses expose ArtifactRefs and
+continuation markdown lists artifacts and relationships without copying claim
+ids or treating cwd as identity. Both Handoff and Checkpoint responses expose ArtifactRefs and
 relationships with stable identities and revisions.
 Changed, verified, committed, pushed, reviewed, merged, released, deployed,
 submitted, and approved facts are stored independently and never inferred from
@@ -231,7 +231,7 @@ remain preferred over auto SessionEnd Handoffs, then the most specific cwd, then
 the most recent. SQLite is the operational coordination source of truth behind
 the single writer actor; Markdown remains the durable knowledge source of truth.
 
-agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
+agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot. The retired single-use `memory_handoff_accept` contract is not current behaviour: a read never consumes a Handoff, and the automatic two-adapter SessionEnd → SessionStart journey continues one WorkItem.
 
 ### 9a. Why SessionStart claims instead of reading
 

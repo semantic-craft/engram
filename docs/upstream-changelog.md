@@ -554,10 +554,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-memory entries merge into a dedicated `ai-memory.json`, leaving any
   third-party `~/.grok/hooks/*.json` untouched. NOTE: Grok ignores hook stdout on
   `SessionStart`, so capture works but handoff injection does not. Grok's
-  `session-start` therefore skips the handoff fetch entirely — the fetch is
-  destructive (it marks the handoff accepted server-side) and Grok would discard
-  the result, silently losing the handoff; recover a prior session's handoff via
-  the MCP `memory_handoff_accept` tool instead. Adds `AgentKind::Grok` (`grok`
+  `session-start` therefore skips the handoff fetch entirely — the fetch was
+  then destructive (it marked the handoff accepted server-side) and Grok would discard
+  the result, silently losing the handoff; at the time, recover a prior session's
+  handoff via the then-current MCP `memory_handoff_accept` tool instead
+  (that accept tool was later removed; current recovery is
+  `memory_handoff_discover` then `memory_handoff_claim`). Adds `AgentKind::Grok` (`grok`
   wire tag), the `AgentKind::session_start_injects_handoff` gate, and migration
   `V20` extending the `sessions.agent_kind` CHECK so Grok sessions persist on
   upgraded servers (the antigravity/`V11` precedent).
@@ -568,7 +570,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not match hook activity. This prevents HTTP-remote shared servers from reading
   or writing another same-user project when the MCP transport session id differs
   from the hook session id ([#97]).
-- `memory_handoff_begin` and `memory_handoff_accept` now accept an optional
+- The then-current `memory_handoff_begin` and `memory_handoff_accept`
+  tools (accept was later removed) now accept an optional
   `workspace` argument alongside `project`, resolving through the same
   workspace+project path as `memory_write_page` (begin, create-if-missing) and
   `memory_handoff_cancel` (accept, find-only). They previously took `project`
@@ -1280,7 +1283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing behind Docker Hub secrets, and optionally publishes both AUR
   package bases when `AUR_SSH_PRIVATE_KEY` is configured.
 - `memory_write_page` MCP tool for explicit durable annotations, so agents can
-  write permanent wiki knowledge without abusing single-use handoffs.
+  write permanent wiki knowledge without abusing the then single-use handoff
+  baton (later replaced by claim and first-checkpoint acknowledgement).
 - `openai-oauth` LLM provider for ChatGPT/Codex accounts, including
   `ai-memory auth login|logout|status` device-flow commands and token storage
   in `<data_dir>/auth.json`.
@@ -1400,7 +1404,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gemini-cli`, `claude-desktop`, `openclaw`, `omp` / `pi`) instead of
   failing the `sessions.agent_kind` database CHECK for agents added after
   the initial schema.
-- `memory_handoff_begin` and `memory_handoff_accept` now resolve the active
+- The then-current `memory_handoff_begin` and `memory_handoff_accept`
+  tools (accept was later removed) now resolve the active
   project the same way the briefing/search tools do, so MCP handoffs land in
   the project currently reported by hooks instead of the server's baked
   default project.

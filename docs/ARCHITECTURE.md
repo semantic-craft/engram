@@ -212,6 +212,14 @@ valid Checkpoint acknowledges it. A receiver that exits or loses its output
 before checkpointing leaves a live claim that returns to `open` at lease
 expiry, so lost work is recoverable rather than lost.
 
+The closed automatic journey is one WorkItem across two output-capable
+adapters: SessionEnd publishes a successor for the active WorkItem; the next
+SessionStart (a different adapter, a different Run) claims it; the receiver's
+first Checkpoint acknowledges it; a further SessionEnd still continues that
+same WorkItem. Briefing counts and `GET /admin/audit` reconstruct the chain.
+cwd is a local-path hint, never identity. There is no `memory_handoff_accept`
+and no read-and-consume baton.
+
 Concurrent automatic and on-demand claims meet at the same compare-and-set, so
 exactly one claimant wins; the loser injects nothing. Claim audit records name
 the adapter and its delivery path (`<agent>:<delivery>` for automatic,

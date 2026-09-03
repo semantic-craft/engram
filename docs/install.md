@@ -321,8 +321,8 @@ Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
 `memory_handoff_discover` when resuming. Claude Desktop and VS Code Copilot are MCP-only here,
 so you'll need to nudge the model to call `memory_query` /
 `memory_handoff_discover` itself, then claim before continuing.
-For clients with `install-hooks` support, the capture path handles
-handoff injection at session start or the client's closest equivalent, except
+For clients with `install-hooks` support, an output-capable SessionStart
+claims the eligible continuation and injects **continuation CLAIMED**, except
 for Grok's no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
 
 ---

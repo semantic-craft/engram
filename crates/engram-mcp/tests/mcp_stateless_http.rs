@@ -17,6 +17,8 @@
 //! direction. They also pin protocol-version negotiation, which the server
 //! previously short-circuited by hard-pinning 2024-11-05.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
@@ -24,8 +26,14 @@ use engram_core::{
     ActiveProject, ActiveProjectMode, ActorContext, ActorKey, AuthLevel, ProjectId, WorkItemId,
     WorkItemState, WorkspaceId,
 };
-use engram_mcp::EngramServer;
-use engram_store::Store;
+use engram_hooks::{
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, SessionStartContinuity,
+    SubagentSessionSet, hook_router,
+};
+use engram_llm::ProviderHealth;
+use engram_mcp::{AdminState, EngramServer, admin_router};
+use engram_store::{DecayParams, Store};
+use engram_wiki::Wiki;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tempfile::TempDir;
@@ -194,6 +202,124 @@ async fn body_string(resp: axum::response::Response) -> String {
         .await
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn continuity_http_router(
+    tmp: &TempDir,
+    store: &Store,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    wiki: Wiki,
+    actor: ActorContext,
+) -> Router {
+    let active_project = ActiveProject::new();
+    let server = EngramServer::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        workspace_id,
+        project_id,
+    )
+    .with_wiki(wiki.clone())
+    .with_active_project(active_project.clone());
+    let mcp = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    );
+    let hooks = hook_router(HookState {
+        workspace_id,
+        project_id,
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki: wiki.clone(),
+        consolidator: None,
+        sanitizer: engram_core::Sanitizer::default(),
+        project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
+        active_project: active_project.clone(),
+        ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
+        )),
+        consolidate_on_session_end: false,
+        subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+        home_dir: None,
+        // This journey verifies continuation semantics. Timeout clamping has
+        // focused tests; a wider bound keeps loaded CI runners from turning a
+        // semantic regression into an opaque empty SessionStart response.
+        continuity: SessionStartContinuity {
+            timeout: std::time::Duration::from_secs(5),
+            ..SessionStartContinuity::default()
+        },
+    });
+    let admin = admin_router(AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        auto_improve_require_approval: false,
+        auto_improve_review_config: Default::default(),
+        embedder: None,
+        provider_health: ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path: store.db_path().to_path_buf(),
+        bind: "127.0.0.1:49374".into(),
+        home_dir: None,
+        bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project,
+        on_project_moved: None,
+    });
+
+    Router::new()
+        .nest_service("/mcp", mcp)
+        .merge(hooks)
+        .merge(admin)
+        .layer(Extension(AuthLevel::User))
+        .layer(Extension(actor))
+}
+
+async fn post_hook_batch(router: &Router, agent: &str, session_id: &str, events: &[&str]) {
+    // The spool endpoint runs the same production `process` path as `/hook`,
+    // but inline and fail-fast, so the test can assert committed effects
+    // without sleeping on the single-event endpoint's detached task.
+    let items: Vec<_> = events
+        .iter()
+        .map(|event| {
+            let mut body = serde_json::json!({
+                "event": event,
+                "session_id": session_id,
+                "cwd": "/tmp/engram-public-journey"
+            });
+            if *event == "user-prompt" {
+                body["prompt"] =
+                    serde_json::json!("Complete the public continuity acceptance journey");
+            }
+            serde_json::json!({
+                "url": format!(
+                    "http://localhost/hook?event={event}&agent={agent}&workspace=default&project=scratch"
+                ),
+                "body": body
+            })
+        })
+        .collect();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hook/batch")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&items).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(response["accepted"], events.len());
 }
 
 /// The fix: in the default stateless mode, a `tools/call` arriving with no
@@ -487,6 +613,298 @@ async fn work_item_handoff_claim_checkpoint_and_completion_round_trip() {
     assert_eq!(completed["sequence"], 2);
     assert_eq!(completed["work_item_revision"], 3);
     assert_eq!(completed["work_item_state"], "completed");
+}
+
+/// Issue #47 close-out: the production HTTP seams carry one WorkItem from a
+/// Claude Code SessionEnd into Codex, through acknowledgement and completion.
+#[tokio::test]
+async fn automatic_two_adapter_journey_uses_public_hook_mcp_and_admin_http() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let workspace_id = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project_id = store
+        .writer
+        .get_or_create_project(workspace_id, "scratch", None)
+        .await
+        .unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
+    let source = continuity_http_router(
+        &tmp,
+        &store,
+        workspace_id,
+        project_id,
+        wiki.clone(),
+        ActorContext {
+            agent: Some("claude-code".into()),
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        },
+    );
+    let receiver = continuity_http_router(
+        &tmp,
+        &store,
+        workspace_id,
+        project_id,
+        wiki,
+        ActorContext {
+            agent: Some("codex".into()),
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        },
+    );
+    let source_run = "11111111-1111-4111-8111-111111111111";
+    let receiving_run = "22222222-2222-4222-8222-222222222222";
+
+    post_hook_batch(
+        &source,
+        "claude-code",
+        source_run,
+        &["session-start", "user-prompt"],
+    )
+    .await;
+    let opened = call_tool(
+        &source,
+        200,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": source_run,
+            "objective": "Close the public two-adapter continuity contract",
+            "acceptance_criteria": [
+                "the public hook and MCP journey completes",
+                "terminal work requires an explicit related WorkItem"
+            ],
+            "summary": "Claude Code opened the acceptance WorkItem."
+        }),
+    )
+    .await;
+    let work_item_id = opened["work_item_id"].as_str().unwrap().to_string();
+
+    post_hook_batch(&source, "claude-code", source_run, &["session-end"]).await;
+    let offered = call_tool(
+        &receiver,
+        201,
+        "memory_handoff_discover",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(offered["work_item"]["id"], work_item_id);
+    assert_eq!(offered["chain"].as_array().unwrap().len(), 2);
+    assert_eq!(offered["chain"][0]["state"], "superseded");
+    assert_eq!(offered["chain"][1]["state"], "open");
+    assert_eq!(
+        offered["chain"][1]["predecessor_handoff_id"],
+        offered["chain"][0]["handoff_id"]
+    );
+
+    let continuation_response = receiver
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/handoff?agent=codex&session_id={receiving_run}&workspace=default&project=scratch"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continuation_response.status(), StatusCode::OK);
+    let continuation = body_string(continuation_response).await;
+    assert!(
+        continuation.contains("continuation CLAIMED")
+            && continuation.contains("adapter `codex:injected`"),
+        "{continuation}"
+    );
+    let claim_id = continuation
+        .split("> Claim `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .expect("the public continuation block carries the claim id");
+
+    let claimed = call_tool(
+        &receiver,
+        202,
+        "memory_handoff_discover",
+        serde_json::json!({ "include_claimed": true }),
+    )
+    .await;
+    assert_eq!(claimed["handoff"]["state"], "claimed");
+    let first_checkpoint = call_tool(
+        &receiver,
+        203,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": receiving_run,
+            "attempt_id": "33333333-3333-4333-8333-333333333333",
+            "expected_work_item_revision": claimed["work_item"]["revision"],
+            "handoff_id": claimed["handoff"]["id"],
+            "claim_id": claim_id,
+            "expected_handoff_revision": claimed["handoff"]["revision"],
+            "summary": "Codex durably acknowledged the automatic continuation.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {
+                    "criterion": "the public hook and MCP journey completes",
+                    "satisfied": true
+                },
+                {
+                    "criterion": "terminal work requires an explicit related WorkItem",
+                    "satisfied": false
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(first_checkpoint["handoff_state"], "acknowledged");
+
+    let wrong_run = call_tool_failure(
+        &source,
+        204,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": source_run,
+            "attempt_id": "44444444-4444-4444-8444-444444444444",
+            "expected_work_item_revision": first_checkpoint["work_item_revision"],
+            "summary": "The source Run must no longer own the WorkItem.",
+            "work_item_state": "active",
+            "acceptance_criteria": [
+                {
+                    "criterion": "the public hook and MCP journey completes",
+                    "satisfied": true
+                },
+                {
+                    "criterion": "terminal work requires an explicit related WorkItem",
+                    "satisfied": false
+                }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        wrong_run.contains("only the current WorkItem owner Run"),
+        "{wrong_run}"
+    );
+
+    let completed = call_tool(
+        &receiver,
+        205,
+        "memory_checkpoint_write",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": receiving_run,
+            "attempt_id": "55555555-5555-4555-8555-555555555555",
+            "expected_work_item_revision": first_checkpoint["work_item_revision"],
+            "summary": "Codex completed the public continuity journey.",
+            "work_item_state": "completed",
+            "acceptance_criteria": [
+                {
+                    "criterion": "the public hook and MCP journey completes",
+                    "satisfied": true
+                },
+                {
+                    "criterion": "terminal work requires an explicit related WorkItem",
+                    "satisfied": true
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(completed["work_item_state"], "completed");
+
+    let terminal_refusal = call_tool_failure(
+        &receiver,
+        206,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "work_item_id": work_item_id,
+            "run_id": receiving_run,
+            "expected_work_item_revision": completed["work_item_revision"],
+            "expected_checkpoint_revision": completed["work_item_revision"],
+            "summary": "A terminal WorkItem must not be silently reopened."
+        }),
+    )
+    .await;
+    assert!(
+        terminal_refusal.contains("terminal work item state completed"),
+        "{terminal_refusal}"
+    );
+
+    let follow_up = call_tool(
+        &receiver,
+        207,
+        "memory_handoff_begin",
+        serde_json::json!({
+            "run_id": "66666666-6666-4666-8666-666666666666",
+            "objective": "Follow up after the completed acceptance journey",
+            "summary": "Related work uses a new WorkItem.",
+            "relationships": [{
+                "kind": "derived_from",
+                "target_work_item_id": work_item_id
+            }]
+        }),
+    )
+    .await;
+    assert_ne!(follow_up["work_item_id"], work_item_id);
+    assert_eq!(follow_up["relationships"][0]["kind"], "derived_from");
+    assert_eq!(
+        follow_up["relationships"][0]["to_work_item_id"],
+        work_item_id
+    );
+
+    let briefing = call_tool(
+        &receiver,
+        208,
+        "memory_briefing",
+        serde_json::json!({
+            "workspace": "default",
+            "project": "scratch",
+            "recent_pages_limit": 5
+        }),
+    )
+    .await;
+    assert_eq!(briefing["work_items"]["completed"], 1);
+    assert_eq!(briefing["work_items"]["active"], 1);
+    assert_eq!(briefing["handoffs"]["superseded"], 1);
+    assert_eq!(briefing["handoffs"]["acknowledged"], 1);
+    assert_eq!(briefing["handoffs"]["open"], 1);
+    assert_eq!(briefing["pending_handoff_count"], 1);
+
+    let audit_response = receiver
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/admin/audit?workspace=default&project=scratch&work_item_id={work_item_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit_response.status(), StatusCode::OK);
+    let audit: serde_json::Value =
+        serde_json::from_str(&body_string(audit_response).await).unwrap();
+    let entries = audit["entries"].as_array().unwrap();
+    for op in [
+        "handoff_publish",
+        "handoff_supersede",
+        "handoff_claim",
+        "handoff_acknowledge",
+        "checkpoint_write",
+        "work_item_terminal",
+    ] {
+        assert!(
+            entries.iter().any(|entry| entry["op"] == op),
+            "public audit must reconstruct {op}: {entries:?}"
+        );
+    }
 }
 
 /// One recovery journey covers the retry, true same-revision concurrency,
