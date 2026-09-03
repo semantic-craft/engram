@@ -14,6 +14,7 @@ use rusqlite::Connection;
 
 mod artifacts;
 mod auto_improve;
+pub mod continuation;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -42,6 +43,14 @@ pub use auto_improve::{
     project_instruction_approval_sha256, project_instruction_token_delta,
     project_instruction_unified_diff,
 };
+pub use continuation::{
+    ContextCandidateParts, ContextQuotaOverrides, DEFAULT_HANDOFF_RETRIEVAL_LIMIT,
+    DEFAULT_OBSERVATION_QUOTA, DEFAULT_SESSION_PAGE_QUOTA, DEFAULT_WIKI_PAGE_QUOTA, HandoffContext,
+    HandoffContextRequest, PageCandidateHit, QueryEmbedding, ResolvedContextRef,
+    assemble_handoff_context, build_context_candidates, claim_access_bump_ids, context_candidate,
+    context_quotas, context_ref_omission_label, handoff_retrieval_query,
+    observation_context_candidate, page_context_candidate, resolve_context_refs,
+};
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
@@ -49,9 +58,9 @@ pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
     DerivedIndexStatus, EmbeddingTripleCount, HandoffSummary, HealthDetail, HealthPage,
-    ObservationContextSource, ObservationHit, OpenSession, PageAuthor, PageContextSource, PageHit,
-    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
-    ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition, SessionSummary,
+    LiveHandoffClaim, ObservationContextSource, ObservationHit, OpenSession, PageAuthor,
+    PageContextSource, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
+    ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition, SessionSummary,
     StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
     f32_vec_to_bytes,
 };

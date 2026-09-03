@@ -20,9 +20,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use engram_consolidate::Consolidator;
 use engram_core::{
-    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff,
-    NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
-    WorkItem, WorkspaceId,
+    ActiveProject, ActorKey, AdapterContract, AdapterPeer, AdapterRequest, AgentKind, AuthLevel,
+    DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff, NewObservation, NewSession, ObservationKind,
+    ProjectId, Sanitized, Sanitizer, SessionId, WorkItem, WorkItemId, WorkspaceId,
 };
 use engram_store::WriterHandle;
 use engram_wiki::Wiki;
@@ -274,6 +274,81 @@ pub struct HookState {
     /// to this, so `$HOME` cannot become a catch-all (issue #103). `None`
     /// disables the guard. Held here so the hooks crate makes no env reads.
     pub home_dir: Option<String>,
+    /// Strict bounds for automatic SessionStart continuation.
+    pub continuity: SessionStartContinuity,
+}
+
+/// Strict, operator-configurable bounds for automatic SessionStart recovery.
+///
+/// SessionStart sits on the agent's critical path, so every leg of automatic
+/// recovery is capped: the assembled package by a UTF-8-byte budget, the whole
+/// discover → claim → assemble → render sequence by a wall-clock timeout, and
+/// the resulting lease by its own ceiling. Exceeding the timeout aborts the
+/// injection; at worst that leaves a live claim which returns to `open` at
+/// lease expiry, which is precisely the recoverable-claim contract.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionStartContinuity {
+    /// Continuation ContextPackage budget in selected-content UTF-8 bytes.
+    /// Same unit and assembler contract as `memory_query`.
+    pub context_budget: usize,
+    /// Wall-clock cap for the whole automatic continuation leg.
+    pub timeout: std::time::Duration,
+    /// Lease granted to an automatic claim.
+    pub lease_seconds: u64,
+}
+
+/// Default continuation budget: roughly 2k tokens of evidence, enough for a
+/// handful of briefs plus one upgraded page without taxing every session start.
+pub const DEFAULT_SESSION_START_CONTEXT_BUDGET: usize = 8_000;
+/// The `GET /handoff` deadline every shipped hook client uses.
+///
+/// `curl --max-time 1.0` in `hooks/_lib.sh`, `-TimeoutSec 1` in
+/// `hooks/lib/engram-hook.ps1`, and `timeoutSignal(1000)` in the generated
+/// OpenCode / OMP / Pi / OpenClaw integrations. The native `engram hook`
+/// client allows more, so this is the tightest deadline in the fleet.
+pub const SESSION_START_CLIENT_BUDGET_MS: u64 = 1_000;
+
+/// Ceiling for the server-side continuation timeout.
+///
+/// Strictly below [`SESSION_START_CLIENT_BUDGET_MS`] so the SERVER always
+/// gives up first. If the client aborted first the claim would already be
+/// committed while nothing reached the agent, leaving the transfer leased for
+/// the whole `session_start_lease_seconds` with no receiver — recoverable, but
+/// a self-inflicted outage on every session start.
+pub const MAX_SESSION_START_TIMEOUT_MS: u64 = 900;
+
+/// Floor for the server-side continuation timeout.
+pub const MIN_SESSION_START_TIMEOUT_MS: u64 = 50;
+
+/// Default continuation timeout, comfortably under
+/// [`MAX_SESSION_START_TIMEOUT_MS`].
+pub const DEFAULT_SESSION_START_TIMEOUT_MS: u64 = 750;
+
+// Compile-time coupling, not a runtime test: if someone raises the server
+// ceiling to or past the tightest client deadline, the build fails rather than
+// shipping a configuration where the client can abort after the claim commits.
+const _: () = assert!(
+    MAX_SESSION_START_TIMEOUT_MS < SESSION_START_CLIENT_BUDGET_MS,
+    "the server's continuation timeout must expire before any hook client's"
+);
+const _: () = assert!(
+    MIN_SESSION_START_TIMEOUT_MS <= DEFAULT_SESSION_START_TIMEOUT_MS
+        && DEFAULT_SESSION_START_TIMEOUT_MS <= MAX_SESSION_START_TIMEOUT_MS,
+    "the default continuation timeout must sit inside the clamp range"
+);
+/// Default automatic lease. Long enough for a resuming agent to reach its first
+/// checkpoint, short enough that an abandoned session returns the transfer to
+/// `open` within a coffee break.
+pub const DEFAULT_SESSION_START_LEASE_SECONDS: u64 = 900;
+
+impl Default for SessionStartContinuity {
+    fn default() -> Self {
+        Self {
+            context_budget: DEFAULT_SESSION_START_CONTEXT_BUDGET,
+            timeout: std::time::Duration::from_millis(DEFAULT_SESSION_START_TIMEOUT_MS),
+            lease_seconds: DEFAULT_SESSION_START_LEASE_SECONDS,
+        }
+    }
 }
 
 /// Build a router with `POST /hook` (event ingress) and `GET /handoff`
@@ -476,6 +551,21 @@ fn parse_hook_query(url: &str) -> HookQuery {
 /// Query params for `GET /handoff`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HandoffQuery {
+    /// Which Agent Adapter is asking. Normalized through
+    /// [`AdapterContract::from_wire`], which decides whether this request may
+    /// read and claim a Handoff at all. Absent or unrecognized means
+    /// "delivery not established" — the non-destructive default.
+    pub agent: Option<String>,
+    /// The harness's own identifier for the Run/Session it is starting.
+    /// Mapped onto engram's Run identity by
+    /// [`SessionId::from_agent_session`], the same mapping `POST /hook` uses,
+    /// so an automatic claim binds to exactly the Run whose observations and
+    /// acknowledging Checkpoint follow. Absent means no automatic claim.
+    pub session_id: Option<String>,
+    /// Optional WorkItem selection hint (a checkout pinned to one task through
+    /// its `.engram.toml`). Narrows selection inside the already-resolved
+    /// scope; it grants nothing and can never widen scope.
+    pub work_item: Option<String>,
     /// Optional cwd filter. When provided, only handoffs whose stored
     /// cwd matches this string are returned. Note: the cwd string is
     /// not canonicalized; symlinked paths must match byte-for-byte.
@@ -505,26 +595,39 @@ pub struct HandoffQuery {
     pub briefing_budget: Option<String>,
 }
 
-/// Synchronous endpoint used by `session-start.sh` to discover any
-/// pending handoff from a previous agent. Returns plain text Markdown
-/// (or an empty body when no handoff is open) with a 1-second cap on
-/// the server side so the agent never blocks measurably on startup.
+/// Synchronous endpoint every Agent Adapter's SessionStart hook calls.
 ///
-/// This endpoint is read-only. Rendering or losing SessionStart output cannot
-/// consume a continuation; the receiving Run must claim it and persist its
-/// first checkpoint through MCP.
+/// What happens here depends entirely on the adapter's shared
+/// [`AdapterContract`]:
+///
+/// * **Output-capable adapter with a known Run** — discovers one eligible
+///   Handoff in the resolved scope and *claims* it through the same
+///   compare-and-set path as `memory_handoff_claim`, then renders the
+///   continuation envelope, claim metadata, and a budgeted ContextPackage. The
+///   Handoff is left `claimed`, never accepted: only the receiving Run's first
+///   valid Checkpoint acknowledges it.
+/// * **Output-capable adapter that cannot name its Run** — renders the
+///   read-only envelope. Claiming for an unidentifiable Run would produce a
+///   lease nobody could acknowledge.
+/// * **Adapter that discards SessionStart output, or an unestablished one** —
+///   performs no Handoff read and no mutation at all. The transfer stays open
+///   for an explicit on-demand `memory_handoff_claim`.
+///
+/// Always answers `200`; a failure injects nothing rather than breaking the
+/// resuming agent.
 async fn handle_handoff(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    auth_ext: Option<axum::Extension<AuthLevel>>,
 ) -> impl IntoResponse {
     let actor = actor_ext
-        .map(|axum::Extension(actor)| ActorKey {
-            user: actor.user,
-            session_id: actor.session_id,
-        })
+        .map(|axum::Extension(actor)| actor)
         .unwrap_or_default();
-    match fetch_handoff_context(&state, query, &actor).await {
+    // Absent extension means the auth middleware never ran for this request;
+    // fail closed to the least-privileged tier rather than assuming root.
+    let auth = auth_ext.map_or(AuthLevel::Anonymous, |axum::Extension(level)| level);
+    match fetch_handoff_context(&state, query, &actor, auth).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         Err(e) => {
@@ -534,31 +637,103 @@ async fn handle_handoff(
     }
 }
 
+/// Normalize one SessionStart request into the shared [`AdapterRequest`].
+///
+/// Every identity dimension is filled from exactly one source and none of them
+/// substitutes for another: the actor comes from the authenticated
+/// [`engram_core::ActorContext`], the Run from the harness's own session
+/// identifier, and the WorkItem/cwd values stay explicit hints.
+fn adapter_request(query: &HandoffQuery, actor: &engram_core::ActorContext) -> AdapterRequest {
+    let work_item = query.work_item.as_deref().and_then(|raw| {
+        let parsed = WorkItemId::from_str(raw.trim()).ok();
+        if parsed.is_none() {
+            warn!(hint = %raw, "ignoring unparseable work_item hint");
+        }
+        parsed
+    });
+    AdapterRequest {
+        contract: AdapterContract::from_wire(query.agent.as_deref()),
+        actor: actor.continuity_key(),
+        run: harness_session_id(query).map(SessionId::from_agent_session),
+        work_item,
+        cwd: query.cwd.clone(),
+    }
+}
+
+/// The harness's own session identifier, normalized: absent, blank, or
+/// whitespace-only all mean "this adapter did not report a Run".
+fn harness_session_id(query: &HandoffQuery) -> Option<&str> {
+    query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+}
+
 async fn fetch_handoff_context(
     state: &HookState,
     query: HandoffQuery,
-    actor: &ActorKey,
+    actor_ctx: &engram_core::ActorContext,
+    auth: AuthLevel,
 ) -> anyhow::Result<Option<String>> {
-    let Some((ws, proj)) = resolve_handoff_scope(state, &query, actor).await? else {
+    let request = adapter_request(&query, actor_ctx);
+    // `POST /hook` keys the active-project pointer by (user, session); the
+    // continuity read must use the same key or a per-session install resolves a
+    // different project than the events of the very same session.
+    let actor = ActorKey {
+        user: actor_ctx.user.clone(),
+        session_id: harness_session_id(&query).map(str::to_owned),
+    };
+    let Some((ws, proj)) = resolve_handoff_scope(state, &query, &actor).await? else {
         return Ok(None);
     };
-    let handoff_md = {
-        // One snapshot: the injected envelope must not mix a transfer with a
-        // WorkItem or Checkpoint that a concurrent successor has already moved
-        // past.
-        state
-            .reader
-            .discover_continuation(ws, proj, query.cwd, false)
-            .await?
-            .map(|envelope| {
-                render_handoff_markdown(
-                    &envelope.handoff,
-                    &envelope.work_item,
-                    envelope.latest_checkpoint.as_ref(),
-                )
-            })
+    // This endpoint MUTATES on the claiming path, so it passes the same
+    // capability gate every MCP continuity transition does. Reading the brief
+    // below stays a NormalRead surface.
+    let may_claim = request.contract.may_claim_on_session_start()
+        && match auth.authorize(engram_core::Capability::NormalWrite, false) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    adapter = %request.delivery_path(),
+                    error = error.message(),
+                    "session-start continuation is not authorized to claim"
+                );
+                false
+            }
+        };
+    let handoff_md = if may_claim {
+        // One strict wall-clock cap over discover + claim + assemble + render.
+        // Timing out injects nothing; at worst a live claim remains, and a live
+        // claim returns to `open` at lease expiry.
+        match tokio::time::timeout(
+            state.continuity.timeout,
+            session_start_continuation(state, ws, proj, &request),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(
+                    adapter = %request.delivery_path(),
+                    timeout_ms = state.continuity.timeout.as_millis(),
+                    "session-start continuation timed out; injecting nothing"
+                );
+                None
+            }
+        }
+    } else {
+        // A harness that discards SessionStart output — or one whose delivery is
+        // not established — performs NO automatic Handoff read or mutation. The
+        // transfer stays open for `memory_handoff_claim`.
+        debug!(
+            adapter = %request.delivery_path(),
+            "adapter does not deliver session-start output; skipping continuation"
+        );
+        None
     };
-    // The brief and handoff are both non-destructive and may be rendered again.
+    // The brief is non-destructive project context, not a transfer: it is
+    // rendered for whoever opted in, independent of the continuation decision.
     let brief_md = if crate::payload::query_flag_truthy(query.briefing.as_deref()) {
         let budget = query
             .briefing_budget
@@ -580,6 +755,250 @@ async fn fetch_handoff_context(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     })
+}
+
+/// Re-render a held claim, or discover and claim one, for an output-capable
+/// adapter.
+///
+/// Order matters. The Run's OWN live claim is resolved first, before any
+/// open-transfer discovery: a harness re-fires SessionStart inside a live Run
+/// (Claude Code does it on `/clear` and on resume), and discovering first would
+/// make the second start claim whatever *other* open transfer the project
+/// happens to have — stranding the continuation this Run is already carrying
+/// under its lease and injecting unrelated work.
+///
+/// Returns `Ok(None)` for every non-exceptional "nothing to inject" outcome —
+/// no eligible transfer, or losing the compare-and-set race to a concurrent
+/// claimant. Losing that race is normal: exactly one claimant wins, and the
+/// loser must inject nothing rather than a transfer it does not hold.
+async fn session_start_continuation(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    request: &AdapterRequest,
+) -> anyhow::Result<Option<String>> {
+    if let Some(rendered) = rerender_own_claim(state, workspace_id, project_id, request).await? {
+        return Ok(Some(rendered));
+    }
+    // One snapshot: the injected envelope must not mix a transfer with a
+    // WorkItem or Checkpoint that a concurrent successor has already moved
+    // past.
+    let Some(envelope) = state
+        .reader
+        .discover_continuation(
+            workspace_id,
+            project_id,
+            request.cwd.clone(),
+            request.work_item,
+            false,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(run_id) = request.run else {
+        // Output-capable adapter that cannot name its Run: render the
+        // discovery result read-only and let the agent claim through MCP with
+        // a Run it can actually identify.
+        return Ok(Some(render_discovered_continuation(
+            &envelope.handoff,
+            &envelope.work_item,
+            envelope.latest_checkpoint.as_ref(),
+        )));
+    };
+
+    let expected_revision = envelope.handoff.revision;
+    let claim = engram_core::HandoffClaim {
+        handoff_id: envelope.handoff.id,
+        workspace_id,
+        project_id,
+        expected_revision,
+        run_id,
+        // Deterministic Attempt identity: a SessionStart hook that fires twice
+        // for the same (transfer revision, Run) replays its own claim instead
+        // of racing itself.
+        attempt_id: session_start_attempt_id(envelope.handoff.id, expected_revision, run_id),
+        actor_key: request.actor.clone(),
+        lease_seconds: state.continuity.lease_seconds,
+        context_options: serde_json::json!({
+            "context_budget": state.continuity.context_budget,
+            "delivery": "session-start",
+        }),
+        delivery_path: request.delivery_path(),
+    };
+    let claimed = match state.writer.claim_handoff(claim).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            // Stale revision, an existing live claim, or a concurrent winner.
+            // All are ordinary outcomes of the shared compare-and-set path.
+            debug!(
+                error = %error,
+                adapter = %request.delivery_path(),
+                "session-start claim did not win; injecting nothing"
+            );
+            return Ok(None);
+        }
+    };
+    info!(
+        adapter = %request.delivery_path(),
+        actor = %request.actor,
+        run = %run_id,
+        work_item = %claimed.work_item_id,
+        handoff = %claimed.handoff_id,
+        revision = claimed.revision,
+        outcome = "claimed",
+        "session-start continuation claimed"
+    );
+    Ok(Some(
+        render_continuation(
+            state,
+            ClaimedContinuation {
+                handoff: &claimed.handoff,
+                work_item: &envelope.work_item,
+                checkpoint: envelope.latest_checkpoint.as_ref(),
+                claim_id: claimed.claim_id,
+                lease_expires_at: claimed.lease_expires_at,
+                peer: AdapterPeer {
+                    source_agent: claimed.handoff.from_agent,
+                    target_agent: claimed.handoff.to_agent,
+                },
+            },
+            request,
+            // A fresh claim consumes these page revisions for the first time,
+            // so it owes the retention model its reinforcement bump.
+            AccessBump::Record,
+        )
+        .await,
+    ))
+}
+
+/// Re-render the continuation this exact actor and Run already hold.
+///
+/// Purely a read: no claim, no revision bump, no audit transition, and no
+/// access reinforcement — the claim that first delivered these pages already
+/// counted them. Without this a second SessionStart inside one Run (a
+/// `/clear`, a resume) would either inject nothing or, worse, claim a second
+/// unrelated transfer while the first stayed leased.
+///
+/// A Run carries one continuation, so a held claim wins unconditionally; the
+/// WorkItem hint only steers which transfer a *new* claim selects.
+async fn rerender_own_claim(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    request: &AdapterRequest,
+) -> anyhow::Result<Option<String>> {
+    let Some(run_id) = request.run else {
+        return Ok(None);
+    };
+    let Some(held) = state
+        .reader
+        .live_claim_for_run(workspace_id, project_id, request.actor.clone(), run_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(envelope) = state
+        .reader
+        .continuation_by_handoff_id(held.handoff_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    debug!(
+        adapter = %request.delivery_path(),
+        run = %run_id,
+        handoff = %held.handoff_id,
+        outcome = "re-rendered",
+        "session-start re-rendered this Run's existing claim"
+    );
+    Ok(Some(
+        render_continuation(
+            state,
+            ClaimedContinuation {
+                handoff: &envelope.handoff,
+                work_item: &envelope.work_item,
+                checkpoint: envelope.latest_checkpoint.as_ref(),
+                claim_id: held.claim_id,
+                lease_expires_at: held.lease_expires_at,
+                peer: AdapterPeer {
+                    source_agent: envelope.handoff.from_agent,
+                    target_agent: envelope.handoff.to_agent,
+                },
+            },
+            request,
+            AccessBump::Skip,
+        )
+        .await,
+    ))
+}
+
+/// Whether this rendering owes the retention model an access bump.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessBump {
+    /// A fresh claim consumed these revisions: reinforce once each.
+    Record,
+    /// A re-render of an already-counted claim: reinforce nothing.
+    Skip,
+}
+
+/// Assemble the budgeted ContextPackage and render the full injected block.
+async fn render_continuation(
+    state: &HookState,
+    claimed: ClaimedContinuation<'_>,
+    request: &AdapterRequest,
+    bump: AccessBump,
+) -> String {
+    let assembled = engram_store::assemble_handoff_context(
+        &state.reader,
+        claimed.handoff,
+        engram_store::HandoffContextRequest {
+            budget: state.continuity.context_budget,
+            // The SAME default ceilings an on-demand `memory_handoff_claim`
+            // with no overrides uses. An empty list would mean "unlimited per
+            // kind" and assemble a different package than the identical claim.
+            quotas: engram_store::context_quotas(engram_store::ContextQuotaOverrides::default()),
+            already_used: std::collections::BTreeSet::new(),
+            // No embedder on the hook path: SessionStart must never make a
+            // synchronous model call. The retrieval leg degrades to BM25
+            // exactly as `memory_query` does without a provider.
+            embedding: None,
+            retrieval_limit: engram_store::DEFAULT_HANDOFF_RETRIEVAL_LIMIT,
+        },
+    )
+    .await;
+    let package = match assembled {
+        Ok(context) => {
+            if bump == AccessBump::Record {
+                // Same reinforcement term as every other retrieval path, once
+                // per consumed revision.
+                state.writer.bump_access(context.access_bump_ids).await.ok();
+            }
+            Some(context.assembled)
+        }
+        Err(error) => {
+            // The claim is recorded and live. Render the envelope and claim
+            // metadata anyway so the receiver can acknowledge or release it.
+            warn!(error = %error, "session-start context assembly failed; claim stays live");
+            None
+        }
+    };
+    render_claimed_continuation(&claimed, request, package.as_ref())
+}
+
+/// Deterministic Attempt id for one automatic SessionStart claim.
+///
+/// Derived from the exact transfer revision plus the receiving Run, so a hook
+/// that fires twice for one session replays its recorded claim rather than
+/// racing itself, while a different revision or Run is a genuinely different
+/// Attempt.
+fn session_start_attempt_id(
+    handoff_id: engram_core::HandoffId,
+    expected_revision: u64,
+    run_id: SessionId,
+) -> engram_core::AttemptId {
+    let seed = format!("engram:session-start-claim:{handoff_id}:{expected_revision}:{run_id}");
+    engram_core::AttemptId(Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()))
 }
 
 /// Resolve the read-only SessionStart injection scope without creating or
@@ -611,11 +1030,16 @@ async fn resolve_handoff_scope(
         engram_consolidate::derive_project_name(std::path::Path::new(cwd), strategy)
             .map(|(name, _)| name)
     });
+    // A cwd that yields no project name, or that resolves to the reserved
+    // global scope, must NOT fall back to the server's baked default project.
+    // This endpoint claims, and the resolved scope decides whose continuation
+    // gets consumed: silently substituting another project would hand this
+    // session someone else's work. Fail closed instead.
     let Some(project) = project else {
-        return Ok(Some((state.workspace_id, state.project_id)));
+        return Ok(None);
     };
     if project == engram_core::GLOBAL_SCOPE_PROJECT {
-        return Ok(Some((state.workspace_id, state.project_id)));
+        return Ok(None);
     }
     let workspace = query.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE_NAME);
     match resolver.lookup_existing(workspace, &project).await {
@@ -754,7 +1178,13 @@ fn render_session_brief(
     Some(buf)
 }
 
-fn render_handoff_markdown(
+/// Shared body of every continuation envelope: objective, outstanding
+/// criteria, questions, next steps, evidence, and the prose summary.
+///
+/// Both the claimed and the read-only renderings wrap this identical body, so
+/// adapter-specific formatting can differ only in the header and footer and can
+/// never change what the receiver is told about the work itself.
+fn render_handoff_body(
     h: &Handoff,
     work_item: &WorkItem,
     checkpoint: Option<&engram_core::Checkpoint>,
@@ -765,30 +1195,8 @@ fn render_handoff_markdown(
     // block AND let the agent miss that this *is* the answer to
     // "where did we leave off" questions. The new layout leads
     // with the actionable bullets (open questions, next steps) and
-    // pushes the prose summary to the bottom; the agent-facing
-    // footer explicitly tells the model that discovery did not claim work.
+    // pushes the prose summary to the bottom.
     let mut buf = String::with_capacity(512);
-    buf.push_str("> 📥 **engram: pending handoff from previous session**\n");
-    buf.push_str(&format!(
-        "> WorkItem `{work_item}` · Handoff `{handoff}` · revision `{revision}`\n\
-         > from `{from}` · created {ts}\n",
-        work_item = h.work_item_id,
-        handoff = h.id,
-        revision = h.revision,
-        from = h.from_agent.as_str(),
-        ts = h.created_at,
-    ));
-
-    if let Some(predecessor) = h.predecessor_handoff_id {
-        buf.push_str(&format!(
-            "> continues Handoff `{predecessor}`{checkpoint}\n",
-            checkpoint = h
-                .source_checkpoint_revision
-                .map(|revision| format!(" · built from Checkpoint revision `{revision}`"))
-                .unwrap_or_default(),
-        ));
-    }
-
     buf.push_str("\n**Objective**\n");
     buf.push_str(work_item.objective.trim());
     buf.push('\n');
@@ -824,8 +1232,8 @@ fn render_handoff_markdown(
     }
     if !h.next_steps.is_empty() {
         buf.push_str("\n**Next steps**\n");
-        for s in &h.next_steps {
-            buf.push_str(&format!("- {s}\n"));
+        for step in &h.next_steps {
+            buf.push_str(&format!("- {step}\n"));
         }
     }
     if !h.files_touched.is_empty() {
@@ -868,16 +1276,184 @@ fn render_handoff_markdown(
     buf.push_str("\n**Summary**\n");
     buf.push_str(h.summary.trim());
     buf.push('\n');
+    buf
+}
 
+/// Identity header shared by both renderings.
+fn render_handoff_identity(h: &Handoff) -> String {
+    let mut buf = format!(
+        "> WorkItem `{work_item}` · Handoff `{handoff}` · revision `{revision}`\n\
+         > from `{from}` · created {ts}\n",
+        work_item = h.work_item_id,
+        handoff = h.id,
+        revision = h.revision,
+        from = h.from_agent.as_str(),
+        ts = h.created_at,
+    );
+    if let Some(predecessor) = h.predecessor_handoff_id {
+        buf.push_str(&format!(
+            "> continues Handoff `{predecessor}`{checkpoint}\n",
+            checkpoint = h
+                .source_checkpoint_revision
+                .map(|revision| format!(" · built from Checkpoint revision `{revision}`"))
+                .unwrap_or_default(),
+        ));
+    }
+    buf
+}
+
+/// Read-only rendering for an output-capable adapter that could not name its
+/// receiving Run. Nothing was claimed, so the footer sends the agent to the
+/// on-demand claim with a Run it can actually identify.
+fn render_discovered_continuation(
+    h: &Handoff,
+    work_item: &WorkItem,
+    checkpoint: Option<&engram_core::Checkpoint>,
+) -> String {
+    let mut buf = String::with_capacity(768);
+    buf.push_str("> 📥 **engram: pending handoff from previous session**\n");
+    buf.push_str(&render_handoff_identity(h));
+    buf.push_str(&render_handoff_body(h, work_item, checkpoint));
     buf.push_str(
         "\n---\n\
-         _**To the receiving agent:** rendering this envelope did not claim or \
-         acknowledge it. Call `memory_handoff_claim` with the exact Handoff id, \
-         revision, Run/Session id, a fresh Attempt id, and a `context_budget` \
-         in selected-content UTF-8 bytes before continuing. The claim returns \
-         the continuation ContextPackage assembled within that budget. Persist \
-         `memory_checkpoint_write` to acknowledge it; release the claim if you \
-         cannot proceed._\n",
+         _**To the receiving agent:** this session could not report its own \
+         Run/Session id, so nothing was claimed — rendering this envelope did \
+         not claim or acknowledge it. Call `memory_handoff_claim` with the exact \
+         Handoff id, revision, Run/Session id, a fresh Attempt id, and a \
+         `context_budget` in selected-content UTF-8 bytes before continuing. \
+         Persist `memory_checkpoint_write` to acknowledge it; release the claim \
+         if you cannot proceed._\n",
+    );
+    buf
+}
+
+/// Everything the claimed rendering needs, gathered once.
+struct ClaimedContinuation<'a> {
+    handoff: &'a Handoff,
+    work_item: &'a WorkItem,
+    checkpoint: Option<&'a engram_core::Checkpoint>,
+    claim_id: engram_core::ClaimId,
+    lease_expires_at: jiff::Timestamp,
+    peer: AdapterPeer,
+}
+
+/// Rendering for a continuation this session holds a live claim on.
+///
+/// Carries the same envelope, claim metadata, ContextPackage, provenance, and
+/// assembly semantics the on-demand `memory_handoff_claim` returns — the two
+/// paths call the same claim and the same assembler. The Handoff is `claimed`,
+/// never accepted: the footer tells the receiver that its first Checkpoint is
+/// what acknowledges it.
+fn render_claimed_continuation(
+    claimed: &ClaimedContinuation<'_>,
+    request: &AdapterRequest,
+    package: Option<&engram_core::ContextAssemblyResult>,
+) -> String {
+    let h = claimed.handoff;
+    let run = request
+        .run
+        .map(|run| run.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let mut buf = String::with_capacity(2_048);
+    buf.push_str("> 📥 **engram: continuation CLAIMED for this session**\n");
+    buf.push_str(&render_handoff_identity(h));
+    buf.push_str(&format!(
+        "> Claim `{claim}` · Run `{run}` · lease expires {lease}\n\
+         > adapter `{adapter}` · peer `{peer}`{target}\n",
+        claim = claimed.claim_id,
+        lease = claimed.lease_expires_at,
+        adapter = request.delivery_path(),
+        peer = claimed.peer.source_agent.as_str(),
+        target = claimed
+            .peer
+            .target_agent
+            .map(|agent| format!(" · addressed to `{}` (routing hint only)", agent.as_str()))
+            .unwrap_or_default(),
+    ));
+    buf.push_str(&render_handoff_body(
+        h,
+        claimed.work_item,
+        claimed.checkpoint,
+    ));
+    match package {
+        Some(assembled) => buf.push_str(&render_context_package(assembled)),
+        None => buf.push_str(
+            "\n**Continuation context** — assembly failed; the claim is still live. \
+             Call `memory_handoff_claim` with the ids above to re-assemble, or \
+             `memory_handoff_release` to return the transfer.\n",
+        ),
+    }
+    buf.push_str(&format!(
+        "\n---\n\
+         _**To the receiving agent:** this Handoff is now **claimed by you**, not \
+         acknowledged. Do NOT call `memory_handoff_claim` again — use the block \
+         above directly. Acknowledge it with your first \
+         `memory_checkpoint_write` for `work_item_id={work_item}`, passing \
+         `handoff_id={handoff}`, `claim_id={claim}`, \
+         `expected_handoff_revision={revision}`, \
+         `expected_work_item_revision={work_item_revision}`, and \
+         `run_id={run}`. If you will not continue this work, call \
+         `memory_handoff_release` with the same ids so another receiver can pick \
+         it up; leaving it alone also works — the lease expires and the transfer \
+         returns to `open`._\n",
+        work_item = h.work_item_id,
+        handoff = h.id,
+        claim = claimed.claim_id,
+        revision = h.revision,
+        work_item_revision = claimed.work_item.revision,
+    ));
+    buf
+}
+
+/// Render the budgeted ContextPackage and its content-free assembly trace.
+fn render_context_package(assembled: &engram_core::ContextAssemblyResult) -> String {
+    let package = &assembled.package;
+    let trace = &assembled.trace;
+    let mut buf = String::with_capacity(1_024);
+    buf.push_str(&format!(
+        "\n**Continuation context** ({used}/{budget} {unit}, {entries} entries from \
+         {candidates} candidates)\n",
+        used = package.estimated_consumption,
+        budget = package.budget,
+        unit = package.budget_unit,
+        entries = package.entries.len(),
+        candidates = trace.candidate_count,
+    ));
+    for entry in &package.entries {
+        buf.push_str(&format!(
+            "\n### {title} (`{kind}`, {tier}, revision `{revision}`)\n\
+             ref `{context_ref}` · via {provenance}{truncated}\n{content}\n",
+            title = entry.title,
+            kind = entry.kind.as_str(),
+            tier = entry.detail_tier.as_str(),
+            revision = entry.source_revision,
+            context_ref = entry.context_ref,
+            provenance = entry
+                .provenance
+                .iter()
+                .map(|p| p.source.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            truncated = match entry.truncation {
+                engram_core::ContextTruncation::None => String::new(),
+                other => format!(" · truncated (`{other:?}`)"),
+            },
+            content = entry.content.trim(),
+        ));
+    }
+    if !trace.omissions.is_empty() {
+        buf.push_str("\n**Omitted from this package**\n");
+        for omission in &trace.omissions {
+            buf.push_str(&format!(
+                "- `{}` — {}\n",
+                omission.context_ref,
+                engram_store::context_ref_omission_label(omission.reason),
+            ));
+        }
+    }
+    buf.push_str(
+        "\n_Resolve any reference above to exact full evidence with \
+         `memory_context_read`._\n",
     );
     buf
 }
@@ -1491,14 +2067,11 @@ async fn process(
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     if let Some(raw) = &env.session_id {
-        // Accept either a UUID (canonical) or any string, hashing the
-        // latter to a deterministic UUID v5 so each agent's session id
-        // maps cleanly into our schema.
-        if let Ok(id) = SessionId::from_str(raw) {
-            return Ok(id);
-        }
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes());
-        return Ok(SessionId(uuid));
+        // Accept either a UUID (canonical) or any string, hashing the latter to
+        // a deterministic UUID v5 so each agent's session id maps cleanly into
+        // our schema. `GET /handoff` resolves the SAME mapping, so a
+        // SessionStart claim binds to the Run this session's events land under.
+        return Ok(SessionId::from_agent_session(raw));
     }
     if matches!(env.event, HookEvent::SessionStart) {
         return Ok(SessionId::new());
@@ -1714,6 +2287,34 @@ mod tests {
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
+            continuity: SessionStartContinuity::default(),
+        }
+    }
+
+    /// Drive the continuation endpoint at the tier a default single-user
+    /// install runs at. The claiming path passes `Capability::NormalWrite`
+    /// through [`AuthLevel::authorize`] exactly as every MCP transition does.
+    async fn fetch_continuation(
+        state: &HookState,
+        query: HandoffQuery,
+        actor: &engram_core::ActorContext,
+    ) -> anyhow::Result<Option<String>> {
+        fetch_handoff_context(state, query, actor, AuthLevel::Anonymous).await
+    }
+
+    /// A SessionStart query from an output-capable Agent Adapter that can name
+    /// its Run — the shape every shipped hook script now sends.
+    fn session_start_query(agent: &str, session_id: &str) -> HandoffQuery {
+        HandoffQuery {
+            agent: Some(agent.into()),
+            session_id: Some(session_id.into()),
+            work_item: None,
+            cwd: None,
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
         }
     }
 
@@ -4213,17 +4814,14 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
-                project: None,
-                project_strategy: None,
-                briefing: None,
-                briefing_budget: None,
+                ..session_start_query("claude-code", "run-marker")
             },
-            &ActorKey::default(),
+            &engram_core::ActorContext::default(),
         )
         .await
         .unwrap();
@@ -4383,17 +4981,13 @@ mod tests {
             "successor must name the transfer it continues"
         );
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
-                workspace: None,
-                project: None,
-                project_strategy: None,
-                briefing: None,
-                briefing_budget: None,
+                ..session_start_query("codex", "run-chain")
             },
-            &ActorKey::default(),
+            &engram_core::ActorContext::default(),
         )
         .await
         .unwrap()
@@ -4449,27 +5043,32 @@ mod tests {
 
         let query = |briefing: Option<&str>| HandoffQuery {
             cwd: Some(cwd.into()),
-            workspace: None,
-            project: None,
-            project_strategy: None,
             briefing: briefing.map(str::to_owned),
-            briefing_budget: None,
+            ..session_start_query("gemini-cli", "run-brief")
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
-        let rendered = fetch_handoff_context(&state, query(Some("false")), &ActorKey::default())
-            .await
-            .unwrap();
+        let rendered = fetch_continuation(
+            &state,
+            query(Some("false")),
+            &engram_core::ActorContext::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             rendered.is_none(),
             "non-truthy briefing flag must not inject anything"
         );
 
         // Truthy opt-in, no pending handoff: brief alone (the /clear case).
-        let rendered = fetch_handoff_context(&state, query(Some("true")), &ActorKey::default())
-            .await
-            .unwrap()
-            .expect("brief must be injected without a pending handoff");
+        let rendered = fetch_continuation(
+            &state,
+            query(Some("true")),
+            &engram_core::ActorContext::default(),
+        )
+        .await
+        .unwrap()
+        .expect("brief must be injected without a pending handoff");
         assert!(
             rendered.contains("project brief") && rendered.contains("single writer actor"),
             "brief must carry the rules page body: {rendered}"
@@ -4507,22 +5106,25 @@ mod tests {
             })
             .await
             .unwrap();
-        let rendered = fetch_handoff_context(&state, query(Some("true")), &ActorKey::default())
-            .await
-            .unwrap()
-            .expect("handoff + brief must both be injected");
+        let rendered = fetch_continuation(
+            &state,
+            query(Some("true")),
+            &engram_core::ActorContext::default(),
+        )
+        .await
+        .unwrap()
+        .expect("handoff + brief must both be injected");
         let handoff_pos = rendered.find("resume the auth refactor").unwrap();
         let brief_pos = rendered.find("project brief").unwrap();
         assert!(
             handoff_pos < brief_pos,
             "pending handoff must precede the brief"
         );
-        // `context_budget` is a required claim argument: an injected call
-        // shape without it is rejected during argument deserialization,
-        // before the claim runs.
+        // The automatic path already claimed, so the injected instruction is
+        // the acknowledgement contract, not another claim call.
         assert!(
-            rendered.contains("`context_budget`"),
-            "the injected claim instruction must name every required argument: {rendered}"
+            rendered.contains("memory_checkpoint_write") && rendered.contains("claim_id="),
+            "the injected instruction must name the acknowledgement arguments: {rendered}"
         );
     }
 
@@ -4619,17 +5221,13 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
-                workspace: None,
-                project: None,
-                project_strategy: None,
-                briefing: None,
-                briefing_budget: None,
+                ..session_start_query("claude-code", "run-render")
             },
-            &ActorKey::default(),
+            &engram_core::ActorContext::default(),
         )
         .await
         .unwrap()
@@ -4764,17 +5362,13 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
-                workspace: None,
-                project: None,
-                project_strategy: None,
-                briefing: None,
-                briefing_budget: None,
+                ..session_start_query("claude-code", "run-render")
             },
-            &ActorKey::default(),
+            &engram_core::ActorContext::default(),
         )
         .await
         .unwrap();
@@ -4849,26 +5443,37 @@ mod tests {
                 .unwrap();
         }
 
-        let query = HandoffQuery::default();
-        let alice_context = fetch_handoff_context(&state, query.clone(), &alice)
-            .await
-            .unwrap()
-            .unwrap();
-        let bob_context = fetch_handoff_context(&state, query, &bob)
-            .await
-            .unwrap()
-            .unwrap();
+        // The adapter's authenticated actor drives both the active-project
+        // lookup and the claim it records; the two must never diverge.
+        let alice_actor = engram_core::ActorContext {
+            user: Some("alice".into()),
+            ..Default::default()
+        };
+        let bob_actor = engram_core::ActorContext {
+            user: Some("bob".into()),
+            ..Default::default()
+        };
+        let alice_context =
+            fetch_continuation(&state, session_start_query("claude-code", ""), &alice_actor)
+                .await
+                .unwrap()
+                .unwrap();
+        let bob_context =
+            fetch_continuation(&state, session_start_query("claude-code", ""), &bob_actor)
+                .await
+                .unwrap()
+                .unwrap();
         assert!(alice_context.contains("alice continuation"));
         assert!(!alice_context.contains("bob continuation"));
         assert!(bob_context.contains("bob continuation"));
 
-        let missing = fetch_handoff_context(
+        let missing = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some("/tmp/never-created".into()),
-                ..HandoffQuery::default()
+                ..session_start_query("claude-code", "")
             },
-            &alice,
+            &alice_actor,
         )
         .await
         .unwrap();
@@ -5493,6 +6098,783 @@ mod tests {
         assert_ne!(
             proj_a, state.project_id,
             "Windows path must not fall back to the server-default project"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #45 — automatic SessionStart recovery through Agent Adapters.
+    // ---------------------------------------------------------------
+
+    /// Publish one plain continuation for `(ws, proj)` and return it.
+    async fn publish_continuation(
+        state: &HookState,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        objective: &str,
+    ) -> engram_core::PublishedHandoff {
+        state
+            .writer
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                source_run_id: SessionId::new(),
+                from_agent: AgentKind::Codex,
+                source_actor: "user:alice".into(),
+                to_agent: None,
+                cwd: None,
+                objective: objective.into(),
+                acceptance_criteria: vec!["ship it".into()],
+                summary: format!("{objective} summary"),
+                brief: String::new(),
+                context_refs: Vec::new(),
+                open_questions: vec!["what next".into()],
+                next_steps: vec!["continue".into()],
+                files_touched: Vec::new(),
+                artifacts: vec![],
+                relationships: vec![],
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Pull the Claim id out of a rendered continuation block, the way a
+    /// receiving agent reads it before acknowledging.
+    fn rendered_claim_id(rendered: &str) -> String {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("> Claim `"))
+            .and_then(|rest| rest.split('`').next())
+            .expect("the claimed block names its Claim id")
+            .to_owned()
+    }
+
+    fn alice() -> engram_core::ActorContext {
+        engram_core::ActorContext {
+            user: Some("alice".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Both shipped output-capable Adapters claim on SessionStart: the injected
+    /// block carries the continuation envelope, claim metadata, and a budgeted
+    /// ContextPackage, and the transfer is left CLAIMED rather than accepted.
+    #[tokio::test]
+    async fn output_capable_adapters_claim_and_render_the_shared_contract() {
+        for agent in ["claude-code", "codex"] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let published =
+                publish_continuation(&state, state.workspace_id, state.project_id, "resume auth")
+                    .await;
+
+            let rendered = fetch_continuation(
+                &state,
+                session_start_query(agent, "harness-session-1"),
+                &alice(),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{agent} must receive a claimed continuation"));
+
+            assert!(rendered.contains("continuation CLAIMED"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("Handoff `{}`", published.handoff_id)),
+                "{rendered}"
+            );
+            assert!(rendered.contains("Claim `"), "{rendered}");
+            assert!(rendered.contains("lease expires"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("adapter `{agent}:injected`")),
+                "the injected block names the delivery path: {rendered}"
+            );
+            assert!(rendered.contains("peer `codex`"), "{rendered}");
+            assert!(rendered.contains("**Continuation context**"), "{rendered}");
+            assert!(rendered.contains("**Objective**"), "{rendered}");
+            // Claimed, NOT accepted: acknowledgement is the receiver's first
+            // checkpoint, and the block says exactly that.
+            assert!(rendered.contains("memory_checkpoint_write"), "{rendered}");
+            assert!(!rendered.contains("memory_handoff_accept"), "{rendered}");
+
+            let handoff = state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                handoff.state,
+                engram_core::HandoffState::Claimed,
+                "{agent} must leave the transfer claimed, not acknowledged"
+            );
+        }
+    }
+
+    /// A harness the contract classifies as ignoring SessionStart output — and
+    /// any harness whose delivery is not established — performs NO automatic
+    /// Handoff read and NO mutation. The transfer stays `open` for an explicit
+    /// on-demand claim.
+    #[tokio::test]
+    async fn non_delivering_adapters_neither_read_nor_mutate_a_handoff() {
+        for agent in [Some("grok"), Some("some-future-cli"), None] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let published = publish_continuation(
+                &state,
+                state.workspace_id,
+                state.project_id,
+                "leave me open",
+            )
+            .await;
+
+            let query = HandoffQuery {
+                agent: agent.map(str::to_owned),
+                ..session_start_query("unused", "harness-session-2")
+            };
+            let rendered = fetch_continuation(&state, query, &alice()).await.unwrap();
+            assert!(
+                rendered.is_none(),
+                "{agent:?} must inject nothing: {rendered:?}"
+            );
+
+            let handoff = state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                handoff.state,
+                engram_core::HandoffState::Open,
+                "{agent:?} must not mutate the transfer"
+            );
+            assert_eq!(handoff.revision, published.handoff_revision);
+
+            // ... and the same transfer is still claimable on demand.
+            let claimed = state
+                .writer
+                .claim_handoff(engram_core::HandoffClaim {
+                    handoff_id: published.handoff_id,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    expected_revision: published.handoff_revision,
+                    run_id: SessionId::new(),
+                    attempt_id: engram_core::AttemptId::new(),
+                    actor_key: "user:alice".into(),
+                    lease_seconds: 60,
+                    context_options: serde_json::Value::Null,
+                    delivery_path: "grok:on-demand".into(),
+                })
+                .await;
+            assert!(
+                claimed.is_ok(),
+                "an untouched transfer must stay on-demand claimable: {claimed:?}"
+            );
+        }
+    }
+
+    /// An output-capable Adapter that cannot report its own Run must not claim:
+    /// a lease bound to no Run can never be acknowledged. It renders the
+    /// read-only envelope and points the agent at the on-demand claim.
+    #[tokio::test]
+    async fn output_capable_adapter_without_a_run_renders_read_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published =
+            publish_continuation(&state, state.workspace_id, state.project_id, "no run id").await;
+
+        let rendered = fetch_continuation(
+            &state,
+            HandoffQuery {
+                session_id: None,
+                ..session_start_query("claude-code", "unused")
+            },
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("the read-only envelope must still render");
+        assert!(rendered.contains("pending handoff"), "{rendered}");
+        assert!(rendered.contains("memory_handoff_claim"), "{rendered}");
+        assert!(!rendered.contains("CLAIMED"), "{rendered}");
+
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Open,
+        );
+    }
+
+    /// The claim binds to the Run the harness actually reported, mapped through
+    /// the same [`SessionId::from_agent_session`] the capture path uses — so the
+    /// receiving Run's checkpoint acknowledges the transfer end to end.
+    #[tokio::test]
+    async fn actual_session_identity_is_forwarded_and_acknowledged_by_that_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published =
+            publish_continuation(&state, state.workspace_id, state.project_id, "bind the run")
+                .await;
+
+        let harness_session = "codex-session-2026-09-03";
+        let expected_run = SessionId::from_agent_session(harness_session);
+        let rendered = fetch_continuation(
+            &state,
+            session_start_query("codex", harness_session),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("continuation must render");
+        assert!(
+            rendered.contains(&format!("Run `{expected_run}`")),
+            "the block must name the Run the claim is bound to: {rendered}"
+        );
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, true)
+            .await
+            .unwrap()
+            .expect("the claimed transfer is still inspectable");
+        let entry = envelope
+            .chain
+            .iter()
+            .find(|entry| entry.handoff_id == published.handoff_id)
+            .expect("the chain records the receiving provenance");
+        assert_eq!(entry.receiving_run_id, Some(expected_run));
+        assert_eq!(entry.receiving_actor.as_deref(), Some("user:alice"));
+
+        // The rendered ids acknowledge through the ordinary checkpoint path:
+        // the automatic claim's actor and Run match what the receiving agent
+        // will present over MCP.
+        // Take the Claim id from the INJECTED BLOCK, exactly as a receiving
+        // agent would: the acknowledgement contract has to be usable from what
+        // the adapter actually rendered.
+        let claim_id = engram_core::ClaimId::from_str(&rendered_claim_id(&rendered))
+            .expect("the injected block carries a usable Claim id");
+        state
+            .writer
+            .write_checkpoint(engram_core::CheckpointWrite {
+                work_item_id: published.work_item_id,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                run_id: expected_run,
+                handoff_id: Some(published.handoff_id),
+                claim_id: Some(claim_id),
+                expected_handoff_revision: Some(published.handoff_revision + 1),
+                expected_work_item_revision: envelope.work_item.revision,
+                attempt_id: engram_core::AttemptId::new(),
+                actor_key: "user:alice".into(),
+                summary: "picked it up".into(),
+                work_item_state: engram_core::WorkItemState::Active,
+                acceptance_criteria: vec![engram_core::AcceptanceCriterionStatus {
+                    criterion: "ship it".into(),
+                    satisfied: false,
+                }],
+                artifacts: vec![],
+                relationships: vec![],
+                parent_result: None,
+            })
+            .await
+            .expect("the receiving Run's first checkpoint acknowledges the automatic claim");
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Acknowledged,
+        );
+    }
+
+    /// A receiver that loses its output before checkpointing leaves a live but
+    /// recoverable claim: once the lease elapses the transfer is claimable
+    /// again, by SessionStart or on demand.
+    #[tokio::test]
+    async fn lost_output_leaves_a_recoverable_claim_that_expires_back_to_open() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published =
+            publish_continuation(&state, state.workspace_id, state.project_id, "recoverable").await;
+
+        fetch_continuation(
+            &state,
+            session_start_query("claude-code", "lost-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("first session claims");
+
+        // A second session start finds nothing while the lease is live.
+        assert!(
+            fetch_continuation(
+                &state,
+                session_start_query("claude-code", "second-run"),
+                &alice()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a live lease means the work is being carried, not waiting"
+        );
+
+        // The receiver vanished without checkpointing; the lease elapses.
+        let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE handoff_claims SET lease_expires_at = 0 WHERE state = 'live'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+
+        let recovered = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "second-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("an expired lease returns the transfer to a new receiver");
+        assert!(
+            recovered.contains(&format!("Handoff `{}`", published.handoff_id)),
+            "{recovered}"
+        );
+    }
+
+    /// Automatic SessionStart recovery and an on-demand MCP claim go through the
+    /// same compare-and-set path, so exactly one of them wins.
+    #[tokio::test]
+    async fn concurrent_session_start_and_on_demand_claim_produce_one_winner() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published =
+            publish_continuation(&state, state.workspace_id, state.project_id, "one winner").await;
+
+        let automatic = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                fetch_continuation(
+                    &state,
+                    session_start_query("claude-code", "auto-run"),
+                    &alice(),
+                )
+                .await
+                .unwrap()
+            })
+        };
+        let on_demand = {
+            let writer = state.writer.clone();
+            let (ws, proj) = (state.workspace_id, state.project_id);
+            let revision = published.handoff_revision;
+            let handoff_id = published.handoff_id;
+            tokio::spawn(async move {
+                writer
+                    .claim_handoff(engram_core::HandoffClaim {
+                        handoff_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        expected_revision: revision,
+                        run_id: SessionId::new(),
+                        attempt_id: engram_core::AttemptId::new(),
+                        actor_key: "user:alice".into(),
+                        lease_seconds: 60,
+                        context_options: serde_json::Value::Null,
+                        delivery_path: "claude-code:on-demand".into(),
+                    })
+                    .await
+            })
+        };
+        let automatic_won = automatic.await.unwrap().is_some();
+        let on_demand_won = on_demand.await.unwrap().is_ok();
+        assert!(
+            automatic_won ^ on_demand_won,
+            "exactly one claimant may win the shared CAS: automatic={automatic_won}, on_demand={on_demand_won}"
+        );
+
+        // Whoever won, the transfer holds exactly one live claim.
+        let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoff_claims WHERE state = 'live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1);
+    }
+
+    /// Both bounds on the automatic path in one place: assembly runs with no
+    /// LLM provider at all (the hook path never holds an embedder) and reports
+    /// the configured byte budget, and an exhausted wall-clock timeout injects
+    /// nothing rather than holding up session start.
+    #[tokio::test]
+    async fn continuation_is_budget_and_timeout_bounded_without_a_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "decisions/auth.md",
+                "the auth refactor keeps the single writer actor",
+                false,
+            ))
+            .await
+            .unwrap();
+        publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "auth refactor",
+        )
+        .await;
+        state.continuity.context_budget = 4_000;
+
+        let rendered = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "no-provider-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("continuation must render with no provider configured");
+        assert!(
+            rendered.contains("/4000 utf8_bytes"),
+            "the package must report the configured budget: {rendered}"
+        );
+        assert!(
+            rendered.contains("memory_context_read"),
+            "the package must tell the agent how to resolve exact evidence: {rendered}"
+        );
+
+        // Same state, unreachable timeout: nothing is injected.
+        state.continuity.timeout = std::time::Duration::from_nanos(1);
+        let rendered = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "slow-run"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rendered.is_none(),
+            "an exhausted timeout must inject nothing: {rendered:?}"
+        );
+    }
+
+    /// The WorkItem hint narrows selection inside the resolved scope and grants
+    /// nothing: a hint naming work in another project simply matches nothing.
+    #[tokio::test]
+    async fn work_item_hint_narrows_selection_and_never_crosses_scope() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let older =
+            publish_continuation(&state, state.workspace_id, state.project_id, "older work").await;
+        let newer =
+            publish_continuation(&state, state.workspace_id, state.project_id, "newer work").await;
+        assert_ne!(older.work_item_id, newer.work_item_id);
+
+        // Without a hint the newest transfer wins.
+        let rendered = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "hint-run-a"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(rendered.contains("newer work"), "{rendered}");
+
+        // A hint naming the older WorkItem selects that one instead.
+        let rendered = fetch_continuation(
+            &state,
+            HandoffQuery {
+                work_item: Some(older.work_item_id.to_string()),
+                ..session_start_query("claude-code", "hint-run-b")
+            },
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(rendered.contains("older work"), "{rendered}");
+
+        // A hint pointing at another project's WorkItem matches nothing here;
+        // it never widens the scope and never authorizes a cross-scope read.
+        let other_project = state
+            .writer
+            .get_or_create_project(state.workspace_id, "other-project", None)
+            .await
+            .unwrap();
+        let foreign =
+            publish_continuation(&state, state.workspace_id, other_project, "foreign work").await;
+        let rendered = fetch_continuation(
+            &state,
+            HandoffQuery {
+                work_item: Some(foreign.work_item_id.to_string()),
+                ..session_start_query("claude-code", "hint-run-c")
+            },
+            &alice(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rendered.is_none(),
+            "a foreign WorkItem hint must select nothing: {rendered:?}"
+        );
+    }
+
+    /// A transfer addressed to another Adapter is still claimable: the target
+    /// selector is a routing hint, and the claim is recorded against the
+    /// authenticated actor, never the target.
+    #[tokio::test]
+    async fn target_hint_neither_gates_the_claim_nor_becomes_the_actor() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published = state
+            .writer
+            .publish_handoff(NewHandoff {
+                work_item_id: None,
+                expected_work_item_revision: None,
+                expected_checkpoint_revision: None,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                source_run_id: SessionId::new(),
+                from_agent: AgentKind::Codex,
+                source_actor: "user:bob".into(),
+                // Addressed to an adapter that cannot even deliver output.
+                to_agent: Some(AgentKind::Grok),
+                cwd: None,
+                objective: "addressed elsewhere".into(),
+                acceptance_criteria: vec![],
+                summary: "addressed elsewhere".into(),
+                brief: String::new(),
+                context_refs: Vec::new(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                artifacts: vec![],
+                relationships: vec![],
+            })
+            .await
+            .unwrap();
+
+        let rendered = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "peer-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("a target selector must not gate the claim");
+        assert!(
+            rendered.contains("addressed to `grok` (routing hint only)"),
+            "{rendered}"
+        );
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = envelope
+            .chain
+            .iter()
+            .find(|entry| entry.handoff_id == published.handoff_id)
+            .unwrap();
+        assert_eq!(
+            entry.receiving_actor.as_deref(),
+            Some("user:alice"),
+            "the claim belongs to the authenticated actor, not the target hint"
+        );
+    }
+
+    /// The audit trail identifies the Adapter and its delivery path alongside
+    /// actor, Run, WorkItem, Handoff revision, and outcome — and records no
+    /// claim secret.
+    #[tokio::test]
+    async fn claim_audit_records_the_adapter_delivery_path_without_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        publish_continuation(&state, state.workspace_id, state.project_id, "audited").await;
+        fetch_continuation(
+            &state,
+            session_start_query("claude-code", "audited-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM audit_log WHERE op = 'handoff_claim' ORDER BY at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["delivery_path"], "claude-code:injected");
+        assert_eq!(detail["actor"], "user:alice");
+        assert_eq!(detail["outcome"], "claimed");
+        assert!(detail["run_id"].is_string());
+        assert!(detail["work_item_id"].is_string());
+        assert!(detail["revision"].is_number());
+        assert!(
+            detail.get("claim_id").is_none(),
+            "the audit record must not carry the Claim capability: {detail}"
+        );
+    }
+
+    /// A SessionStart that fires again inside the SAME Run re-renders the
+    /// claim that Run already holds — even when the project has since acquired
+    /// another open transfer.
+    ///
+    /// This is the `/clear` path. Discovering open work first would claim the
+    /// *newer* transfer instead, stranding the continuation this Run is
+    /// carrying under its lease and injecting unrelated work.
+    #[tokio::test]
+    async fn repeated_session_start_rerenders_the_held_claim_not_another_open_one() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "the held work",
+        )
+        .await;
+
+        let first = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "same-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(first.contains("the held work"), "{first}");
+
+        // Another agent leaves a NEWER open transfer in the same project while
+        // this Run is mid-task.
+        let distraction = publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "someone else's newer work",
+        )
+        .await;
+
+        let second = fetch_continuation(
+            &state,
+            session_start_query("claude-code", "same-run"),
+            &alice(),
+        )
+        .await
+        .unwrap()
+        .expect("the same Run must get its own continuation back");
+        assert!(
+            second.contains("the held work"),
+            "the Run's own claim must be re-rendered: {second}"
+        );
+        assert!(
+            !second.contains("someone else's newer work"),
+            "a second start must not claim unrelated work: {second}"
+        );
+
+        let claim_line = |rendered: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with("> Claim `"))
+                .map(str::to_owned)
+                .unwrap()
+        };
+        assert_eq!(
+            claim_line(&first),
+            claim_line(&second),
+            "the re-render must return the same Claim and lease"
+        );
+
+        // The distraction is untouched, and exactly one claim exists.
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(distraction.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Open,
+        );
+        let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let claims: i64 = conn
+            .query_row("SELECT COUNT(*) FROM handoff_claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(claims, 1, "a re-render must not record a second claim");
+    }
+
+    /// A supplied cwd that resolves to no existing project must claim nothing.
+    ///
+    /// This endpoint mutates, and the resolved scope decides WHOSE
+    /// continuation is consumed — falling back to the server's baked default
+    /// project would hand this session another project's work.
+    #[tokio::test]
+    async fn unresolvable_cwd_claims_nothing_instead_of_falling_back() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published = publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "default-scope work",
+        )
+        .await;
+
+        for cwd in ["/", engram_core::GLOBAL_SCOPE_PROJECT] {
+            let rendered = fetch_continuation(
+                &state,
+                HandoffQuery {
+                    cwd: Some(cwd.into()),
+                    ..session_start_query("claude-code", "unresolved-run")
+                },
+                &alice(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                rendered.is_none(),
+                "cwd {cwd:?} must not fall back to the default scope: {rendered:?}"
+            );
+        }
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Open,
+            "the default project's transfer must be untouched"
         );
     }
 }

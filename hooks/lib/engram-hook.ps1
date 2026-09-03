@@ -20,6 +20,97 @@ function Get-EngramCwd {
     return $null
 }
 
+# The harness's own session identifier.
+#
+# MUST stay in lockstep with `engram_hooks::extract_session_id` (its
+# SESSION_ID_KEYS then SESSION_ID_PATHS, in that order) and with
+# `engram_extract_session_id` in hooks/_lib.sh. A divergence is silent and
+# expensive: miss the id and an output-capable adapter degrades to the
+# read-only render on every start; find a *different* id and the automatic
+# claim binds to a Run that never writes the acknowledging checkpoint.
+function Get-EngramSessionIdFromObject {
+    param($Parsed)
+    if ($null -eq $Parsed) { return $null }
+    # Phase 1 — SESSION_ID_KEYS across the same candidate objects the Rust
+    # extractor probes (root, .properties, .properties.info, .info, .path).
+    $Candidates = @($Parsed)
+    foreach ($Container in @($Parsed, $Parsed.payload, $Parsed.event)) {
+        if ($null -eq $Container) { continue }
+        $Candidates += $Container
+        if ($null -ne $Container.properties) {
+            $Candidates += $Container.properties
+            if ($null -ne $Container.properties.info) { $Candidates += $Container.properties.info }
+        }
+        if ($null -ne $Container.info) { $Candidates += $Container.info }
+        if ($null -ne $Container.path) { $Candidates += $Container.path }
+    }
+    foreach ($Name in @("session_id", "sessionId", "sessionID", "session", "conversationId")) {
+        foreach ($Candidate in $Candidates) {
+            if ($null -eq $Candidate) { continue }
+            $Value = $Candidate.$Name
+            if ($Value -is [string] -and $Value.Trim().Length -gt 0) { return $Value }
+        }
+    }
+    # Phase 2 — SESSION_ID_PATHS, in order. `info.id` first on purpose.
+    $Paths = @(
+        @("info", "id"),
+        @("properties", "sessionID"),
+        @("properties", "info", "id"),
+        @("event", "properties", "sessionID"),
+        @("event", "properties", "info", "id"),
+        @("payload", "info", "id"),
+        @("payload", "properties", "sessionID"),
+        @("payload", "properties", "info", "id")
+    )
+    foreach ($Path in $Paths) {
+        $Node = $Parsed
+        foreach ($Segment in $Path) {
+            if ($null -eq $Node) { break }
+            $Node = $Node.$Segment
+        }
+        if ($Node -is [string] -and $Node.Trim().Length -gt 0) { return $Node }
+    }
+    return $null
+}
+
+function Get-EngramSessionId {
+    param([string] $Payload)
+    if (-not $Payload) { return $null }
+    try {
+        $Parsed = $Payload | ConvertFrom-Json -ErrorAction Stop
+        $FromObject = Get-EngramSessionIdFromObject -Parsed $Parsed
+        if ($FromObject) { return $FromObject }
+    } catch {
+    }
+    # Unparseable payload: fall back to the same substring scan the POSIX
+    # helper uses, keys first and then the nested paths.
+    foreach ($Name in @("session_id", "sessionId", "sessionID", "session", "conversationId")) {
+        $m = [regex]::Match($Payload, "`"$Name`"\s*:\s*`"([^`"]*)`"")
+        if ($m.Success -and $m.Groups[1].Value.Trim().Length -gt 0) { return $m.Groups[1].Value }
+    }
+    foreach ($Path in @(
+            @("info", "id"),
+            @("properties", "sessionID"),
+            @("properties", "info", "id"),
+            @("event", "properties", "sessionID"),
+            @("event", "properties", "info", "id"),
+            @("payload", "info", "id"),
+            @("payload", "properties", "sessionID"),
+            @("payload", "properties", "info", "id"))) {
+        $Rest = $Payload
+        $Found = $true
+        foreach ($Segment in $Path) {
+            $Index = $Rest.IndexOf("`"$Segment`"", [System.StringComparison]::Ordinal)
+            if ($Index -lt 0) { $Found = $false; break }
+            $Rest = $Rest.Substring($Index + $Segment.Length + 2)
+        }
+        if (-not $Found) { continue }
+        $m = [regex]::Match($Rest, "^\s*:\s*`"([^`"]*)`"")
+        if ($m.Success -and $m.Groups[1].Value.Trim().Length -gt 0) { return $m.Groups[1].Value }
+    }
+    return $null
+}
+
 function Get-EngramMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -72,12 +163,14 @@ function Get-EngramMarkerQuery {
     $proj = $null
     $strategy = $null
     $dropSubagent = $null
+    $workItem = $null
     $marker = Get-EngramMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-EngramTomlKey -File $marker -Key "workspace"
         $proj = Get-EngramTomlKey -File $marker -Key "project"
         $strategy = Get-EngramTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-EngramTomlKey -File $marker -Key "drop_subagent_captures"
+        $workItem = Get-EngramTomlKey -File $marker -Key "work_item"
     }
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
@@ -96,6 +189,9 @@ function Get-EngramMarkerQuery {
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
+    # Optional WorkItem selection hint for a checkout pinned to one task. It
+    # narrows discovery inside the already-resolved scope and authorizes nothing.
+    if ($workItem) { $qs += "&work_item=$([uri]::EscapeDataString($workItem))" }
     return $qs
 }
 
@@ -119,6 +215,10 @@ function Read-EngramStdin {
 }
 
 function Invoke-EngramHook {
+    # `-FetchHandoff` is set only for harnesses the shared Agent Adapter
+    # contract classifies as delivering SessionStart output. A harness that
+    # discards it (Grok) omits the switch and performs no Handoff read or
+    # mutation; the server enforces the same rule from `engram_core::adapter`.
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
         [Parameter(Mandatory = $true)] [string] $Agent,
@@ -150,10 +250,19 @@ function Invoke-EngramHook {
 
     if ($FetchHandoff) {
         try {
+            # Forward the Run this session is starting so the server can bind
+            # the automatic Handoff claim to the actual receiving Run.
+            $SessionId = Get-EngramSessionId -Payload $Payload
+            $RunQS = ""
+            if ($SessionId) { $RunQS = "&session_id=$([uri]::EscapeDataString($SessionId))" }
+            # 1s — the SESSION_START_CLIENT_BUDGET_MS the server's continuity
+            # timeout ceiling is kept strictly below. Keep this in step with
+            # `curl --max-time 1.0` in hooks/_lib.sh and `timeoutSignal(1000)`
+            # in the generated TypeScript integrations.
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
-                -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS" `
+                -TimeoutSec 1 `
+                -Uri "$Server/handoff?agent=$Agent$QS$RunQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
                 if ($AntigravityPreInvocationOutput) {

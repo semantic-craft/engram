@@ -240,36 +240,7 @@ impl HookEnvelope {
     pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code uses `session_id`,
-        // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
-        // JSON keys are case-sensitive, so all spellings must be listed
-        // or tool events fail the router's "missing session_id" check.
-        let session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
+        let session_id = extract_session_id(&raw);
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
             .or_else(|| {
@@ -333,6 +304,51 @@ impl HookEnvelope {
             raw,
         }
     }
+}
+
+/// Top-level session-id key spellings, in precedence order.
+///
+/// OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
+/// `tool.execute.*` / `session.*` events; Claude Code uses `session_id`, Codex
+/// `sessionId`, and Antigravity CLI `conversationId`. JSON keys are
+/// case-sensitive, so every spelling must be listed or tool events fail the
+/// router's "missing session_id" check.
+pub const SESSION_ID_KEYS: &[&str] = &[
+    "session_id",
+    "sessionId",
+    "sessionID",
+    "session",
+    "conversationId",
+];
+
+/// Nested session-id paths, in precedence order, tried after
+/// [`SESSION_ID_KEYS`].
+///
+/// `info.id` comes first on purpose: an OpenCode-shaped payload nests the real
+/// session under `info`, and preferring a nested `properties.sessionID` there
+/// would bind a claim to a different Run than capture used.
+pub const SESSION_ID_PATHS: &[&[&str]] = &[
+    &["info", "id"],
+    &["properties", "sessionID"],
+    &["properties", "info", "id"],
+    &["event", "properties", "sessionID"],
+    &["event", "properties", "info", "id"],
+    &["payload", "info", "id"],
+    &["payload", "properties", "sessionID"],
+    &["payload", "properties", "info", "id"],
+];
+
+/// The ONE session-id extraction used by every engram delivery path.
+///
+/// Hook capture (`POST /hook`) and the native `engram hook` client's
+/// `GET /handoff` call both resolve here, so an automatic SessionStart claim
+/// binds to exactly the Run this session's observations land under. The POSIX
+/// and PowerShell hook helpers mirror the same ordered lists; a divergence
+/// there silently degrades an output-capable adapter to the read-only render,
+/// or worse, binds the claim to a different Run.
+#[must_use]
+pub fn extract_session_id(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, SESSION_ID_KEYS).or_else(|| extract_string_path(raw, SESSION_ID_PATHS))
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {

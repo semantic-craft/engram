@@ -33,6 +33,18 @@ pub enum ContextKind {
     Observation,
 }
 
+impl ContextKind {
+    /// Canonical snake_case wire string, matching the serde representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WikiPage => "wiki_page",
+            Self::SessionPage => "session_page",
+            Self::Observation => "observation",
+        }
+    }
+}
+
 /// Stable, scoped, revisioned source reference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, schemars::JsonSchema)]
 #[schemars(with = "String")]

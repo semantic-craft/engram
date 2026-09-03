@@ -30,6 +30,9 @@ regex.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 git2.workspace = true
+# Tests only: forcibly elapse a claim lease to prove a lost receiver's
+# transfer becomes claimable again.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

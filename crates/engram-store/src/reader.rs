@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use engram_core::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, Checkpoint, CheckpointId, Handoff,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, Checkpoint, CheckpointId, ClaimId, Handoff,
     HandoffChainEntry, HandoffId, HandoffState, Observation, ObservationId, ObservationKind,
     PageId, PagePath, ProjectId, SessionId, User, UserId, WorkItem, WorkItemId, WorkspaceId,
 };
@@ -680,6 +680,17 @@ pub struct SessionSummary {
     pub observations: u64,
     /// Path of the session's summary page, when one was synthesised.
     pub summary_path: Option<String>,
+}
+
+/// One live, unexpired claim, as held by a known actor and Run.
+#[derive(Debug, Clone)]
+pub struct LiveHandoffClaim {
+    /// Opaque lease capability.
+    pub claim_id: ClaimId,
+    /// Transfer the lease is held on.
+    pub handoff_id: HandoffId,
+    /// When the lease elapses.
+    pub lease_expires_at: Timestamp,
 }
 
 /// Everything a receiver needs to decide whether to take a transfer, read
@@ -2585,6 +2596,7 @@ impl ReaderPool {
                 workspace_id,
                 project_id,
                 cwd_filter.as_deref(),
+                None,
                 include_claimed,
             )
         })
@@ -2608,6 +2620,7 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         cwd_filter: Option<String>,
+        work_item_filter: Option<WorkItemId>,
         include_claimed: bool,
     ) -> StoreResult<Option<ContinuationEnvelope>> {
         self.with_conn(move |conn| {
@@ -2617,6 +2630,7 @@ impl ReaderPool {
                 workspace_id,
                 project_id,
                 cwd_filter.as_deref(),
+                work_item_filter,
                 include_claimed,
             )?
             else {
@@ -2661,7 +2675,105 @@ impl ReaderPool {
         .await
     }
 
-    /// Look up the stable WorkItem behind a discovered Handoff.
+    /// The live, unexpired claim this exact actor and Run already hold in one
+    /// scope, if any.
+    ///
+    /// Automatic SessionStart recovery consults this FIRST, before any
+    /// open-transfer discovery. A harness re-fires SessionStart inside a live
+    /// Run (Claude Code does it on `/clear` and on resume); without this check
+    /// the second start would ignore the continuation the Run is already
+    /// carrying and claim whatever *other* open transfer the project happens to
+    /// have, stranding the first claim under its lease and injecting unrelated
+    /// work. A lapsed lease is deliberately not returned: an elapsed claim is
+    /// recoverable work for the next receiver, not a live holding.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, or timestamp errors.
+    pub async fn live_claim_for_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor_key: String,
+        run_id: SessionId,
+    ) -> StoreResult<Option<LiveHandoffClaim>> {
+        self.with_conn(move |conn| {
+            let now = Timestamp::now().as_microsecond();
+            let row: Option<(Vec<u8>, Vec<u8>, i64)> = conn
+                .query_row(
+                    "SELECT id, handoff_id, lease_expires_at FROM handoff_claims \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND actor_key = ?3 \
+                       AND run_id = ?4 AND state = 'live' AND lease_expires_at > ?5 \
+                     ORDER BY claimed_at DESC, rowid DESC LIMIT 1",
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        actor_key,
+                        run_id.as_bytes(),
+                        now
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            row.map(|(claim_id, handoff_id, lease_expires_at)| {
+                Ok(LiveHandoffClaim {
+                    claim_id: ClaimId::from_slice(&claim_id)?,
+                    handoff_id: HandoffId::from_slice(&handoff_id)?,
+                    lease_expires_at: Timestamp::from_microsecond(lease_expires_at)
+                        .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Read the continuation envelope for one EXACT Handoff from a single
+    /// consistent snapshot.
+    ///
+    /// Sibling of [`Self::discover_continuation`] for the case where the
+    /// Handoff is already known (a Run re-rendering the claim it holds) rather
+    /// than being selected by eligibility rules. Shares the same snapshot
+    /// discipline so the envelope cannot mix a transfer with a WorkItem or
+    /// Checkpoint that has already moved past it.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
+    pub async fn continuation_by_handoff_id(
+        &self,
+        handoff_id: HandoffId,
+    ) -> StoreResult<Option<ContinuationEnvelope>> {
+        self.with_conn(move |conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let row = snapshot
+                .query_row(
+                    &format!("SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE id = ?1"),
+                    params![handoff_id.as_bytes()],
+                    row_to_handoff,
+                )
+                .optional()?;
+            let Some(handoff) = row.transpose()? else {
+                return Ok(None);
+            };
+            let handoff = hydrate_handoff(&snapshot, handoff)?;
+            let work_item_id = handoff.work_item_id;
+            let Some(work_item) = load_work_item(&snapshot, work_item_id)? else {
+                return Err(StoreError::MalformedRecord(format!(
+                    "handoff {handoff_id} has no work item"
+                )));
+            };
+            let latest_checkpoint = load_latest_checkpoint(&snapshot, work_item_id)?;
+            let chain = load_handoff_chain(&snapshot, work_item_id)?;
+            Ok(Some(ContinuationEnvelope {
+                handoff,
+                work_item,
+                latest_checkpoint,
+                chain,
+            }))
+        })
+        .await
+    }
+
+    /// Look up the stable WorkItem behind a discovered Handoff.    /// Look up the stable WorkItem behind a discovered Handoff.
     ///
     /// # Errors
     /// Propagates SQL, identity, timestamp, or persisted JSON errors.
@@ -5910,6 +6022,7 @@ fn select_claimable_handoff(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     cwd_filter: Option<&str>,
+    work_item_filter: Option<WorkItemId>,
     include_claimed: bool,
 ) -> StoreResult<Option<Handoff>> {
     let claimable = claimable_handoff_predicate("h", "?4");
@@ -5932,6 +6045,12 @@ fn select_claimable_handoff(
     let mut selected: Option<Handoff> = None;
     for r in rows {
         let handoff = r??;
+        // The WorkItem hint only NARROWS selection inside the already-resolved
+        // workspace/project: a hint naming work in another scope simply matches
+        // nothing here. It never widens the query and never authorizes a read.
+        if work_item_filter.is_some_and(|hint| handoff.work_item_id != hint) {
+            continue;
+        }
         if is_handoff_candidate(&handoff, cwd_filter)
             && selected
                 .as_ref()

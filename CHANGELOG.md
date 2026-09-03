@@ -12,6 +12,64 @@ below start from the fork.
 
 ### Added
 
+- Automatic session-start recovery now uses the same recoverable claim and
+  ContextPackage contract as on-demand continuation. `GET /handoff` is driven
+  by a shared, typed **Agent Adapter contract** (`engram_core::adapter`) that
+  normalizes harness kind, authenticated actor, peer, the actual receiving
+  Run/Session when the harness reports one, an optional WorkItem hint, the
+  lifecycle event, the cwd hint, and — the decisive field — whether that
+  harness delivers SessionStart output. An adapter that delivers it discovers
+  and atomically claims one eligible Handoff through the same compare-and-set
+  path as `memory_handoff_claim`, binding the claim to the real receiving Run,
+  and the injected block carries the identical envelope, claim metadata,
+  budgeted ContextPackage, provenance, and assembly trace the MCP tool returns
+  (both call the new shared `engram_store::continuation` module). The Handoff
+  is left **claimed, never accepted**: the receiving Run's first valid
+  `memory_checkpoint_write` acknowledges it, and a session that dies before
+  checkpointing leaves a recoverable claim that returns to `open` at lease
+  expiry. Concurrent automatic and on-demand claims meet at one
+  compare-and-set, so exactly one claimant wins. Grok — which discards
+  SessionStart stdout — and every harness whose delivery is not established
+  now perform **no** automatic Handoff read or mutation and recover on demand
+  instead. Claim audit records name the adapter and delivery path alongside
+  actor, Run, WorkItem, Handoff revision, and outcome, without recording the
+  Claim capability.
+- New `[continuity]` config table bounds automatic session-start recovery:
+  `session_start_context_budget` (UTF-8 bytes, default 8000),
+  `session_start_timeout_ms` (default 750) covering discover + claim +
+  assemble + render, and `session_start_lease_seconds` (default 900). The
+  timeout is clamped to 50-900 ms, strictly below the 1 s deadline every
+  shipped hook client aborts at, so the server always gives up first; context
+  assembly on this path never calls an LLM provider.
+- `.engram.toml` gains an optional `work_item` key: a checkout pinned to one
+  task only receives continuations for that exact WorkItem. It is a selection
+  hint inside the already-resolved scope — it never widens scope and never
+  authorizes anything.
+
+### Changed
+
+- Every shipped hook client now encodes its adapter's output capability and
+  forwards its session id on `GET /handoff`: the six delivery-capable
+  `hooks/*/session-start.sh` and `.ps1` bundles, the native
+  `engram hook --event session-start` path, and the generated OpenCode, OMP,
+  Pi, and OpenClaw integrations. Grok's bundle stays capture-only. An adapter
+  that cannot report its Run still renders the read-only envelope and points
+  the agent at `memory_handoff_claim`.
+- Routing instructions, the managed handoff skill, and the MCP tool
+  descriptions now teach agents to use an injected "continuation CLAIMED"
+  block directly and acknowledge it with their first checkpoint, rather than
+  claiming it again.
+- `GET /handoff` now passes `Capability::NormalWrite` through
+  `AuthLevel::authorize` on its claiming path, matching every MCP continuity
+  transition. A supplied cwd that resolves to no existing project claims
+  nothing instead of falling back to the server's default project.
+- Every delivery path resolves the harness session id through one shared
+  ordered key-and-path list (`engram_hooks::extract_session_id`), so
+  OpenCode-shaped `{"info":{"id":…}}` payloads are recognized and the
+  automatic claim can never bind to a different Run than hook capture
+  recorded. The PowerShell client's `GET /handoff` deadline drops from 2 s to
+  1 s to match the POSIX and generated TypeScript clients.
+
 - A WorkItem can now cross many agents and Runs without overwriting earlier
   transfers. `memory_handoff_begin` publishes a *successor* Handoff for an
   existing WorkItem, requiring the caller's `expected_work_item_revision` and

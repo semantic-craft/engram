@@ -291,6 +291,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     engram_hooks::SubagentSessionSet::default(),
                 )),
                 home_dir: config.home_dir.clone(),
+                continuity: config.continuity.resolved(),
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),

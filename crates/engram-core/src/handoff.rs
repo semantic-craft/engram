@@ -344,6 +344,11 @@ pub struct HandoffClaim {
     /// callers that assemble nothing.
     #[serde(default)]
     pub context_options: serde_json::Value,
+    /// Which delivery path recorded this claim, e.g. `claude-code:injected`
+    /// for automatic SessionStart recovery or `mcp:on-demand` for the tool
+    /// surface. Audit metadata only: never part of the Attempt identity, never
+    /// an authorization input, and it carries no claim secret.
+    pub delivery_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

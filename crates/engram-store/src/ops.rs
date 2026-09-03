@@ -1337,6 +1337,7 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
             .iter()
             .map(|rel| rel.id.to_string())
             .collect::<Vec<_>>(),
+        None,
     )?;
     tx.commit()?;
     Ok(PublishedHandoff {
@@ -1476,7 +1477,7 @@ pub fn claim_handoff(
                      WHERE handoff_id = ?2 AND state = 'live'",
                         params![now, input.handoff_id.as_bytes()],
                     )?;
-                    audit_continuity(
+                    audit_continuity_claim(
                         &tx,
                         "handoff_claim_expire",
                         input.workspace_id,
@@ -1489,6 +1490,7 @@ pub fn claim_handoff(
                         &input.actor_key,
                         "expired",
                         now,
+                        &input.delivery_path,
                     )?;
                     handoff.state = HandoffState::Open;
                     None
@@ -1520,7 +1522,7 @@ pub fn claim_handoff(
             &message,
             now,
         )?;
-        audit_continuity(
+        audit_continuity_claim(
             &tx,
             "handoff_claim",
             input.workspace_id,
@@ -1533,6 +1535,7 @@ pub fn claim_handoff(
             &input.actor_key,
             "conflict",
             now,
+            &input.delivery_path,
         )?;
         tx.commit()?;
         return Err(StoreError::InvalidState(message));
@@ -1610,7 +1613,7 @@ pub fn claim_handoff(
         &result,
         now,
     )?;
-    audit_continuity(
+    audit_continuity_claim(
         &tx,
         "handoff_claim",
         input.workspace_id,
@@ -1623,6 +1626,7 @@ pub fn claim_handoff(
         &input.actor_key,
         "claimed",
         now,
+        &input.delivery_path,
     )?;
     tx.commit()?;
     Ok(result)
@@ -2309,6 +2313,7 @@ pub fn write_checkpoint(
             .iter()
             .map(|rel| rel.id.to_string())
             .collect::<Vec<_>>(),
+        None,
     )?;
     if matches!(
         input.work_item_state,
@@ -2680,6 +2685,47 @@ fn audit_continuity(
         at,
         &[],
         &[],
+        None,
+    )
+}
+
+/// Claim-specific audit that also records WHICH delivery path recorded the
+/// transition — the Agent Adapter for automatic SessionStart recovery, or the
+/// MCP tool surface for an on-demand claim. The label is a capability
+/// descriptor (`<agent>:<session-start delivery>`), never a Claim id or any
+/// other secret.
+#[allow(clippy::too_many_arguments)]
+fn audit_continuity_claim(
+    tx: &rusqlite::Transaction<'_>,
+    op: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    run_id: SessionId,
+    handoff_id: Option<HandoffId>,
+    revision: Option<u64>,
+    attempt_id: Option<AttemptId>,
+    actor: &str,
+    outcome: &str,
+    at: i64,
+    delivery_path: &str,
+) -> StoreResult<()> {
+    audit_continuity_with_refs(
+        tx,
+        op,
+        workspace_id,
+        project_id,
+        work_item_id,
+        run_id,
+        handoff_id,
+        revision,
+        attempt_id,
+        actor,
+        outcome,
+        at,
+        &[],
+        &[],
+        Some(delivery_path),
     )
 }
 
@@ -2699,6 +2745,7 @@ fn audit_continuity_with_refs(
     at: i64,
     artifact_ids: &[String],
     relationship_ids: &[String],
+    delivery_path: Option<&str>,
 ) -> StoreResult<()> {
     let detail = serde_json::to_string(&serde_json::json!({
         "actor": actor,
@@ -2710,6 +2757,7 @@ fn audit_continuity_with_refs(
         "outcome": outcome,
         "artifact_ids": artifact_ids,
         "relationship_ids": relationship_ids,
+        "delivery_path": delivery_path,
     }))?;
     tx.execute(
         "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
@@ -3999,6 +4047,7 @@ mod tests {
             actor_key: "receiver".into(),
             lease_seconds: 60,
             context_options: serde_json::json!({ "context_budget": 4096 }),
+            delivery_path: "test:on-demand".into(),
         };
         let first = claim_handoff(&mut conn, &claim).unwrap();
 
@@ -4125,6 +4174,7 @@ mod tests {
                 actor_key: "receiver".into(),
                 lease_seconds: 60,
                 context_options: serde_json::Value::Null,
+                delivery_path: "test:on-demand".into(),
             },
         )
         .unwrap();

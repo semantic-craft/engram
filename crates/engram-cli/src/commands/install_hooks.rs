@@ -1082,12 +1082,14 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
+    const workItem = tomlKey(body, "work_item");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
     if (briefing) url.searchParams.set("briefing", briefing);
     if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+    if (workItem) url.searchParams.set("work_item", workItem);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -1106,6 +1108,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let dropSubagent: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
+  let workItem: string | undefined;
   const marker = findMarker(cwd);
   if (marker) {
     try {
@@ -1116,6 +1119,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       dropSubagent = tomlKey(body, "drop_subagent_captures");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
+      workItem = tomlKey(body, "work_item");
     } catch (_e) {
     }
   }
@@ -1130,6 +1134,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
   if (briefing) url.searchParams.set("briefing", briefing);
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+  if (workItem) url.searchParams.set("work_item", workItem);
 }"#;
     format!(
         "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{body}",
@@ -1387,10 +1392,14 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, sessionId?: string): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  // This harness delivers session-start output, so the server may claim the
+  // continuation. Forward the Run so the claim binds to the session that is
+  // actually starting and its first checkpoint can acknowledge it.
+  if (sessionId) url.searchParams.set("session_id", sessionId);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -1486,7 +1495,7 @@ export const EngramHooks: Plugin = async ({{ directory }}) => {{
       if (!id || handoffChecked.has(id)) return;
       handoffChecked.add(id);
       startSession(id, cwdFor(id, directory));
-      const handoff = await fetchHandoff(cwdFor(id, directory));
+      const handoff = await fetchHandoff(cwdFor(id, directory), id);
       if (handoff) (output as any).system.push(handoff);
     }},
   }};
@@ -1944,10 +1953,14 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, sessionId?: string): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  // This harness delivers session-start output, so the server may claim the
+  // continuation. Forward the Run so the claim binds to the session that is
+  // actually starting and its first checkpoint can acknowledge it.
+  if (sessionId) url.searchParams.set("session_id", sessionId);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -1977,7 +1990,7 @@ export default function EngramExtension(api: any): void {{
     const id = sessionID(ctx);
     if (!id || handoffChecked.has(id)) return;
     handoffChecked.add(id);
-    const handoff = await fetchHandoff(ctx?.cwd ?? "");
+    const handoff = await fetchHandoff(ctx?.cwd ?? "", id);
     if (!handoff) return;
     return {{
       message: {{
@@ -2455,9 +2468,12 @@ fn render_grok(
         println!("# Auth: ENGRAM_AUTH_TOKEN embedded in each hook command below.");
         println!("#       Treat ~/.grok/hooks/engram.json as sensitive (chmod 600).");
     }
-    println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
-    println!("#       but handoff injection does not. Recover a prior session's");
-    println!("#       handoff via the MCP `memory_handoff_discover` tool.");
+    println!("# NOTE: the Agent Adapter contract classifies Grok as ignoring");
+    println!("#       SessionStart stdout — capture works, but automatic");
+    println!("#       continuation does not, and this adapter performs no");
+    println!("#       automatic Handoff read or mutation. Recover a prior");
+    println!("#       session's Handoff on demand: `memory_handoff_discover`");
+    println!("#       then `memory_handoff_claim`.");
     println!();
     println!("{serialized}");
     Ok(())
@@ -2827,6 +2843,173 @@ mod tests {
         assert_eq!(
             effective_hook_server_url(&config, &args, Some(&inferred)),
             "http://homelab:49374"
+        );
+    }
+
+    /// The server's continuation timeout ceiling must stay strictly below the
+    /// deadline every shipped hook client aborts at, and every client must
+    /// actually use that deadline.
+    ///
+    /// If a client aborted first, the claim would already be committed while
+    /// nothing reached the agent — the transfer would sit leased for the whole
+    /// lease with no receiver, on every session start.
+    #[test]
+    fn server_continuation_timeout_stays_under_every_client_deadline() {
+        // The ceiling-below-client-budget invariant itself is a compile-time
+        // assertion in `engram_hooks`. What needs proving here is that an
+        // operator cannot configure past that ceiling, and that every shipped
+        // client really does use the budget the ceiling is derived from.
+        let over = crate::config::ContinuitySettings {
+            session_start_timeout_ms: 60_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            over.resolved().timeout,
+            std::time::Duration::from_millis(engram_hooks::MAX_SESSION_START_TIMEOUT_MS)
+        );
+
+        // Every shipped client encodes the same 1s deadline.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let posix = fs::read_to_string(root.join("hooks").join("_lib.sh")).unwrap();
+        assert!(
+            posix.contains("curl -s --max-time 1.0"),
+            "hooks/_lib.sh must use the shared client budget"
+        );
+        let powershell =
+            fs::read_to_string(root.join("hooks").join("lib").join("engram-hook.ps1")).unwrap();
+        assert!(
+            powershell.contains("-TimeoutSec 1 `"),
+            "the PowerShell client must use the same budget as the POSIX one"
+        );
+        for generated in [
+            build_opencode_plugin("http://127.0.0.1:49374", None, None),
+            build_omp_extension("http://127.0.0.1:49374", None, None),
+            super::super::openclaw_plugin::build_plugin("http://127.0.0.1:49374", None, None),
+        ] {
+            assert!(
+                generated.contains("signal: timeoutSignal(1000)"),
+                "every generated client must use the same budget"
+            );
+        }
+    }
+
+    /// The POSIX helper's session-id extraction must agree with
+    /// `engram_hooks::extract_session_id` on every payload shape a supported
+    /// harness sends.
+    ///
+    /// Divergence is silent and expensive in both directions: a miss degrades
+    /// an output-capable adapter to the read-only render on every start, and a
+    /// *different* answer binds the automatic claim to a Run that never writes
+    /// the acknowledging checkpoint.
+    #[cfg(unix)]
+    #[test]
+    fn posix_helper_session_id_matches_the_shared_extractor() {
+        let lib = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks")
+            .join("_lib.sh");
+        for payload in [
+            // Claude Code / Codex / OpenCode / Antigravity top-level spellings.
+            r#"{"session_id":"cc-1","cwd":"/repo"}"#,
+            r#"{"sessionId":"cx-1"}"#,
+            r#"{"sessionID":"oc-1"}"#,
+            r#"{"conversationId":"ag-1"}"#,
+            // OpenCode's nested shape — the one a key-only scan misses.
+            r#"{"info":{"id":"oc-nested"},"cwd":"/repo"}"#,
+            r#"{"properties":{"info":{"id":"oc-props"}}}"#,
+            r#"{"event":{"properties":{"sessionID":"ev-1"}}}"#,
+            r#"{"payload":{"info":{"id":"pl-1"}}}"#,
+            // A key spelling and a nested path together: both sides must pick
+            // the SAME one, or capture and the claim disagree about the Run.
+            r#"{"info":{"id":"a"},"properties":{"sessionID":"b"}}"#,
+            // No session identity at all.
+            r#"{"cwd":"/repo"}"#,
+        ] {
+            let script = format!(
+                ". {}; engram_extract_session_id '{}'",
+                lib.display(),
+                payload
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("sh must run");
+            assert!(out.status.success(), "sh failed for {payload}");
+            let shell = String::from_utf8(out.stdout).unwrap();
+            let shell = shell.trim();
+            let rust = engram_hooks::extract_session_id(
+                &serde_json::from_str(payload).expect("test payload is valid JSON"),
+            )
+            .unwrap_or_default();
+            assert_eq!(
+                shell, rust,
+                "hooks/_lib.sh and engram_hooks::extract_session_id disagree on {payload}"
+            );
+        }
+    }
+
+    /// Every shipped hook bundle must encode its adapter's SessionStart
+    /// output capability exactly as `engram_core::adapter` declares it.
+    ///
+    /// This is the one place where a wrong answer is silent and expensive: a
+    /// bundle that fetches `/handoff` for a harness that discards the render
+    /// would consume a transfer nobody reads, and a bundle that skips the
+    /// fetch for a capable harness loses continuity outright.
+    #[test]
+    fn shipped_hook_bundles_match_the_adapter_capability_table() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        let mut checked = 0usize;
+        for entry in fs::read_dir(&hooks_root).unwrap() {
+            let dir = entry.unwrap().path();
+            let script = dir.join("session-start.sh");
+            if !script.is_file() {
+                continue;
+            }
+            let body = fs::read_to_string(&script).unwrap();
+            let wire = body
+                .split("event=session-start&agent=")
+                .nth(1)
+                .and_then(|rest| rest.split(['$', '"']).next())
+                .unwrap_or_else(|| panic!("{} must post a wire agent name", script.display()))
+                .to_owned();
+            let contract =
+                engram_core::AdapterContract::for_agent(engram_core::AgentKind::from_wire(&wire));
+            let ps1 = fs::read_to_string(dir.join("session-start.ps1")).unwrap();
+
+            if contract.may_claim_on_session_start() {
+                assert!(
+                    body.contains(&format!("/handoff?agent={wire}")),
+                    "{wire}: a delivery-capable adapter must fetch the continuation"
+                );
+                assert!(
+                    body.contains("engram_session_qs") && body.contains("${RUN_QS}"),
+                    "{wire}: the claim must bind to the Run this session reports"
+                );
+                assert!(
+                    ps1.contains("-FetchHandoff"),
+                    "{wire}: the PowerShell bundle must match the POSIX one"
+                );
+            } else {
+                assert!(
+                    !body.contains("/handoff"),
+                    "{wire}: an adapter that discards session-start output must \
+                     perform no automatic Handoff read"
+                );
+                assert!(
+                    !ps1.contains("-FetchHandoff"),
+                    "{wire}: the PowerShell bundle must match the POSIX one"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 7,
+            "every shipped hook bundle must be covered by the capability table"
         );
     }
 
@@ -3270,6 +3453,11 @@ model = "gpt-5"
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
         assert!(plugin.contains("fetchHandoff"));
+        // Output-capable adapter: it forwards the Run so the server binds the
+        // automatic claim to the session that is actually starting.
+        assert!(plugin.contains("url.searchParams.set(\"session_id\", sessionId)"));
+        assert!(plugin.contains("await fetchHandoff(cwdFor(id, directory), id)"));
+        assert!(plugin.contains("tomlKey(body, \"work_item\")"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
         assert!(plugin.contains("text.split(/\\r?\\n/)"));
@@ -3392,6 +3580,9 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-start\""));
         assert!(extension.contains("postHook(\"user-prompt\""));
         assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("url.searchParams.set(\"session_id\", sessionId)"));
+        assert!(extension.contains("await fetchHandoff(ctx?.cwd ?? \"\", id)"));
+        assert!(extension.contains("tomlKey(body, \"work_item\")"));
         assert!(extension.contains("function applyMarkerParams"));
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));
         assert!(extension.contains("text.split(/\\r?\\n/)"));
