@@ -9,7 +9,8 @@ managed routing snippet + Agent Skills package.
 You normally do not create handoffs by hand. With lifecycle hooks
 installed, session-end capture publishes a Handoff — continuing the
 WorkItem this session owns or claimed, or creating one if there is
-nothing to continue — and the next session start picks it up.
+nothing to continue — and the next session start picks it up. Two
+output-capable adapters in sequence stay on that same WorkItem.
 
 ```text
 $ claude

@@ -36,7 +36,7 @@ files for OpenClaw / OpenCode / OMP) and are covered in the
 [main README](../README.md#quick-start). On native Windows, Claude Code uses
 Git Bash `.sh` hooks rather than the PowerShell default used by other
 script-hook agents. Grok captures lifecycle events, but it ignores
-SessionStart stdout, so engram does not auto-inject handoffs for Grok.
+SessionStart stdout, so engram performs no automatic Handoff read or claim for Grok.
 
 Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
 long-term memory to their LLMs via engram's MCP tools
@@ -46,8 +46,8 @@ endpoint. The trade-off:
 
 | | What you get | What you don't get |
 |---|---|---|
-| **MCP only** | LLM can query the wiki, discover/claim/checkpoint Handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries or SessionStart discovery |
-| **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting | - |
+| **MCP only** | LLM can query the wiki, discover/claim/checkpoint Handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries or SessionStart claim/injection |
+| **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; output-capable adapters claim and inject the continuation at SessionStart | - |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -205,10 +205,10 @@ Aliases: `copilot`, `github-copilot`.
   to call; check **Settings → Copilot → MCP servers** if the server
   shows as blocked.
 - Lifecycle hooks aren't possible until VS Code Copilot adds an agent
-  hook surface. Until then, the auto-handoff flow that other agents
-  enjoy (SessionStart auto-fetches a "where you left off" block) does
-  not run here — ask the agent to call read-only `memory_handoff_discover`,
-  then claim the returned exact revision before continuing.
+  hook surface. Until then, the automatic SessionStart claim that other
+  output-capable agents enjoy does not run here — ask the agent to call
+  read-only `memory_handoff_discover`, then claim the returned exact
+  revision before continuing.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
   <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
@@ -292,7 +292,8 @@ Gemini CLI's lifecycle event names differ from Claude Code's, so use
 `install-hooks --agent gemini-cli` rather than copying another agent's
 settings. engram maps Gemini's `SessionStart`, `SessionEnd`,
 `BeforeTool`, `AfterTool`, and `PreCompress` events to the shared hook
-capture path; `SessionStart` also fetches pending handoffs.
+capture path; `SessionStart` claims the eligible continuation and injects a
+**continuation CLAIMED** block.
 
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.
@@ -394,8 +395,9 @@ The rendered hooks config looks like:
 - Hook scripts are staged under `~/.local/share/engram/hooks/antigravity-cli/`.
 - The `PreInvocation` event fires before each model call (not just at
   session start). engram uses it as the closest equivalent to Gemini
-  CLI's `SessionStart`; when a pending handoff exists, the hook injects
-  it via Antigravity's `injectSteps[].ephemeralMessage` output.
+  CLI's `SessionStart`; when an eligible continuation exists, the hook
+  claims it and injects a **continuation CLAIMED** block via
+  Antigravity's `injectSteps[].ephemeralMessage` output.
 - Antigravity CLI does not expose a true session-end hook. `Stop` records
   a stop observation only; call `memory_handoff_begin` before quitting when
   you need the next agent to receive a handoff.
@@ -435,7 +437,8 @@ OpenClaw distinguishes transports explicitly. Use
 - The plugin registers OpenClaw `session_start`, `session_end`,
   `before_prompt_build`, `before_tool_call`, `after_tool_call`,
   `before_compaction`, and `agent_end` hooks. `before_prompt_build`
-  injects pending handoffs via OpenClaw's `prependContext` hook result.
+  claims an eligible continuation and injects a **continuation CLAIMED**
+  block via OpenClaw's `prependContext` hook result.
 - Plugin installs or updates require a Gateway restart unless your
   managed OpenClaw Gateway auto-restarts after plugin source changes.
 - Sources: <https://docs.openclaw.ai/cli/mcp>,
@@ -485,7 +488,8 @@ installing or changing the file.
 - OMP extensions are TypeScript modules, not shell hooks; stdout is not
   used for context injection.
 - The extension uses OMP lifecycle events for prompt/tool capture and
-  `before_agent_start` to inject pending engram handoffs.
+  `before_agent_start` to claim an eligible continuation and inject
+  **continuation CLAIMED**.
 
 ## Pi
 
@@ -497,8 +501,9 @@ to write `~/.pi/agent/extensions/engram.ts`.
 engram install-hooks --agent pi --apply
 ```
 
-The generated extension posts lifecycle events to `/hook`, fetches pending
-handoffs in `before_agent_start`, initializes engram's HTTP `/mcp` endpoint,
+The generated extension posts lifecycle events to `/hook`, claims an
+eligible continuation in `before_agent_start` and injects
+**continuation CLAIMED**, initializes engram's HTTP `/mcp` endpoint,
 lists tools, and registers each one with `pi.registerTool`. `install-mcp
 --client pi` intentionally prints this bridge guidance instead of writing an
 ignored `~/.pi/agent/mcp.json`.
@@ -563,7 +568,7 @@ that *starts* the next one - to play nicely with engram:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `engram finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the read-only Handoff discovery via `/handoff`, OR (b) the model proactively calls `memory_handoff_discover`; the receiver then explicitly claims and checkpoints it. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) an output-capable SessionStart adapter claims via `/handoff` and injects a **continuation CLAIMED** block, OR (b) the model calls `memory_handoff_discover` then `memory_handoff_claim`. Rendering never accepts; the first `memory_checkpoint_write` does. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any
@@ -579,9 +584,11 @@ want to close every matching open Codex session in that scope.
 
 So a typical mixed workflow looks like:
 
-- **Claude Code → Cursor.** Claude Code's `SessionEnd` creates the
-  handoff automatically. Cursor's `sessionStart` hook fetches and
-  prepends it when `install-hooks --agent cursor --apply` is installed.
+- **Claude Code → Cursor.** Claude Code's `SessionEnd` publishes a
+  successor for the active WorkItem. Cursor's `sessionStart` hook claims
+  it and injects **continuation CLAIMED** when
+  `install-hooks --agent cursor --apply` is installed. The first
+  checkpoint acknowledges the transfer.
 - **Claude Desktop → Claude Code.** Claude Desktop doesn't write a
   handoff (no hooks). To resume in Claude Code, you'd have had to
   call `memory_handoff_begin` manually in Claude Desktop before

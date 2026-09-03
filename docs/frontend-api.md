@@ -336,8 +336,10 @@ behind reappears here (or `null`):
 }
 ```
 
-> Note: `last_open_handoff` is **not** consumed by the read API. Claiming and
-> first-Checkpoint acknowledgement happen only through explicit MCP writes.
+> Note: the overview `handoff` field is **not** consumed by the read API.
+> Output-capable SessionStart adapters claim through `GET /handoff`;
+> other adapters claim on demand with `memory_handoff_claim`. Rendering
+> never accepts the transfer — only the receiving Run's first Checkpoint does.
 
 ### 4.9 Sessions and handoffs (per project)
 

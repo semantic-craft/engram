@@ -77,7 +77,8 @@ work_item = "0195f1a1-...-...."
 # session-start continuation fetch also returns this project's pinned /
 # `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
 # page titles, so the agent starts with the architecture context instead
-# of re-exploring the codebase. Appended AFTER any pending handoff, and
+# of re-exploring the codebase. Appended AFTER the continuation CLAIMED
+# (or unclaimed pending) block, and
 # unlike the continuation it is never claimed — it is recomposed every
 # opted-in session start. Only Agent Adapters whose harness delivers
 # session-start output benefit (Claude Code, Codex, OpenCode, …); see
