@@ -12,8 +12,9 @@ use std::thread::{self, JoinHandle};
 
 use engram_core::{
     CheckpointWrite, CheckpointWriteResult, HandoffCancel, HandoffClaim, HandoffClaimResult,
-    HandoffRelease, HandoffReleaseResult, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
-    ObservationId, PageId, PagePath, ProjectId, PublishedHandoff, SessionId, UserId, WorkspaceId,
+    HandoffId, HandoffRelease, HandoffReleaseResult, NewHandoff, NewObservation, NewPage,
+    NewSession, NewUser, ObservationId, PageId, PagePath, ProjectId, PublishedHandoff, SessionId,
+    UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -94,6 +95,14 @@ pub(crate) enum WriteCmd {
     PublishHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<PublishedHandoff>>,
+    },
+    ExpireStaleOpenHandoffs {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        keep_handoff_id: HandoffId,
+        actor: String,
+        run_id: SessionId,
+        reply: oneshot::Sender<StoreResult<usize>>,
     },
     ClaimHandoff {
         claim: HandoffClaim,
@@ -465,6 +474,35 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PublishHandoff { handoff, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Expire stale `open` Handoffs in this scope, never touching `keep_handoff_id`.
+    ///
+    /// Bounded: at most 32 rows older than 14 days, select-then-update, one
+    /// audit row each. Invoked from SessionEnd after the new transfer is
+    /// published. See [`ops::expire_stale_open_handoffs`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn expire_stale_open_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        keep_handoff_id: HandoffId,
+        actor: impl Into<String>,
+        run_id: SessionId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireStaleOpenHandoffs {
+            workspace_id,
+            project_id,
+            keep_handoff_id,
+            actor: actor.into(),
+            run_id,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1158,6 +1196,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::PublishHandoff { handoff, reply } => {
                 let result = ops::publish_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "publish_handoff");
+            }
+            WriteCmd::ExpireStaleOpenHandoffs {
+                workspace_id,
+                project_id,
+                keep_handoff_id,
+                actor,
+                run_id,
+                reply,
+            } => {
+                let result = ops::expire_stale_open_handoffs(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    keep_handoff_id,
+                    &actor,
+                    run_id,
+                );
+                send_or_warn(reply, result, "expire_stale_open_handoffs");
             }
             WriteCmd::ClaimHandoff { claim, reply } => {
                 let result = ops::claim_handoff(&mut conn, &claim);

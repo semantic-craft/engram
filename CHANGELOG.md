@@ -48,6 +48,16 @@ below start from the fork.
 
 ### Changed
 
+- SessionEnd auto-handoffs continue the active WorkItem instead of minting an
+  orphan per session. The ending run publishes a successor when it already owns
+  the WorkItem, or when it holds a live or lapsed SessionStart claim (re-claim
+  plus one auto checkpoint transfers ownership). Otherwise it still creates a
+  new WorkItem. The automatic transfer now carries a brief (session summary,
+  open questions, next steps) and context refs for the session page plus up to
+  five observations. After publish, SessionEnd expires up to 32 `open`
+  Handoffs in the same scope that are older than 14 days. SessionEnd records
+  the actor with `ActorContext::continuity_key()`, matching SessionStart.
+
 - Every shipped hook client now encodes its adapter's output capability and
   forwards its session id on `GET /handoff`: the six delivery-capable
   `hooks/*/session-start.sh` and `.ps1` bundles, the native

@@ -27,6 +27,12 @@ use crate::error::{StoreError, StoreResult};
 /// Upper bound on revisioned ContextRefs stored on one Handoff row.
 const HANDOFF_CONTEXT_REFS_MAX: usize = 32;
 
+/// Open Handoffs older than this are expired opportunistically on SessionEnd.
+const STALE_OPEN_HANDOFF_MAX_AGE_DAYS: i64 = 14;
+
+/// Cap on stale open Handoffs expired in one SessionEnd call.
+const STALE_OPEN_HANDOFF_EXPIRE_LIMIT: i64 = 32;
+
 /// Summary returned by [`reorg_sessions`] and exposed via
 /// [`crate::writer::WriterHandle::reorg_sessions`].
 #[derive(Debug, Default, Clone)]
@@ -1355,6 +1361,102 @@ pub fn publish_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Pub
         artifacts,
         relationships,
     })
+}
+
+/// Expire stale `open` Handoffs in one scope, leaving `keep_handoff_id` alone.
+///
+/// Select-then-update, capped at [`STALE_OPEN_HANDOFF_EXPIRE_LIMIT`] rows whose
+/// `created_at` is older than [`STALE_OPEN_HANDOFF_MAX_AGE_DAYS`]. Each expired
+/// row gets one audit record. A row that moved out of `open` between select and
+/// update is skipped; this is opportunistic reclamation, not a CAS that must
+/// fail the caller.
+///
+/// # Errors
+/// Propagates SQL, identity, or timestamp errors.
+pub fn expire_stale_open_handoffs(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    keep_handoff_id: HandoffId,
+    actor: &str,
+    run_id: SessionId,
+) -> StoreResult<usize> {
+    let now = Timestamp::now().as_microsecond();
+    let cutoff = now.saturating_sub(
+        STALE_OPEN_HANDOFF_MAX_AGE_DAYS
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000_000),
+    );
+    let tx = conn.transaction()?;
+    let selected: Vec<(HandoffId, i64, WorkItemId)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, revision, work_item_id FROM handoffs \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND state = 'open' AND id != ?3 AND created_at < ?4 \
+             ORDER BY created_at, rowid \
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                keep_handoff_id.as_bytes(),
+                cutoff,
+                STALE_OPEN_HANDOFF_EXPIRE_LIMIT,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (handoff, revision, work_item) = row?;
+            out.push((
+                HandoffId::from_slice(&handoff)?,
+                revision,
+                WorkItemId::from_slice(&work_item)?,
+            ));
+        }
+        out
+    };
+    let mut expired = 0usize;
+    for (handoff_id, revision, work_item_id) in selected {
+        let next = u64::try_from(revision)
+            .map_err(|_| StoreError::MalformedRecord("negative handoff revision".into()))?
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidState("handoff revision overflow".into()))?;
+        let changed = tx.execute(
+            "UPDATE handoffs SET state = 'expired', revision = ?1 \
+             WHERE id = ?2 AND revision = ?3 AND state = 'open'",
+            params![next, handoff_id.as_bytes(), revision],
+        )?;
+        if changed != 1 {
+            continue;
+        }
+        audit_continuity(
+            &tx,
+            "handoff_expire_stale",
+            workspace_id,
+            project_id,
+            work_item_id,
+            run_id,
+            Some(handoff_id),
+            Some(next),
+            None,
+            actor,
+            "expired",
+            now,
+        )?;
+        expired += 1;
+    }
+    tx.commit()?;
+    Ok(expired)
 }
 
 /// The WorkItem's state when it is terminal, else `None`.

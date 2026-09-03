@@ -2727,6 +2727,55 @@ impl ReaderPool {
         .await
     }
 
+    /// This actor and Run's most recent still-`live` claim in one scope,
+    /// including a lapsed lease.
+    ///
+    /// [`Self::live_claim_for_run`] hides an elapsed lease so SessionStart
+    /// will not re-render work that is already recoverable for the next
+    /// receiver. SessionEnd needs the opposite: a session that claimed at
+    /// start and outlived `session_start_lease_seconds` still owns that
+    /// claim until somebody else claims or accepts it. `state = 'live'`
+    /// is that "no later claim by another run" check — a subsequent claim
+    /// expires this row before inserting its own.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, or timestamp errors.
+    pub async fn claim_for_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor_key: String,
+        run_id: SessionId,
+    ) -> StoreResult<Option<LiveHandoffClaim>> {
+        self.with_conn(move |conn| {
+            let row: Option<(Vec<u8>, Vec<u8>, i64)> = conn
+                .query_row(
+                    "SELECT id, handoff_id, lease_expires_at FROM handoff_claims \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND actor_key = ?3 \
+                       AND run_id = ?4 AND state = 'live' \
+                     ORDER BY claimed_at DESC, rowid DESC LIMIT 1",
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        actor_key,
+                        run_id.as_bytes(),
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            row.map(|(claim_id, handoff_id, lease_expires_at)| {
+                Ok(LiveHandoffClaim {
+                    claim_id: ClaimId::from_slice(&claim_id)?,
+                    handoff_id: HandoffId::from_slice(&handoff_id)?,
+                    lease_expires_at: Timestamp::from_microsecond(lease_expires_at)
+                        .map_err(|e| StoreError::MalformedRecord(e.to_string()))?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
     /// Read the continuation envelope for one EXACT Handoff from a single
     /// consistent snapshot.
     ///

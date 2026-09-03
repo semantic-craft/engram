@@ -20,9 +20,11 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use engram_consolidate::Consolidator;
 use engram_core::{
-    ActiveProject, ActorKey, AdapterContract, AdapterPeer, AdapterRequest, AgentKind, AuthLevel,
-    DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff, NewObservation, NewSession, ObservationKind,
-    ProjectId, Sanitized, Sanitizer, SessionId, WorkItem, WorkItemId, WorkspaceId,
+    AcceptanceCriterionStatus, ActiveProject, ActorContext, ActorKey, AdapterContract, AdapterPeer,
+    AdapterRequest, AgentKind, AttemptId, AuthLevel, CheckpointWrite, ContextRef,
+    DEFAULT_WORKSPACE_NAME, Handoff, HandoffClaim, HandoffId, NewHandoff, NewObservation,
+    NewSession, ObservationKind, PageId, ProjectId, PublishedHandoff, Sanitized, Sanitizer,
+    SessionId, WorkItem, WorkItemId, WorkItemState, WorkspaceId,
 };
 use engram_store::WriterHandle;
 use engram_wiki::Wiki;
@@ -374,14 +376,15 @@ async fn handle_hook(
     // it. Runs before the semaphore so a dropped event consumes no capacity.
     // The auth middleware in front of `/hook` injects the request's
     // [`ActorContext`] (rung 1 root, rung 2 DB user, or anonymous). We
-    // capture its `user` field NOW — before the spawn drops the request
-    // extensions — so `process()` can key the `ActiveProject` map by the
-    // authenticated identity when `[auto_scope] mode = per_actor` is on.
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
+    // capture it NOW — before the spawn drops the request extensions — so
+    // `process()` can key the `ActiveProject` map by the authenticated
+    // identity when `[auto_scope] mode = per_actor` is on, and so SessionEnd
+    // publishes against `continuity_key()` (user / sub / client / anonymous).
+    let actor = actor_ext
+        .map(|axum::Extension(ctx)| ctx)
         .unwrap_or_default();
     let actor_key = ActorKey {
-        user: actor_user.clone(),
+        user: actor.user.clone(),
         session_id: env.session_id.clone(),
     };
     if should_drop_subagent(&state, &env, &actor_key).await {
@@ -393,7 +396,7 @@ async fn handle_hook(
     };
     tokio::spawn(async move {
         let _permit = permit;
-        process_envelope(state, env, actor_user).await;
+        process_envelope(state, env, actor).await;
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -451,15 +454,15 @@ async fn handle_hook_batch(
     }
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
+    let actor = actor_ext
+        .map(|axum::Extension(ctx)| ctx)
         .unwrap_or_default();
     let mut accepted = 0usize;
     for item in items {
         let query = parse_hook_query(&item.url);
         let env = HookEnvelope::from_query_and_body(query, item.body);
         let actor_key = ActorKey {
-            user: actor_user.clone(),
+            user: actor.user.clone(),
             session_id: env.session_id.clone(),
         };
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
@@ -482,7 +485,7 @@ async fn handle_hook_batch(
             );
         };
         let _permit = permit;
-        if let Err(e) = process(&state, env, actor_user.clone()).await {
+        if let Err(e) = process(&state, env, actor.clone()).await {
             warn!(error = %e, accepted, "hook batch item failed; stopping (fail-fast)");
             break;
         }
@@ -1775,17 +1778,13 @@ fn sticky_within_session_tree(
     std::path::Path::new(&event_norm).starts_with(std::path::Path::new(&session_norm))
 }
 
-async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor_user: Option<String>) {
-    if let Err(e) = process(&state, env, actor_user).await {
+async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor: ActorContext) {
+    if let Err(e) = process(&state, env, actor).await {
         warn!(error = %e, "hook processing failed");
     }
 }
 
-async fn process(
-    state: &HookState,
-    env: HookEnvelope,
-    actor_user: Option<String>,
-) -> anyhow::Result<()> {
+async fn process(state: &HookState, env: HookEnvelope, actor: ActorContext) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
     // Build the actor key used to scope the in-process `ActiveProject`
     // pointer. `user` is whatever the auth middleware extracted from this
@@ -1797,7 +1796,7 @@ async fn process(
     // (anonymous + no session) is allowed — `set_for` falls back to the
     // single slot.
     let actor_key = engram_core::ActorKey {
-        user: actor_user.clone(),
+        user: actor.user.clone(),
         session_id: env.session_id.clone(),
     };
     // Session-sticky attribution: for an event whose session already
@@ -2008,18 +2007,17 @@ async fn process(
             })
             .await?;
         state.writer.end_session(session_id, Some(page_id)).await?;
-        let handoff = build_auto_handoff(
+        let published = publish_session_end_handoff(
+            state,
             ws,
             proj,
-            env.agent,
-            actor_user
-                .as_deref()
-                .map_or_else(|| "anonymous".to_string(), |user| format!("user:{user}")),
+            &env,
+            &actor,
             session_id,
-            env.cwd.clone(),
+            page_id,
             &observations,
-        );
-        let published = state.writer.publish_handoff(handoff).await?;
+        )
+        .await?;
         // Opt-in (ENGRAM_CONSOLIDATE_ON_SESSION_END): additionally run LLM
         // consolidation so the session's knowledge is compiled into topical
         // pages, not just the heuristic session record. The heuristic page
@@ -2079,15 +2077,280 @@ fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     anyhow::bail!("hook payload missing session_id and event is not session-start")
 }
 
-fn build_auto_handoff(
+/// Successor target for a SessionEnd auto-handoff. `None` on `NewHandoff`
+/// means "mint a WorkItem"; `Some` publishes onto an existing one.
+struct SessionEndSuccessor {
+    work_item_id: WorkItemId,
+    expected_work_item_revision: u64,
+    expected_checkpoint_revision: Option<u64>,
+}
+
+/// SessionEnd auto-handoff: continue the WorkItem this run owns or claimed,
+/// otherwise mint a new one. Always publishes an open transfer with a brief
+/// and curated context refs, then opportunistically expires stale opens.
+#[allow(clippy::too_many_arguments)]
+async fn publish_session_end_handoff(
+    state: &HookState,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    from_agent: AgentKind,
-    source_actor: String,
+    env: &HookEnvelope,
+    actor: &ActorContext,
     session_id: SessionId,
-    cwd: Option<String>,
+    page_id: PageId,
     observations: &[engram_core::Observation],
-) -> NewHandoff {
+) -> anyhow::Result<PublishedHandoff> {
+    let source_actor = actor.continuity_key();
+    let (summary, _, _) = auto_handoff_prose(observations);
+    let successor = resolve_session_end_successor(
+        state,
+        workspace_id,
+        project_id,
+        &source_actor,
+        session_id,
+        &summary,
+    )
+    .await?;
+    let context_refs = auto_handoff_context_refs(&state.reader, page_id, observations).await;
+    let mut handoff = build_auto_handoff(
+        workspace_id,
+        project_id,
+        env.agent,
+        source_actor.clone(),
+        session_id,
+        env.cwd.clone(),
+        observations,
+        successor.as_ref(),
+        context_refs,
+    );
+    let published = match state.writer.publish_handoff(handoff.clone()).await {
+        Ok(published) => published,
+        Err(error) if successor.is_some() => {
+            // Lost the owner/claim race: still leave an open transfer so the
+            // next session has something to pick up, as today's mint-new path.
+            warn!(
+                error = %error,
+                session = %session_id,
+                "SessionEnd successor publish conflicted; minting a new WorkItem"
+            );
+            handoff.work_item_id = None;
+            handoff.expected_work_item_revision = None;
+            handoff.expected_checkpoint_revision = None;
+            state.writer.publish_handoff(handoff).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = state
+        .writer
+        .expire_stale_open_handoffs(
+            workspace_id,
+            project_id,
+            published.handoff_id,
+            source_actor,
+            session_id,
+        )
+        .await
+    {
+        warn!(
+            error = %error,
+            session = %session_id,
+            "SessionEnd stale-open Handoff expiry failed; published transfer stands"
+        );
+    }
+    Ok(published)
+}
+
+/// Three-tier SessionEnd resolution: already owner, this run's live-or-lapsed
+/// claim (re-claim + auto checkpoint), or nothing to continue.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_session_end_successor(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    source_actor: &str,
+    session_id: SessionId,
+    session_summary: &str,
+) -> anyhow::Result<Option<SessionEndSuccessor>> {
+    if let Some(envelope) = state
+        .reader
+        .discover_continuation(workspace_id, project_id, None, None, true)
+        .await?
+        && envelope.work_item.owner_actor == source_actor
+        && envelope.work_item.owner_run_id == Some(session_id)
+    {
+        return Ok(Some(SessionEndSuccessor {
+            work_item_id: envelope.work_item.id,
+            expected_work_item_revision: envelope.work_item.revision,
+            expected_checkpoint_revision: envelope
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.work_item_revision),
+        }));
+    }
+
+    let Some(held) = state
+        .reader
+        .claim_for_run(
+            workspace_id,
+            project_id,
+            source_actor.to_string(),
+            session_id,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(envelope) = state
+        .reader
+        .continuation_by_handoff_id(held.handoff_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let now = Timestamp::now();
+    let (claim_id, handoff_revision, work_item) = if held.lease_expires_at > now {
+        (held.claim_id, envelope.handoff.revision, envelope.work_item)
+    } else {
+        let claim = HandoffClaim {
+            handoff_id: held.handoff_id,
+            workspace_id,
+            project_id,
+            expected_revision: envelope.handoff.revision,
+            run_id: session_id,
+            attempt_id: session_end_reclaim_attempt_id(
+                held.handoff_id,
+                envelope.handoff.revision,
+                session_id,
+            ),
+            actor_key: source_actor.to_string(),
+            lease_seconds: state.continuity.lease_seconds,
+            context_options: serde_json::Value::Null,
+            delivery_path: format!("{}:session-end", envelope.handoff.from_agent.as_str()),
+        };
+        match state.writer.claim_handoff(claim).await {
+            Ok(claimed) => (claimed.claim_id, claimed.revision, envelope.work_item),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    session = %session_id,
+                    handoff = %held.handoff_id,
+                    "SessionEnd re-claim lost the race; minting a new WorkItem"
+                );
+                return Ok(None);
+            }
+        }
+    };
+
+    let checkpoint = CheckpointWrite {
+        work_item_id: work_item.id,
+        workspace_id,
+        project_id,
+        run_id: session_id,
+        expected_work_item_revision: work_item.revision,
+        handoff_id: Some(held.handoff_id),
+        claim_id: Some(claim_id),
+        expected_handoff_revision: Some(handoff_revision),
+        summary: session_summary.to_string(),
+        work_item_state: WorkItemState::Active,
+        acceptance_criteria: work_item
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| AcceptanceCriterionStatus {
+                criterion: criterion.clone(),
+                satisfied: false,
+            })
+            .collect(),
+        actor_key: source_actor.to_string(),
+        attempt_id: session_end_ack_attempt_id(held.handoff_id, handoff_revision, session_id),
+        artifacts: vec![],
+        relationships: vec![],
+        parent_result: None,
+    };
+    match state.writer.write_checkpoint(checkpoint).await {
+        Ok(written) => Ok(Some(SessionEndSuccessor {
+            work_item_id: written.work_item_id,
+            expected_work_item_revision: written.work_item_revision,
+            expected_checkpoint_revision: Some(written.work_item_revision),
+        })),
+        Err(error) => {
+            warn!(
+                error = %error,
+                session = %session_id,
+                work_item = %work_item.id,
+                "SessionEnd auto-checkpoint failed; minting a new WorkItem"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn session_end_reclaim_attempt_id(
+    handoff_id: HandoffId,
+    expected_revision: u64,
+    run_id: SessionId,
+) -> AttemptId {
+    let seed = format!("engram:session-end-reclaim:{handoff_id}:{expected_revision}:{run_id}");
+    AttemptId(Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()))
+}
+
+fn session_end_ack_attempt_id(
+    handoff_id: HandoffId,
+    expected_revision: u64,
+    run_id: SessionId,
+) -> AttemptId {
+    let seed = format!("engram:session-end-ack:{handoff_id}:{expected_revision}:{run_id}");
+    AttemptId(Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()))
+}
+
+const AUTO_HANDOFF_OBSERVATION_REFS: usize = 5;
+
+/// Session page plus up to five observations, built only from store-backed
+/// sources so `resolve_context_refs` can locate them.
+async fn auto_handoff_context_refs(
+    reader: &engram_store::ReaderPool,
+    page_id: PageId,
+    observations: &[engram_core::Observation],
+) -> Vec<ContextRef> {
+    let mut refs = Vec::new();
+    if let Ok(pages) = reader.context_pages_by_ids(vec![page_id]).await
+        && let Some(source) = pages.into_iter().next()
+        && let Ok(reference) = ContextRef::page(
+            source.workspace_name,
+            source.project_name,
+            source.path,
+            source.id,
+        )
+    {
+        refs.push(reference);
+    }
+
+    let mut ranked: Vec<&engram_core::Observation> = observations.iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .importance
+            .cmp(&left.importance)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+    });
+    let observation_ids: Vec<_> = ranked
+        .into_iter()
+        .take(AUTO_HANDOFF_OBSERVATION_REFS)
+        .map(|obs| obs.id)
+        .collect();
+    if let Ok(sources) = reader.context_observations_by_ids(observation_ids).await {
+        for source in sources {
+            if let Ok(reference) =
+                ContextRef::observation(source.workspace_name, source.project_name, source.id)
+            {
+                refs.push(reference);
+            }
+        }
+    }
+    refs
+}
+
+fn auto_handoff_prose(
+    observations: &[engram_core::Observation],
+) -> (String, Vec<String>, Vec<String>) {
     // Prefer obs.body (the full prompt) over obs.title (first-line +
     // truncated to 80 chars for log/list display). When body is
     // empty fall back to title so we never produce an empty entry.
@@ -2151,10 +2414,57 @@ fn build_auto_handoff(
             tools.into_iter().collect::<Vec<_>>().join(", ")
         )]
     };
+    (summary, open_questions, next_steps)
+}
+
+fn compose_auto_brief(summary: &str, open_questions: &[String], next_steps: &[String]) -> String {
+    let mut parts = vec![summary.to_string()];
+    if !open_questions.is_empty() {
+        let bullets = open_questions
+            .iter()
+            .map(|question| format!("- {question}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("Open questions:\n{bullets}"));
+    }
+    if !next_steps.is_empty() {
+        let bullets = next_steps
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("Next steps:\n{bullets}"));
+    }
+    parts.join("\n\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_auto_handoff(
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    from_agent: AgentKind,
+    source_actor: String,
+    session_id: SessionId,
+    cwd: Option<String>,
+    observations: &[engram_core::Observation],
+    successor: Option<&SessionEndSuccessor>,
+    context_refs: Vec<ContextRef>,
+) -> NewHandoff {
+    let (summary, open_questions, next_steps) = auto_handoff_prose(observations);
+    let brief = compose_auto_brief(&summary, &open_questions, &next_steps);
+    let (work_item_id, expected_work_item_revision, expected_checkpoint_revision) = match successor
+    {
+        Some(target) => (
+            Some(target.work_item_id),
+            Some(target.expected_work_item_revision),
+            target.expected_checkpoint_revision,
+        ),
+        None => (None, None, None),
+    };
     NewHandoff {
-        work_item_id: None,
-        expected_work_item_revision: None,
-        expected_checkpoint_revision: None,
+        work_item_id,
+        expected_work_item_revision,
+        expected_checkpoint_revision,
         workspace_id,
         project_id,
         from_session_id: Some(session_id),
@@ -2166,8 +2476,8 @@ fn build_auto_handoff(
         objective: summary.clone(),
         acceptance_criteria: Vec::new(),
         summary,
-        brief: String::new(),
-        context_refs: Vec::new(),
+        brief,
+        context_refs,
         open_questions,
         next_steps,
         files_touched: Vec::new(),
@@ -2532,12 +2842,20 @@ mod tests {
 
         // Session starts at the parent; a later tool event reports the
         // subdirectory cwd (agent shells keep their working directory).
-        process(&state, fire("session-start", parent.clone()), None)
-            .await
-            .unwrap();
-        process(&state, fire("post-tool-use", subdir.clone()), None)
-            .await
-            .unwrap();
+        process(
+            &state,
+            fire("session-start", parent.clone()),
+            ActorContext::default(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", subdir.clone()),
+            ActorContext::default(),
+        )
+        .await
+        .unwrap();
 
         let parent_proj = state
             .reader
@@ -2583,7 +2901,7 @@ mod tests {
                 "tool_name": "Bash",
             }),
         );
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
         assert!(
             state
                 .reader
@@ -3947,7 +4265,9 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "heal-sess-1" }),
         );
-        process(&state, env1, None).await.unwrap();
+        process(&state, env1, ActorContext::default())
+            .await
+            .unwrap();
         let (ws, proj) = resolve_project_ids(
             &state,
             Some(cwd),
@@ -3987,7 +4307,7 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "heal-sess-2" }),
         );
-        process(&state, env2, None)
+        process(&state, env2, ActorContext::default())
             .await
             .expect("self-heal: stale cached project must be recreated, not FK-fail");
 
@@ -4032,7 +4352,9 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "move-sess-1" }),
         );
-        process(&state, env1, None).await.unwrap();
+        process(&state, env1, ActorContext::default())
+            .await
+            .unwrap();
         let (ws, proj) = resolve_project_ids(
             &state,
             Some(cwd),
@@ -4079,7 +4401,7 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "move-sess-2" }),
         );
-        process(&state, env2, None)
+        process(&state, env2, ActorContext::default())
             .await
             .expect("self-heal: stale cross-workspace pair must re-resolve, not write split-brain");
 
@@ -4132,7 +4454,9 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "heal-repo-root-1" }),
         );
-        process(&state, env1, None).await.unwrap();
+        process(&state, env1, ActorContext::default())
+            .await
+            .unwrap();
         let (ws, proj) = resolve_project_ids(
             &state,
             Some(cwd),
@@ -4160,7 +4484,7 @@ mod tests {
             },
             serde_json::json!({ "sessionID": "heal-repo-root-2" }),
         );
-        process(&state, env2, None)
+        process(&state, env2, ActorContext::default())
             .await
             .expect("repo-root cache slot must be evicted and recreated");
 
@@ -4197,7 +4521,7 @@ mod tests {
             }),
         );
 
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         // The observation must be in the project derived from the cwd,
         // not in the server-default `scratch` project.
@@ -4238,7 +4562,7 @@ mod tests {
                 },
                 serde_json::json!({ "session_id": sid }),
             );
-            process(&state, env, Some("alice".into())).await.unwrap();
+            process(&state, env, alice()).await.unwrap();
         }
 
         let pages = state
@@ -4276,7 +4600,7 @@ mod tests {
             },
             serde_json::json!({ "session_id": sid }),
         );
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         let completed = state
             .reader
@@ -4335,7 +4659,7 @@ mod tests {
             },
             serde_json::json!({ "session_id": target_sid.to_string(), "cwd": "/tmp/target" }),
         );
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         assert_eq!(
             state
@@ -4417,7 +4741,7 @@ mod tests {
                 },
                 serde_json::json!({ "session_id": sid.to_string(), "cwd": "/tmp/target" }),
             );
-            process(&state, env, None).await.unwrap();
+            process(&state, env, ActorContext::default()).await.unwrap();
         }
 
         let pages = state
@@ -4477,7 +4801,7 @@ mod tests {
             },
             serde_json::json!({ "session_id": sid.to_string(), "cwd": "/tmp/target" }),
         );
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         let pages = state
             .reader
@@ -4526,10 +4850,14 @@ mod tests {
         };
 
         // First life: one tool call, then a real end.
-        process(&state, fire("post-tool-use", Some("Bash")), None)
-            .await
-            .unwrap();
-        process(&state, fire("session-end", None), None)
+        process(
+            &state,
+            fire("post-tool-use", Some("Bash")),
+            ActorContext::default(),
+        )
+        .await
+        .unwrap();
+        process(&state, fire("session-end", None), ActorContext::default())
             .await
             .unwrap();
         let disposition = state
@@ -4557,9 +4885,13 @@ mod tests {
             .expect("first SessionEnd writes the session page");
 
         // Second life: the agent resumed the same id and did more work.
-        process(&state, fire("post-tool-use", Some("Edit")), None)
-            .await
-            .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", Some("Edit")),
+            ActorContext::default(),
+        )
+        .await
+        .unwrap();
         let disposition = state
             .reader
             .session_end_disposition(
@@ -4576,7 +4908,7 @@ mod tests {
             "observations after ended_at must mark the session re-endable"
         );
 
-        process(&state, fire("session-end", None), None)
+        process(&state, fire("session-end", None), ActorContext::default())
             .await
             .unwrap();
 
@@ -4640,7 +4972,7 @@ mod tests {
             }),
         );
 
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         let counts = state.reader.status_counts().await.unwrap();
         assert_eq!(counts.sessions, 1);
@@ -4668,7 +5000,7 @@ mod tests {
         );
         let session_id = resolve_session_id(&env).unwrap();
 
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         let observations = state
             .reader
@@ -4710,7 +5042,7 @@ mod tests {
         );
         let session_id = resolve_session_id(&env).unwrap();
 
-        process(&state, env, None).await.unwrap();
+        process(&state, env, ActorContext::default()).await.unwrap();
 
         let observations = state
             .reader
@@ -6876,5 +7208,160 @@ mod tests {
             engram_core::HandoffState::Open,
             "the default project's transfer must be untouched"
         );
+    }
+
+    fn session_hook(event: &str, session_id: &str) -> HookEnvelope {
+        let mut body = serde_json::json!({ "session_id": session_id });
+        if event == "user-prompt" {
+            body["prompt"] = serde_json::json!("Continue the auth cookie rotation");
+        }
+        HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            body,
+        )
+    }
+
+    /// Two consecutive SessionEnds for the same project/actor produce one
+    /// WorkItem whose Handoffs chain, not two orphaned WorkItems (#55).
+    /// The second session claims at SessionStart (lease still live) and
+    /// SessionEnd continues that WorkItem.
+    #[tokio::test]
+    async fn two_consecutive_session_ends_chain_one_work_item() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+        let sid2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid1), alice())
+                .await
+                .unwrap();
+        }
+        let first = state
+            .reader
+            .latest_claimable_handoff(state.workspace_id, state.project_id, None, false)
+            .await
+            .unwrap()
+            .expect("first SessionEnd publishes an open handoff");
+        let first_work_item = first.work_item_id;
+
+        let claimed =
+            fetch_continuation(&state, session_start_query("claude-code", sid2), &alice())
+                .await
+                .unwrap()
+                .expect("SessionStart must claim the first session's handoff");
+        assert!(claimed.contains("continuation CLAIMED"), "{claimed}");
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid2), alice())
+                .await
+                .unwrap();
+        }
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, false)
+            .await
+            .unwrap()
+            .expect("second SessionEnd publishes a claimable successor");
+        assert_eq!(envelope.work_item.id, first_work_item);
+        assert_eq!(envelope.chain.len(), 2, "{:?}", envelope.chain);
+        assert_eq!(
+            envelope.chain[1].predecessor_handoff_id,
+            Some(envelope.chain[0].handoff_id)
+        );
+        assert_eq!(envelope.chain[1].state, engram_core::HandoffState::Open);
+        assert!(!envelope.handoff.brief.is_empty());
+        assert!(
+            !envelope.handoff.context_refs.is_empty(),
+            "auto-handoff must carry the session page and observations"
+        );
+    }
+
+    /// SessionStart claims, the lease lapses, SessionEnd re-claims and
+    /// continues the same WorkItem rather than minting an orphan (#55).
+    #[tokio::test]
+    async fn session_end_reclaims_lapsed_session_start_claim_and_continues() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid1 = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
+        let sid2 = "dddddddd-dddd-4ddd-8ddd-ddddddddddd2";
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid1), alice())
+                .await
+                .unwrap();
+        }
+        let first = state
+            .reader
+            .latest_claimable_handoff(state.workspace_id, state.project_id, None, false)
+            .await
+            .unwrap()
+            .expect("first SessionEnd publishes an open handoff");
+
+        fetch_continuation(&state, session_start_query("claude-code", sid2), &alice())
+            .await
+            .unwrap()
+            .expect("SessionStart must claim the first session's handoff");
+
+        let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        conn.execute("UPDATE handoff_claims SET lease_expires_at = 1", [])
+            .unwrap();
+        drop(conn);
+
+        let run_id = SessionId::from_agent_session(sid2);
+        assert!(
+            state
+                .reader
+                .live_claim_for_run(
+                    state.workspace_id,
+                    state.project_id,
+                    "user:alice".into(),
+                    run_id,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "an elapsed lease is no longer a live holding"
+        );
+        assert!(
+            state
+                .reader
+                .claim_for_run(
+                    state.workspace_id,
+                    state.project_id,
+                    "user:alice".into(),
+                    run_id,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "SessionEnd must still see this Run's lapsed claim"
+        );
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid2), alice())
+                .await
+                .unwrap();
+        }
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, false)
+            .await
+            .unwrap()
+            .expect("SessionEnd must publish a successor after re-claiming");
+        assert_eq!(envelope.work_item.id, first.work_item_id);
+        assert_eq!(envelope.chain.len(), 2, "{:?}", envelope.chain);
+        assert_eq!(
+            envelope.chain[1].predecessor_handoff_id,
+            Some(envelope.chain[0].handoff_id)
+        );
+        assert!(!envelope.handoff.brief.is_empty());
+        assert!(!envelope.handoff.context_refs.is_empty());
     }
 }
