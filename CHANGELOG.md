@@ -50,7 +50,8 @@ below start from the fork.
 
 - SessionEnd auto-handoffs continue the active WorkItem instead of minting an
   orphan per session. The ending run publishes a successor when it already owns
-  the WorkItem, or when it holds a live or lapsed SessionStart claim (re-claim
+  the WorkItem — including after the first checkpoint has acknowledged the
+  Handoff — or when it holds a live or lapsed SessionStart claim (re-claim
   plus one auto checkpoint transfers ownership). Otherwise it still creates a
   new WorkItem. The automatic transfer now carries a brief (session summary,
   open questions, next steps) and context refs for the session page plus up to

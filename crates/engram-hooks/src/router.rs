@@ -2159,8 +2159,9 @@ async fn publish_session_end_handoff(
     Ok(published)
 }
 
-/// Three-tier SessionEnd resolution: already owner, this run's live-or-lapsed
-/// claim (re-claim + auto checkpoint), or nothing to continue.
+/// Three-tier SessionEnd resolution: already owner (including after the
+/// Handoff is acknowledged), this run's live-or-lapsed claim (re-claim +
+/// auto checkpoint), or nothing to continue.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_session_end_successor(
     state: &HookState,
@@ -2170,18 +2171,20 @@ async fn resolve_session_end_successor(
     session_id: SessionId,
     session_summary: &str,
 ) -> anyhow::Result<Option<SessionEndSuccessor>> {
-    if let Some(envelope) = state
+    if let Some((work_item, latest_checkpoint)) = state
         .reader
-        .discover_continuation(workspace_id, project_id, None, None, true)
+        .work_item_owned_by_run(
+            workspace_id,
+            project_id,
+            source_actor.to_string(),
+            session_id,
+        )
         .await?
-        && envelope.work_item.owner_actor == source_actor
-        && envelope.work_item.owner_run_id == Some(session_id)
     {
         return Ok(Some(SessionEndSuccessor {
-            work_item_id: envelope.work_item.id,
-            expected_work_item_revision: envelope.work_item.revision,
-            expected_checkpoint_revision: envelope
-                .latest_checkpoint
+            work_item_id: work_item.id,
+            expected_work_item_revision: work_item.revision,
+            expected_checkpoint_revision: latest_checkpoint
                 .as_ref()
                 .map(|checkpoint| checkpoint.work_item_revision),
         }));
@@ -2206,6 +2209,10 @@ async fn resolve_session_end_successor(
     else {
         return Ok(None);
     };
+    let prior_criterion_status = envelope
+        .latest_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.acceptance_criteria.clone());
 
     let now = Timestamp::now();
     let (claim_id, handoff_revision, work_item) = if held.lease_expires_at > now {
@@ -2257,7 +2264,15 @@ async fn resolve_session_end_successor(
             .iter()
             .map(|criterion| AcceptanceCriterionStatus {
                 criterion: criterion.clone(),
-                satisfied: false,
+                satisfied: prior_criterion_status
+                    .as_ref()
+                    .and_then(|statuses| {
+                        statuses
+                            .iter()
+                            .find(|status| status.criterion == *criterion)
+                            .map(|status| status.satisfied)
+                    })
+                    .unwrap_or(false),
             })
             .collect(),
         actor_key: source_actor.to_string(),
@@ -7360,6 +7375,111 @@ mod tests {
         assert_eq!(
             envelope.chain[1].predecessor_handoff_id,
             Some(envelope.chain[0].handoff_id)
+        );
+        assert!(!envelope.handoff.brief.is_empty());
+        assert!(!envelope.handoff.context_refs.is_empty());
+    }
+
+    /// SessionStart claims, the first checkpoint acknowledges the Handoff,
+    /// and the same Run's SessionEnd continues that WorkItem rather than
+    /// minting an orphan (#55).
+    #[tokio::test]
+    async fn session_end_continues_after_acknowledging_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid1 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1";
+        let sid2 = "ffffffff-ffff-4fff-8fff-fffffffffff2";
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid1), alice())
+                .await
+                .unwrap();
+        }
+        let first = state
+            .reader
+            .latest_claimable_handoff(state.workspace_id, state.project_id, None, false)
+            .await
+            .unwrap()
+            .expect("first SessionEnd publishes an open handoff");
+
+        let rendered =
+            fetch_continuation(&state, session_start_query("claude-code", sid2), &alice())
+                .await
+                .unwrap()
+                .expect("SessionStart must claim the first session's handoff");
+        assert!(rendered.contains("continuation CLAIMED"), "{rendered}");
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, true)
+            .await
+            .unwrap()
+            .expect("the claimed transfer is still inspectable");
+        let claim_id = engram_core::ClaimId::from_str(&rendered_claim_id(&rendered))
+            .expect("the injected block carries a usable Claim id");
+        state
+            .writer
+            .write_checkpoint(engram_core::CheckpointWrite {
+                work_item_id: first.work_item_id,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                run_id: SessionId::from_agent_session(sid2),
+                handoff_id: Some(first.id),
+                claim_id: Some(claim_id),
+                expected_handoff_revision: Some(first.revision + 1),
+                expected_work_item_revision: envelope.work_item.revision,
+                attempt_id: engram_core::AttemptId::new(),
+                actor_key: "user:alice".into(),
+                summary: "picked it up".into(),
+                work_item_state: engram_core::WorkItemState::Active,
+                acceptance_criteria: envelope
+                    .work_item
+                    .acceptance_criteria
+                    .iter()
+                    .map(|criterion| engram_core::AcceptanceCriterionStatus {
+                        criterion: criterion.clone(),
+                        satisfied: false,
+                    })
+                    .collect(),
+                artifacts: vec![],
+                relationships: vec![],
+                parent_result: None,
+            })
+            .await
+            .expect("the receiving Run's first checkpoint acknowledges the automatic claim");
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Acknowledged,
+        );
+
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(&state, session_hook(event, sid2), alice())
+                .await
+                .unwrap();
+        }
+
+        let envelope = state
+            .reader
+            .discover_continuation(state.workspace_id, state.project_id, None, None, false)
+            .await
+            .unwrap()
+            .expect("SessionEnd must publish a successor after acknowledging");
+        assert_eq!(envelope.work_item.id, first.work_item_id);
+        assert_eq!(envelope.chain.len(), 2, "{:?}", envelope.chain);
+        assert_eq!(
+            envelope.chain[1].predecessor_handoff_id,
+            Some(envelope.chain[0].handoff_id)
+        );
+        assert_eq!(envelope.chain[1].state, engram_core::HandoffState::Open);
+        assert_eq!(
+            envelope.chain[0].state,
+            engram_core::HandoffState::Acknowledged
         );
         assert!(!envelope.handoff.brief.is_empty());
         assert!(!envelope.handoff.context_refs.is_empty());

@@ -2831,6 +2831,61 @@ impl ReaderPool {
             .await
     }
 
+    /// The WorkItem this actor and Run currently own in one scope, if any.
+    ///
+    /// Ownership is independent of Handoff state: after the receiving Run's
+    /// first checkpoint acknowledges a claim, the Handoff is no longer
+    /// open/claimed and [`Self::discover_continuation`] will not return it,
+    /// but this Run is still the WorkItem owner. SessionEnd consults this
+    /// first so an acknowledged transfer continues the same WorkItem instead
+    /// of minting an orphan.
+    ///
+    /// Returns the WorkItem together with its latest Checkpoint (or `None`
+    /// before the first one) from a single snapshot, so the successor can
+    /// assert `expected_checkpoint_revision` as that checkpoint's
+    /// `work_item_revision`.
+    ///
+    /// # Errors
+    /// Propagates SQL, identity, timestamp, or persisted JSON errors.
+    pub async fn work_item_owned_by_run(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_actor: String,
+        owner_run_id: SessionId,
+    ) -> StoreResult<Option<(WorkItem, Option<Checkpoint>)>> {
+        self.with_conn(move |conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let id: Option<Vec<u8>> = snapshot
+                .query_row(
+                    "SELECT id FROM work_items \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                       AND owner_actor = ?3 AND owner_run_id = ?4 \
+                     ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        owner_actor,
+                        owner_run_id.as_bytes(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                return Ok(None);
+            };
+            let work_item_id = WorkItemId::from_slice(&id)?;
+            let Some(work_item) = load_work_item(&snapshot, work_item_id)? else {
+                return Err(StoreError::MalformedRecord(format!(
+                    "owned work item {work_item_id} has no row"
+                )));
+            };
+            let latest_checkpoint = load_latest_checkpoint(&snapshot, work_item_id)?;
+            Ok(Some((work_item, latest_checkpoint)))
+        })
+        .await
+    }
+
     /// Snapshot the database to `dest_path` using SQLite's online backup
     /// API. The source DB stays writable for the duration of the copy.
     ///
