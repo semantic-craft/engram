@@ -366,6 +366,25 @@ Project resolution chain: explicit param → server's default → cwd-based heur
 - **Self-healing**: startup checks (`memory_diagnose`): vector dim/provider drift, FTS index corruption, orphan pages, broken links, zombie sessions. `memory_heal` auto-fixes the safe subset.
 - **Logging**: structured `tracing` with rotating files, capped at N MB. No feedback loops (agentmemory #519).
 
+## 12a. Task-continuity retention and accepted vs completed
+
+Lease expiry is evaluated only at transition time (`claim_handoff`). There is
+no sweeper and no unbounded background task that collects lapsed claims. A
+claimed transfer whose live lease has elapsed becomes claimable again on the
+next claim; `lapsed_awaiting_recovery` on the briefing snapshot reports that
+count without mutating it.
+
+Nothing deletes `handoffs`, `work_items`, `checkpoints`, or `handoff_claims`
+rows except project purge. `forget_sweep` and `hard_delete_decayed` reach
+wiki pages only. Historical transfers stay readable while their WorkItem is
+retained, including `acknowledged`, `expired`, `cancelled`, and `superseded`
+states.
+
+An *accepted transfer* (`handoffs.acknowledged`) is the receiver's first
+checkpoint on that Handoff. It says nothing about whether the underlying
+WorkItem finished. Completed work is `work_items.completed`, written only by
+an explicit checkpoint.
+
 ## 13. What we are explicitly NOT doing in v1
 
 To stay scoped:

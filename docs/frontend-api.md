@@ -281,6 +281,9 @@ pages. No LLM, deterministic.
   "activity_30d": { "days": 30, "sessions": 24, "observations": 3712, "pages_updated": 102 },
   "last_observation_at": "2026-05-28T13:58:02.123Z",
   "pending_handoff_count": 0,
+  "work_items": { "active": 0, "blocked": 0, "completed": 0, "abandoned": 0 },
+  "handoffs": { "open": 0, "claimed": 0, "acknowledged": 0, "expired": 0, "cancelled": 0, "superseded": 0 },
+  "lapsed_awaiting_recovery": 0,
   "rules": [{ "path": "_rules/postgres.md", "title": "Postgres only", "kind": "rule",  "updated_at": "…" }],
   "slots": [{ "path": "_slots/focus.md",    "title": "Current focus", "kind": "fact",  "updated_at": "…" }],
   "recent_pages": [

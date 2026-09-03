@@ -12,6 +12,15 @@ below start from the fork.
 
 ### Added
 
+- Task-continuity diagnostics on every briefing snapshot: WorkItems by
+  `active`/`blocked`/`completed`/`abandoned`, Handoffs by
+  `open`/`claimed`/`acknowledged`/`expired`/`cancelled`/`superseded`, and
+  `lapsed_awaiting_recovery` (live claims whose lease has elapsed). The same
+  counts land in `memory_briefing`, `memory_explore`, web `/briefing`, and
+  both overview routes. `GET /admin/audit` is a root-only, no-create read of
+  `audit_log` rows for one `work_item_id` or `handoff_id` (limit default 50,
+  cap 200, newest first) so operators and #47 can reconstruct a journey from
+  stored detail JSON, which already omits claim ids.
 - Automatic session-start recovery now uses the same recoverable claim and
   ContextPackage contract as on-demand continuation. `GET /handoff` is driven
   by a shared, typed **Agent Adapter contract** (`engram_core::adapter`) that

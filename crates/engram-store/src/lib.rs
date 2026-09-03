@@ -55,14 +55,14 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
-    ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
-    ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
-    DerivedIndexStatus, EmbeddingTripleCount, HandoffSummary, HealthDetail, HealthPage,
-    LiveHandoffClaim, ObservationContextSource, ObservationHit, OpenSession, PageAuthor,
-    PageContextSource, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
-    ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition, SessionSummary,
-    StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    ActivityWindow, AuditLogEntry, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
+    BriefingSnapshot, ContaminationFinding, ContaminationReport, ContaminationSummary,
+    DecayCandidate, DerivedIndexStatus, EmbeddingTripleCount, HandoffStateCounts, HandoffSummary,
+    HealthDetail, HealthPage, LiveHandoffClaim, ObservationContextSource, ObservationHit,
+    OpenSession, PageAuthor, PageContextSource, PageHit, PageHitWithMeta, PageLinks, PageMeta,
+    PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow,
+    SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding, StoredPageBody,
+    WorkItemStateCounts, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,

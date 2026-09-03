@@ -102,6 +102,37 @@ If an agent creates a handoff by mistake, cancel it immediately with
 `cancelled` is a distinct outcome from a released Claim, a lapsed lease, and a
 superseded predecessor.
 
+### Continuity diagnostics
+
+`memory_briefing` (and `memory_explore`, the web `/briefing` payload, and both
+overview routes) reports scope-wide continuity counts next to
+`pending_handoff_count`:
+
+- `work_items`: `active` / `blocked` / `completed` / `abandoned`
+- `handoffs`: `open` / `claimed` / `acknowledged` / `expired` / `cancelled` /
+  `superseded`
+- `lapsed_awaiting_recovery`: live claims whose lease has already elapsed.
+  These recover at the next `claim_handoff`; nothing sweeps them in the
+  background.
+
+`acknowledged` means an accepted *transfer* — the receiver wrote its first
+checkpoint. It is not completed work. Completed work is
+`work_items.completed`.
+
+To reconstruct a WorkItem or Handoff journey, root can read the stored
+`audit_log` rows (newest first, limit default 50, cap 200):
+
+```bash
+curl -H "Authorization: Bearer $ENGRAM_AUTH_TOKEN" \
+  "$ENGRAM_URL/admin/audit?workspace=default&project=scratch&work_item_id=<id>"
+```
+
+`handoff_id` is accepted instead of (or with) `work_item_id`. Workspace and
+project must both be supplied and must already exist; a missing or partial
+scope fails closed. The response `detail` objects are the stored JSON as-is
+and never include claim ids. In multi-user mode this route is root-only, like
+every other `/admin/*` endpoint.
+
 Claims, releases, and checkpoints require a fresh caller-supplied `attempt_id`.
 If a response is lost, retry the identical request with the same Attempt id;
 Engram returns the recorded result without extending a lease or duplicating a
