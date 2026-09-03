@@ -10,6 +10,17 @@ below start from the fork.
 
 ## Unreleased
 
+## Desktop 0.3.0 - 2026-09-04
+
+### Changed
+
+- Replaced the geometric `e` / node-mark app icon with the original Paper
+  Muse spark across the Dock/app bundle, DMG, and in-app favicon. The same
+  artwork already shipped in the 2.3.0 engine and web surfaces.
+- Semantic search now sends an explicit `context_budget` and maps navigable
+  page hits from the engine 2.3.0 `ContextPackage` instead of the removed
+  flat hit arrays. Requires a locally running Engram engine ≥ 2.3.0.
+
 ## 2.3.0 - 2026-09-03
 
 ### Added
