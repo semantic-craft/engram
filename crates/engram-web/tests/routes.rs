@@ -5,7 +5,10 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use engram_core::{AgentKind, HandoffCancel, NewHandoff, NewPage, PagePath, SessionId, Tier};
+use engram_core::{
+    AgentKind, AttemptId, HandoffCancel, HandoffClaim, NewHandoff, NewPage, PagePath, SessionId,
+    Tier,
+};
 use engram_store::Store;
 use engram_web::{api_router, router};
 use engram_wiki::{Wiki, WritePageRequest};
@@ -1358,6 +1361,98 @@ async fn api_workspace_overview_includes_open_handoff() {
     assert_eq!(handoff["next_steps"][0], "next_step_marker");
     assert_eq!(handoff["project"], "scratch");
     assert_eq!(handoff["agent"], "claude-code");
+}
+
+/// #54: a receiver that crashed leaves its transfer `claimed` with a live
+/// claim whose lease then elapses. That work is claimable again, so the
+/// workspace overview must surface it instead of showing an idle workspace.
+#[tokio::test]
+async fn api_workspace_overview_includes_expired_lease_claimed_handoff() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let published = store
+        .writer
+        .publish_handoff(NewHandoff {
+            expected_work_item_revision: None,
+            expected_checkpoint_revision: None,
+            brief: String::new(),
+            context_refs: Vec::new(),
+            ..new_handoff(
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                None,
+                "abandoned_handoff_marker",
+            )
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .claim_handoff(HandoffClaim {
+            handoff_id: published.handoff_id,
+            workspace_id: ws,
+            project_id: proj,
+            expected_revision: published.handoff_revision,
+            run_id: SessionId::new(),
+            attempt_id: AttemptId::new(),
+            actor_key: "receiver".into(),
+            lease_seconds: 30,
+            context_options: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+
+    let overview = |app: axum::Router| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/default/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()
+    };
+
+    let while_leased = overview(api_router(store.reader.clone(), wiki.clone())).await;
+    assert!(
+        while_leased["handoff"].is_null(),
+        "a live lease means the work is being carried: {while_leased}"
+    );
+
+    // Simulate the crashed receiver: the lease elapses with the claim still
+    // `live` and the transfer still `claimed`. Ageing the row beats sleeping
+    // on the wall clock — the assertion below is then deterministic.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let expired = conn
+        .execute(
+            "UPDATE handoff_claims SET lease_expires_at = 0 WHERE state = 'live'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(expired, 1);
+
+    let after_expiry = overview(api_router(store.reader.clone(), wiki.clone())).await;
+    assert_eq!(
+        after_expiry["handoff"]["summary"], "abandoned_handoff_marker",
+        "an expired lease returns the transfer to the overview: {after_expiry}"
+    );
 }
 
 #[tokio::test]

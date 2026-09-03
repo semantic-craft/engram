@@ -309,8 +309,9 @@ across all projects in the workspace:
 }
 ```
 
-**Project overview** additionally includes the latest open handoff (or
-`null`):
+**Project overview** additionally includes the latest claimable handoff —
+open, or claimed with an expired lease, so work a crashed receiver left
+behind reappears here (or `null`):
 
 ```json
 {

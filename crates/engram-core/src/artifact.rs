@@ -204,7 +204,7 @@ impl ArtifactInput {
     }
 
     pub fn normalized(&self) -> Result<NormalizedArtifact, MemoryError> {
-        let locator = normalize_locator(&self.locator)?;
+        let locator = normalize_locator(&self.locator, path_like(self.kind))?;
         if locator.is_empty() {
             return Err(MemoryError::MalformedRecord(
                 "artifact locator must not be empty".into(),
@@ -387,7 +387,33 @@ fn nonempty_opt(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
+/// Whether a kind's locator is a filesystem path, whose separator is a
+/// property of the reporting machine rather than part of the identifier.
+///
+/// `git` locators are cwd hints excluded from identity, and `external`
+/// locators are opaque strings (URLs, issue keys, registry coordinates) where
+/// `\` may be a meaningful character. Only `file` and `worktree` name paths.
+fn path_like(kind: ArtifactKind) -> bool {
+    matches!(kind, ArtifactKind::File | ArtifactKind::Worktree)
+}
+
+/// Canonicalize a locator, optionally unifying path separators.
+///
+/// With `unify_separators`, `\` collapses to `/` before the caller derives an
+/// identity key: the same repository file reported as `src\lib.rs` from
+/// Windows and `src/lib.rs` from macOS is one object, so both must produce one
+/// key. The cost is that a literal `\` inside a POSIX filename is no longer
+/// expressible in a path-like locator: it is read as a separator.
+/// Cross-machine identity for the overwhelmingly common case is worth more
+/// than that pathological name.
+///
+/// Only path-like kinds ([`path_like`]) and the path/URL-like
+/// `repository_identity` pass `true`. An `external` locator keeps every
+/// character it was given, so `registry\item` and `registry/item` stay two
+/// distinct identities. Parent-segment rejection and trailing-separator
+/// trimming treat both characters as separators either way, which is what
+/// they did before separator unification existed.
+fn normalize_locator(raw: &str, unify_separators: bool) -> Result<String, MemoryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
@@ -397,18 +423,26 @@ fn normalize_locator(raw: &str) -> Result<String, MemoryError> {
             "artifact locator must not contain NUL".into(),
         ));
     }
-    for segment in trimmed.split(['/', '\\']) {
+    let canonical = if unify_separators {
+        trimmed.replace('\\', "/")
+    } else {
+        trimmed.to_string()
+    };
+    for segment in canonical.split(['/', '\\']) {
         if segment == ".." {
             return Err(MemoryError::MalformedRecord(
                 "artifact locator must not contain parent segments".into(),
             ));
         }
     }
-    Ok(trimmed.trim_end_matches(['/', '\\']).to_string())
+    Ok(canonical.trim_end_matches(['/', '\\']).to_string())
 }
 
+/// A repository identity is a URL or path, never an opaque external string,
+/// so the same remote reached as `//host/share/repo.git` and
+/// `\\host\share\repo.git` is one repository.
 fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
-    let locator = normalize_locator(raw)?;
+    let locator = normalize_locator(raw, true)?;
     Ok(locator.trim_end_matches(".git").to_string())
 }
 
@@ -420,9 +454,12 @@ fn normalize_repository_identity(raw: &str) -> Result<String, MemoryError> {
 /// `C:\\`. Requiring three characters would let that root through as
 /// cross-machine identity, which is exactly what `local_path_hint` is for.
 /// `C:relative` is drive-relative and not a repository path either.
+///
+/// Only `file` and `worktree` locators reach this check, and those are
+/// separator-unified by [`normalize_locator`], so a UNC root arrives as
+/// `//host/share` and needs no separate `\` case.
 fn is_absolute_path(value: &str) -> bool {
     value.starts_with('/')
-        || value.starts_with('\\')
         || (value.len() >= 2
             && value.as_bytes()[1] == b':'
             && value.as_bytes()[0].is_ascii_alphabetic())
@@ -590,6 +627,120 @@ mod tests {
             let facts = DeliveryFacts::only(flag).unwrap();
             assert_eq!(facts.asserted_flags(), vec![flag]);
         }
+    }
+
+    /// #54: one repository file reported from Windows (`src\lib.rs`) and from
+    /// a POSIX machine (`src/lib.rs`) is one object under #42's cross-machine
+    /// identity rule, so the separator the reporter happened to use must not
+    /// survive into the identity key — scoped or unscoped.
+    #[test]
+    fn file_identity_is_separator_independent() {
+        let project_id = ProjectId::new();
+        let posix = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/nested/lib.rs".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            ..empty_input()
+        };
+        let windows = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src\\nested\\lib.rs".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            ..empty_input()
+        };
+        assert_eq!(
+            posix.identity_key().unwrap(),
+            windows.identity_key().unwrap()
+        );
+        assert_eq!(
+            posix
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id),
+            windows
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id)
+        );
+
+        // The repository-less file falls back to the project-scoped key,
+        // which embeds the locator too.
+        let scoped_posix = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src/nested/lib.rs".into(),
+            ..empty_input()
+        };
+        let scoped_windows = ArtifactInput {
+            kind: ArtifactKind::File,
+            locator: "src\\nested\\lib.rs".into(),
+            ..empty_input()
+        };
+        assert_eq!(
+            scoped_posix
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id),
+            scoped_windows
+                .normalized()
+                .unwrap()
+                .identity_key_for_scope(project_id)
+        );
+    }
+
+    /// The worktree key embeds the locator as well, so it inherits the same
+    /// separator hazard the File key had.
+    #[test]
+    fn worktree_identity_is_separator_independent() {
+        let posix = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt/machine-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("/tmp/machine-a/engram".into()),
+            ..empty_input()
+        };
+        let windows = ArtifactInput {
+            kind: ArtifactKind::Worktree,
+            locator: "wt\\machine-a".into(),
+            repository_identity: Some("github.com/semantic-craft/engram".into()),
+            observed_revision: Some("abc123".into()),
+            local_path_hint: Some("C:\\machine-a\\engram".into()),
+            ..empty_input()
+        };
+        assert_eq!(
+            posix.identity_key().unwrap(),
+            windows.identity_key().unwrap()
+        );
+    }
+
+    /// The flip side of the separator rule: an `external` locator is an
+    /// opaque identifier (URL, issue key, registry coordinate), not a
+    /// filesystem path, so `\` stays a meaningful character and the two
+    /// spellings remain two distinct objects.
+    #[test]
+    fn external_identity_keeps_literal_backslash() {
+        let slash = ArtifactInput {
+            kind: ArtifactKind::External,
+            locator: "registry/item".into(),
+            observed_revision: Some("1.0.0".into()),
+            ..empty_input()
+        };
+        let backslash = ArtifactInput {
+            kind: ArtifactKind::External,
+            locator: "registry\\item".into(),
+            observed_revision: Some("1.0.0".into()),
+            ..empty_input()
+        };
+        assert_ne!(
+            slash.identity_key().unwrap(),
+            backslash.identity_key().unwrap(),
+            "external locators are opaque; the separator is part of the identifier"
+        );
+        assert!(
+            backslash.identity_key().unwrap().contains("registry\\item"),
+            "{}",
+            backslash.identity_key().unwrap()
+        );
     }
 
     fn empty_input() -> ArtifactInput {

@@ -48,8 +48,8 @@ below start from the fork.
 
 - Recoverable task continuity now models stable WorkItems separately from
   Runs/Sessions, revisioned Handoffs, lease-bound Claims, append-only
-  Checkpoints, caller-supplied retry Attempts, and BackgroundJob identities.
-  The MCP surface adds read-only `memory_handoff_discover`, compare-and-set
+  Checkpoints, and caller-supplied retry Attempts. The MCP surface adds
+  read-only `memory_handoff_discover`, compare-and-set
   `memory_handoff_claim`, explicit `memory_handoff_release`, and
   `memory_checkpoint_write`; identical lost-response retries replay the
   original result while mismatched Attempt reuse fails closed.
@@ -82,6 +82,29 @@ below start from the fork.
   records observed status and performs no Git or external mutation.
 
 ### Fixed
+
+- One repository file now has one artifact identity regardless of the
+  reporting machine's path separator: path-like locators (`file`, `worktree`)
+  and `repository_identity` normalize `\` to `/` before the identity key is
+  derived, so `src\lib.rs` from Windows and `src/lib.rs` from macOS are the
+  same artifact instead of two. `git` and `external` locators keep every
+  character they were given: an `external` locator is an opaque identifier
+  where `\` can be meaningful, and a `git` locator is a cwd hint that is not
+  part of identity (#54).
+
+- A transfer left claimed by a receiver that crashed is visible again as soon
+  as its lease expires. `memory_briefing`'s pending handoff count (project,
+  workspace, and global) and the web workspace overview now apply the same
+  claimable rule `memory_handoff_discover` already used, instead of counting
+  only `open` transfers and hiding recoverable work (#54).
+
+- A Run that owns a parent WorkItem can complete, abandon, claim, or supersede
+  it even when the same Run also created a child of it; owning the parent is
+  checked before the child classification that produced a spurious
+  `CHILD_MUTATION_FORBIDDEN` (#54).
+
+- A WorkItem can no longer acquire a second `child_of` parent, which had made
+  parent resolution arbitrary. The store rejects the second relationship (#54).
 
 - Updated the `h2` crate to 0.4.19 to address RUSTSEC-2026-0258 (unbounded
   empty DATA frames). This unblocks `cargo-deny` and `cargo-audit` on main.
