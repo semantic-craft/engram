@@ -84,9 +84,13 @@ below start from the fork.
 ### Fixed
 
 - One repository file now has one artifact identity regardless of the
-  reporting machine's path separator: locators normalize `\` to `/` before
-  the identity key is derived, so `src\lib.rs` from Windows and `src/lib.rs`
-  from macOS are the same File (and Worktree) artifact instead of two (#54).
+  reporting machine's path separator: path-like locators (`file`, `worktree`)
+  and `repository_identity` normalize `\` to `/` before the identity key is
+  derived, so `src\lib.rs` from Windows and `src/lib.rs` from macOS are the
+  same artifact instead of two. `git` and `external` locators keep every
+  character they were given: an `external` locator is an opaque identifier
+  where `\` can be meaningful, and a `git` locator is a cwd hint that is not
+  part of identity (#54).
 
 - A transfer left claimed by a receiver that crashed is visible again as soon
   as its lease expires. `memory_briefing`'s pending handoff count (project,
