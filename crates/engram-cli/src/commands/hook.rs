@@ -21,7 +21,7 @@ use engram_llm::OidcToken;
 use crate::cli::HookArgs;
 
 use super::hook_capture::{
-    build_client, extract_cwd, extract_session_id, get_handoff, marker_query_suffix, url_encode,
+    build_client, extract_cwd, get_handoff, marker_query_suffix, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -274,7 +274,10 @@ where
         if AdapterContract::from_wire(Some(&args.agent)).may_claim_on_session_start() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let run_qs = extract_session_id(&json)
+            // The ONE shared extraction (`engram_hooks::extract_session_id`),
+            // not a local copy: a divergent key list here would bind the claim
+            // to a different Run than hook capture recorded.
+            let run_qs = engram_hooks::extract_session_id(&json)
                 .map(|id| format!("&session_id={}", url_encode(&id)))
                 .unwrap_or_default();
             let handoff_url = format!("{base}/handoff?agent={}{qs}{run_qs}", args.agent);

@@ -301,7 +301,12 @@ the conversation calls for them:\n\
   never marks the Handoff accepted. A child WorkItem cannot claim its parent.\n\
 - `memory_checkpoint_write` — append durable progress for the exact \
   WorkItem, including typed artifacts, explicit WorkItem relationships, \
-  and optional parent_result evidence. Responses expose ArtifactRefs and \
+  and optional parent_result evidence. **This is also how you accept an \
+  injected session-start block headed \'📥 engram: continuation CLAIMED\': \
+  that block already holds this Run\'s claim, so do NOT claim again — write \
+  your first checkpoint with the `work_item_id`, `handoff_id`, `claim_id`, \
+  `expected_handoff_revision`, `expected_work_item_revision`, and `run_id` \
+  the block names.** Responses expose ArtifactRefs and \
   relationships with stable identities and revisions. The first receiver \
   checkpoint supplies its live Claim and acknowledges the Handoff \
   transactionally; that ack checkpoint may attach relationships. \
@@ -3334,26 +3339,22 @@ fn assembly_failed_after_claim(claimed: &HandoffClaimResult, error: McpError) ->
     )
 }
 
+/// Convert the tool-surface quota arguments into the shared per-kind ceilings.
+///
+/// The defaults live in `engram_store::continuation` so `memory_query`,
+/// on-demand `memory_handoff_claim`, and automatic SessionStart recovery all
+/// assemble under identical ceilings.
 fn context_quotas(quotas: Option<ContextQuotaArgs>) -> Vec<ContextQuota> {
     let quotas = quotas.unwrap_or(ContextQuotaArgs {
         wiki_page: None,
         session_page: None,
         observation: None,
     });
-    vec![
-        ContextQuota {
-            kind: ContextKind::WikiPage,
-            maximum: quotas.wiki_page.unwrap_or(6),
-        },
-        ContextQuota {
-            kind: ContextKind::SessionPage,
-            maximum: quotas.session_page.unwrap_or(3),
-        },
-        ContextQuota {
-            kind: ContextKind::Observation,
-            maximum: quotas.observation.unwrap_or(3),
-        },
-    ]
+    engram_store::context_quotas(engram_store::ContextQuotaOverrides {
+        wiki_page: quotas.wiki_page,
+        session_page: quotas.session_page,
+        observation: quotas.observation,
+    })
 }
 
 fn checkpoint_or_mcp(wiki: &Wiki, message: impl AsRef<str>) -> Result<Option<String>, McpError> {

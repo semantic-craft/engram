@@ -168,27 +168,47 @@ Run):
 
 1. Resolve the workspace/project through the shared scope framework's no-create
    lookup, failing closed on missing or partial explicit scope, honouring
-   active-project and multi-user isolation.
-2. Discover one eligible transfer. The optional `.engram.toml` `work_item` hint
-   narrows selection *inside* that resolved scope; cwd remains a local routing
-   hint. Neither is task identity and neither authorizes anything.
-3. Claim it through `engram_store`'s single writer and the same compare-and-set
+   active-project and multi-user isolation. Because this endpoint mutates, a
+   supplied cwd that resolves to no existing project claims **nothing**: it
+   never falls back to the server's baked default project, which would hand the
+   session another project's work.
+2. Pass `Capability::NormalWrite` through `AuthLevel::authorize`, the same gate
+   every MCP continuity transition uses. Only the claiming path is gated; the
+   opt-in project brief remains a read surface.
+3. **Re-render first.** If this exact actor and Run already hold a live claim
+   in this scope (`ReaderPool::live_claim_for_run`), render that continuation
+   and stop. Discovery must not run first: a harness re-fires SessionStart
+   inside a live Run (Claude Code on `/clear`, on resume), and claiming
+   whatever *other* open transfer the project has would strand the
+   continuation this Run is carrying and inject unrelated work.
+4. Otherwise discover one eligible transfer. The optional `.engram.toml`
+   `work_item` hint narrows selection *inside* that resolved scope; cwd remains
+   a local routing hint. Neither is task identity and neither authorizes
+   anything.
+5. Claim it through `engram_store`'s single writer and the same compare-and-set
    path as `memory_handoff_claim`, binding the claim to the actual receiving
    Run. The Attempt id is derived from `(handoff, revision, run)`, so a hook
    that fires twice replays rather than races itself.
-4. Assemble the ContextPackage through the shared
+6. Assemble the ContextPackage through the shared
    `engram_store::continuation` module — the same call `memory_handoff_claim`
-   makes — under a strict byte budget, with no embedder and therefore no
-   synchronous model call.
-5. Render the envelope, claim metadata, package, and provenance.
+   makes, including the same default per-kind quotas from
+   `engram_store::context_quotas` — under a strict byte budget, with no
+   embedder and therefore no synchronous model call.
+7. Render the envelope, claim metadata, package, and provenance. A fresh claim
+   records the retention access bump; a re-render does not, because the claim
+   that first delivered those revisions already counted them.
 
-The whole sequence runs under one wall-clock timeout (`[continuity]`). The
-Handoff is left **claimed, never accepted**: only the receiving Run's first
+The whole sequence runs under one wall-clock timeout (`[continuity]`), whose
+ceiling (`MAX_SESSION_START_TIMEOUT_MS`, 900 ms) is held strictly below
+`SESSION_START_CLIENT_BUDGET_MS` (1000 ms) — the deadline every shipped hook
+client aborts at. The server must give up first: a client that aborted first
+would leave a committed claim with nothing injected, leasing the transfer with
+no receiver on every session start.
+
+The Handoff is left **claimed, never accepted**: only the receiving Run's first
 valid Checkpoint acknowledges it. A receiver that exits or loses its output
 before checkpointing leaves a live claim that returns to `open` at lease
-expiry, so lost work is recoverable rather than lost. A second SessionStart
-inside the *same* Run (Claude Code re-fires it on `/clear`) re-renders that
-Run's own live claim as a pure read.
+expiry, so lost work is recoverable rather than lost.
 
 Concurrent automatic and on-demand claims meet at the same compare-and-set, so
 exactly one claimant wins; the loser injects nothing. Claim audit records name
@@ -199,7 +219,14 @@ Handoff revision, and outcome, and never record the Claim capability itself.
 Hook clients encode the same table: the six delivery-capable
 `hooks/*/session-start.sh` and `.ps1` bundles forward their session id and fetch
 `/handoff`; Grok's bundle captures only; and the generated OpenCode / OMP / Pi /
-OpenClaw integrations forward their session id from the harness SDK.
+OpenClaw integrations forward their session id from the harness SDK. Every
+client resolves the session id through the one ordered key-and-path list in
+`engram_hooks::extract_session_id` (`SESSION_ID_KEYS` then
+`SESSION_ID_PATHS`) — the native client calls it directly, and the POSIX and
+PowerShell helpers mirror it under test. A divergence there would either miss
+OpenCode's nested `{"info":{"id":…}}` shape (silently degrading an
+output-capable adapter to the read-only render) or bind the claim to a
+different Run than capture recorded.
 
 ## Storage architecture
 
@@ -593,7 +620,7 @@ hard_delete_after_days = 180
 
 [continuity]                       # automatic session-start recovery bounds
 session_start_context_budget = 8000    # ContextPackage budget, UTF-8 bytes
-session_start_timeout_ms = 750         # discover + claim + assemble + render
+session_start_timeout_ms = 750         # clamped to 50..=900 (see below)
 session_start_lease_seconds = 900      # lease an automatic claim receives
 
 [auto_improve]                     # default-available learning reviewer

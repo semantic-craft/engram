@@ -67,22 +67,67 @@ engram_extract_cwd() {
 }
 
 # Extract the harness's own session identifier from a JSON payload on stdin or
-# in $1. Mirrors the server-side extraction in `engram_hooks::payload`: Claude
-# Code sends `session_id`, Codex `sessionId`, OpenCode `sessionID`, Antigravity
-# CLI `conversationId`. Same intentionally-tiny sed approach as
-# `engram_extract_cwd` — POSIX shell, no jq.
+# in $1.
 #
-# `session-start.sh` forwards the value on `GET /handoff` so the server can bind
-# the automatic Handoff claim to the Run that is actually starting; without it
-# the server renders read-only and the agent must claim through MCP.
+# MUST stay in lockstep with `engram_hooks::extract_session_id` (its
+# SESSION_ID_KEYS then SESSION_ID_PATHS, in that order) and with
+# `Get-EngramSessionId` in hooks/lib/engram-hook.ps1. A divergence is silent
+# and expensive: miss the id and an output-capable adapter degrades to the
+# read-only render on every start; find a *different* id and the automatic
+# claim binds to a Run that never writes the acknowledging checkpoint.
+#
+# Phase 1 is the flat key scan (Claude Code `session_id`, Codex `sessionId`,
+# OpenCode `sessionID`, Antigravity CLI `conversationId`), which also reaches
+# the nested `properties` / `info` objects the Rust side probes because the
+# scan is substring-based. Phase 2 walks the nested paths for payloads that
+# carry no key spelling at all — notably OpenCode's `{"info":{"id":...}}`.
+# Same intentionally-tiny sed approach as `engram_extract_cwd`; no jq.
+engram_session_id_string() {
+    printf '%s' "$1" \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+        | head -n 1
+}
+
+# Walk "$1" (payload) through the remaining arguments as an ordered path of
+# JSON keys, printing the final segment's string value. Each step truncates the
+# payload at its key, so `info id` reads the `id` that follows `"info"`.
+engram_json_path_value() {
+    _payload="$1"
+    shift
+    while [ "$#" -gt 0 ]; do
+        _rest=${_payload#*\"$1\"}
+        [ "$_rest" = "$_payload" ] && return 0
+        _payload="$_rest"
+        shift
+    done
+    engram_session_id_string "$_payload"
+}
+
 engram_extract_session_id() {
     payload="${1:-$(cat)}"
+    # Phase 1 — SESSION_ID_KEYS, in order.
     for _k in session_id sessionId sessionID session conversationId; do
         rest=${payload#*\"$_k\"}
         [ "$rest" = "$payload" ] && continue
-        raw=$(printf '%s' "$rest" \
-            | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
-            | head -n 1)
+        raw=$(engram_session_id_string "$rest")
+        if [ -n "$raw" ]; then
+            printf '%s' "$raw"
+            return 0
+        fi
+    done
+    # Phase 2 — SESSION_ID_PATHS, in order.
+    for _path in \
+        "info id" \
+        "properties sessionID" \
+        "properties info id" \
+        "event properties sessionID" \
+        "event properties info id" \
+        "payload info id" \
+        "payload properties sessionID" \
+        "payload properties info id"; do
+        # Word-split the path on purpose: these are literal, space-free keys.
+        # shellcheck disable=SC2086
+        raw=$(engram_json_path_value "$payload" $_path)
         if [ -n "$raw" ]; then
             printf '%s' "$raw"
             return 0
@@ -221,11 +266,19 @@ engram_post_hook() {
 }
 
 # GET "$1" with the same auth-header rules as `engram_post_hook`.
-# Used by `session-start.sh` to pull the cross-agent handoff before
+# Used by `session-start.sh` to pull the cross-agent continuation before
 # the resuming agent's first prompt. 1s budget — slightly more
 # generous than POST because the result is *synchronously* fed to
 # stdout (and prepended to the agent's context), so we want to avoid
-# truncating a handoff that was almost ready.
+# truncating a continuation that was almost ready.
+#
+# This 1.0s IS `engram_hooks::SESSION_START_CLIENT_BUDGET_MS`. The server
+# clamps its own continuation timeout strictly below it, so the server always
+# gives up first; if the client aborted first the claim would already be
+# committed with nothing injected, leaving the transfer leased with no
+# receiver. Changing this number means changing that constant, the PowerShell
+# `-TimeoutSec`, and `timeoutSignal(1000)` in the generated TypeScript clients
+# together.
 engram_get_handoff() {
     if [ -n "${ENGRAM_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 1.0 "$1" \

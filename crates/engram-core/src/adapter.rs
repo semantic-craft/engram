@@ -25,6 +25,11 @@
 //!
 //! ## Identity dimensions stay distinct
 //!
+//! The lifecycle event is not a field here: `GET /handoff` is the SessionStart
+//! surface by construction, and `POST /hook` already carries the canonical
+//! [`crate::ObservationKind`] for every other event. Restating it would be a
+//! second, divergable source of truth for one fixed value.
+//!
 //! [`AdapterRequest`] keeps the authenticated `actor` separate from the
 //! execution `agent`, the receiving `run`, and every *hint* ([`AdapterRequest::work_item`],
 //! [`AdapterRequest::cwd`], [`AdapterPeer`]). Hints narrow selection inside an
@@ -34,7 +39,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentKind, SessionId, WorkItemId};
-use crate::observation::ObservationKind;
 
 /// What a harness does with a SessionStart hook's output.
 ///
@@ -200,8 +204,6 @@ pub struct AdapterRequest {
     /// its `.engram.toml`). Narrows selection *inside* the already-resolved
     /// workspace/project; it can never widen scope or authorize anything.
     pub work_item: Option<WorkItemId>,
-    /// Canonical lifecycle event that produced this request.
-    pub event: ObservationKind,
     /// Local routing hint. Never the identity of the task.
     pub cwd: Option<String>,
 }
@@ -283,7 +285,6 @@ mod tests {
             actor: "user:alice".into(),
             run: None,
             work_item: None,
-            event: ObservationKind::SessionStart,
             cwd: Some("/repo".into()),
         };
         assert!(!request.may_claim());

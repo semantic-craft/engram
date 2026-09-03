@@ -20,7 +20,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use engram_consolidate::Consolidator;
 use engram_core::{
-    ActiveProject, ActorKey, AdapterContract, AdapterPeer, AdapterRequest, AgentKind,
+    ActiveProject, ActorKey, AdapterContract, AdapterPeer, AdapterRequest, AgentKind, AuthLevel,
     DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff, NewObservation, NewSession, ObservationKind,
     ProjectId, Sanitized, Sanitizer, SessionId, WorkItem, WorkItemId, WorkspaceId,
 };
@@ -300,10 +300,42 @@ pub struct SessionStartContinuity {
 /// Default continuation budget: roughly 2k tokens of evidence, enough for a
 /// handful of briefs plus one upgraded page without taxing every session start.
 pub const DEFAULT_SESSION_START_CONTEXT_BUDGET: usize = 8_000;
-/// Default continuation timeout. The client-side `GET /handoff` budget is 1s,
-/// so the server gives up first and injects nothing rather than being cut off
-/// mid-render.
+/// The `GET /handoff` deadline every shipped hook client uses.
+///
+/// `curl --max-time 1.0` in `hooks/_lib.sh`, `-TimeoutSec 1` in
+/// `hooks/lib/engram-hook.ps1`, and `timeoutSignal(1000)` in the generated
+/// OpenCode / OMP / Pi / OpenClaw integrations. The native `engram hook`
+/// client allows more, so this is the tightest deadline in the fleet.
+pub const SESSION_START_CLIENT_BUDGET_MS: u64 = 1_000;
+
+/// Ceiling for the server-side continuation timeout.
+///
+/// Strictly below [`SESSION_START_CLIENT_BUDGET_MS`] so the SERVER always
+/// gives up first. If the client aborted first the claim would already be
+/// committed while nothing reached the agent, leaving the transfer leased for
+/// the whole `session_start_lease_seconds` with no receiver — recoverable, but
+/// a self-inflicted outage on every session start.
+pub const MAX_SESSION_START_TIMEOUT_MS: u64 = 900;
+
+/// Floor for the server-side continuation timeout.
+pub const MIN_SESSION_START_TIMEOUT_MS: u64 = 50;
+
+/// Default continuation timeout, comfortably under
+/// [`MAX_SESSION_START_TIMEOUT_MS`].
 pub const DEFAULT_SESSION_START_TIMEOUT_MS: u64 = 750;
+
+// Compile-time coupling, not a runtime test: if someone raises the server
+// ceiling to or past the tightest client deadline, the build fails rather than
+// shipping a configuration where the client can abort after the claim commits.
+const _: () = assert!(
+    MAX_SESSION_START_TIMEOUT_MS < SESSION_START_CLIENT_BUDGET_MS,
+    "the server's continuation timeout must expire before any hook client's"
+);
+const _: () = assert!(
+    MIN_SESSION_START_TIMEOUT_MS <= DEFAULT_SESSION_START_TIMEOUT_MS
+        && DEFAULT_SESSION_START_TIMEOUT_MS <= MAX_SESSION_START_TIMEOUT_MS,
+    "the default continuation timeout must sit inside the clamp range"
+);
 /// Default automatic lease. Long enough for a resuming agent to reach its first
 /// checkpoint, short enough that an abandoned session returns the transfer to
 /// `open` within a coffee break.
@@ -587,11 +619,15 @@ async fn handle_handoff(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<engram_core::ActorContext>>,
+    auth_ext: Option<axum::Extension<AuthLevel>>,
 ) -> impl IntoResponse {
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_default();
-    match fetch_handoff_context(&state, query, &actor).await {
+    // Absent extension means the auth middleware never ran for this request;
+    // fail closed to the least-privileged tier rather than assuming root.
+    let auth = auth_ext.map_or(AuthLevel::Anonymous, |axum::Extension(level)| level);
+    match fetch_handoff_context(&state, query, &actor, auth).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         Err(e) => {
@@ -620,7 +656,6 @@ fn adapter_request(query: &HandoffQuery, actor: &engram_core::ActorContext) -> A
         actor: actor.continuity_key(),
         run: harness_session_id(query).map(SessionId::from_agent_session),
         work_item,
-        event: ObservationKind::SessionStart,
         cwd: query.cwd.clone(),
     }
 }
@@ -639,6 +674,7 @@ async fn fetch_handoff_context(
     state: &HookState,
     query: HandoffQuery,
     actor_ctx: &engram_core::ActorContext,
+    auth: AuthLevel,
 ) -> anyhow::Result<Option<String>> {
     let request = adapter_request(&query, actor_ctx);
     // `POST /hook` keys the active-project pointer by (user, session); the
@@ -651,7 +687,22 @@ async fn fetch_handoff_context(
     let Some((ws, proj)) = resolve_handoff_scope(state, &query, &actor).await? else {
         return Ok(None);
     };
-    let handoff_md = if request.contract.may_claim_on_session_start() {
+    // This endpoint MUTATES on the claiming path, so it passes the same
+    // capability gate every MCP continuity transition does. Reading the brief
+    // below stays a NormalRead surface.
+    let may_claim = request.contract.may_claim_on_session_start()
+        && match auth.authorize(engram_core::Capability::NormalWrite, false) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    adapter = %request.delivery_path(),
+                    error = error.message(),
+                    "session-start continuation is not authorized to claim"
+                );
+                false
+            }
+        };
+    let handoff_md = if may_claim {
         // One strict wall-clock cap over discover + claim + assemble + render.
         // Timing out injects nothing; at worst a live claim remains, and a live
         // claim returns to `open` at lease expiry.
@@ -706,7 +757,15 @@ async fn fetch_handoff_context(
     })
 }
 
-/// Discover, claim, and render one continuation for an output-capable adapter.
+/// Re-render a held claim, or discover and claim one, for an output-capable
+/// adapter.
+///
+/// Order matters. The Run's OWN live claim is resolved first, before any
+/// open-transfer discovery: a harness re-fires SessionStart inside a live Run
+/// (Claude Code does it on `/clear` and on resume), and discovering first would
+/// make the second start claim whatever *other* open transfer the project
+/// happens to have — stranding the continuation this Run is already carrying
+/// under its lease and injecting unrelated work.
 ///
 /// Returns `Ok(None)` for every non-exceptional "nothing to inject" outcome —
 /// no eligible transfer, or losing the compare-and-set race to a concurrent
@@ -718,10 +777,13 @@ async fn session_start_continuation(
     project_id: ProjectId,
     request: &AdapterRequest,
 ) -> anyhow::Result<Option<String>> {
+    if let Some(rendered) = rerender_own_claim(state, workspace_id, project_id, request).await? {
+        return Ok(Some(rendered));
+    }
     // One snapshot: the injected envelope must not mix a transfer with a
     // WorkItem or Checkpoint that a concurrent successor has already moved
     // past.
-    let claimable = state
+    let Some(envelope) = state
         .reader
         .discover_continuation(
             workspace_id,
@@ -730,13 +792,9 @@ async fn session_start_continuation(
             request.work_item,
             false,
         )
-        .await?;
-    let Some(envelope) = claimable else {
-        // Nothing claimable. A SessionStart that fires again inside the SAME
-        // Run (Claude Code re-fires it on `/clear` and on resume) must not lose
-        // the continuation this Run already holds, so re-render its own live
-        // claim. Any other holder's claim is none of this session's business.
-        return rerender_own_claim(state, workspace_id, project_id, request).await;
+        .await?
+    else {
+        return Ok(None);
     };
     let Some(run_id) = request.run else {
         // Output-capable adapter that cannot name its Run: render the
@@ -806,6 +864,9 @@ async fn session_start_continuation(
                 },
             },
             request,
+            // A fresh claim consumes these page revisions for the first time,
+            // so it owes the retention model its reinforcement bump.
+            AccessBump::Record,
         )
         .await,
     ))
@@ -813,10 +874,14 @@ async fn session_start_continuation(
 
 /// Re-render the continuation this exact actor and Run already hold.
 ///
-/// Purely a read: no claim, no revision bump, no audit transition. Without it a
-/// second SessionStart inside one Run (a `/clear`, a resume) would find its own
-/// claimed transfer "not claimable" and inject nothing, silently costing the
-/// agent the context it is entitled to.
+/// Purely a read: no claim, no revision bump, no audit transition, and no
+/// access reinforcement — the claim that first delivered these pages already
+/// counted them. Without this a second SessionStart inside one Run (a
+/// `/clear`, a resume) would either inject nothing or, worse, claim a second
+/// unrelated transfer while the first stayed leased.
+///
+/// A Run carries one continuation, so a held claim wins unconditionally; the
+/// WorkItem hint only steers which transfer a *new* claim selects.
 async fn rerender_own_claim(
     state: &HookState,
     workspace_id: WorkspaceId,
@@ -826,26 +891,27 @@ async fn rerender_own_claim(
     let Some(run_id) = request.run else {
         return Ok(None);
     };
-    let Some(envelope) = state
+    let Some(held) = state
         .reader
-        .discover_continuation(
-            workspace_id,
-            project_id,
-            request.cwd.clone(),
-            request.work_item,
-            true,
-        )
+        .live_claim_for_run(workspace_id, project_id, request.actor.clone(), run_id)
         .await?
     else {
         return Ok(None);
     };
-    let Some(live) = state.reader.live_handoff_claim(envelope.handoff.id).await? else {
+    let Some(envelope) = state
+        .reader
+        .continuation_by_handoff_id(held.handoff_id)
+        .await?
+    else {
         return Ok(None);
     };
-    if live.actor_key != request.actor || live.run_id != run_id {
-        // Someone else is carrying this work.
-        return Ok(None);
-    }
+    debug!(
+        adapter = %request.delivery_path(),
+        run = %run_id,
+        handoff = %held.handoff_id,
+        outcome = "re-rendered",
+        "session-start re-rendered this Run's existing claim"
+    );
     Ok(Some(
         render_continuation(
             state,
@@ -853,17 +919,27 @@ async fn rerender_own_claim(
                 handoff: &envelope.handoff,
                 work_item: &envelope.work_item,
                 checkpoint: envelope.latest_checkpoint.as_ref(),
-                claim_id: live.claim_id,
-                lease_expires_at: live.lease_expires_at,
+                claim_id: held.claim_id,
+                lease_expires_at: held.lease_expires_at,
                 peer: AdapterPeer {
                     source_agent: envelope.handoff.from_agent,
                     target_agent: envelope.handoff.to_agent,
                 },
             },
             request,
+            AccessBump::Skip,
         )
         .await,
     ))
+}
+
+/// Whether this rendering owes the retention model an access bump.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessBump {
+    /// A fresh claim consumed these revisions: reinforce once each.
+    Record,
+    /// A re-render of an already-counted claim: reinforce nothing.
+    Skip,
 }
 
 /// Assemble the budgeted ContextPackage and render the full injected block.
@@ -871,13 +947,17 @@ async fn render_continuation(
     state: &HookState,
     claimed: ClaimedContinuation<'_>,
     request: &AdapterRequest,
+    bump: AccessBump,
 ) -> String {
     let assembled = engram_store::assemble_handoff_context(
         &state.reader,
         claimed.handoff,
         engram_store::HandoffContextRequest {
             budget: state.continuity.context_budget,
-            quotas: Vec::new(),
+            // The SAME default ceilings an on-demand `memory_handoff_claim`
+            // with no overrides uses. An empty list would mean "unlimited per
+            // kind" and assemble a different package than the identical claim.
+            quotas: engram_store::context_quotas(engram_store::ContextQuotaOverrides::default()),
             already_used: std::collections::BTreeSet::new(),
             // No embedder on the hook path: SessionStart must never make a
             // synchronous model call. The retrieval leg degrades to BM25
@@ -889,9 +969,11 @@ async fn render_continuation(
     .await;
     let package = match assembled {
         Ok(context) => {
-            // Same reinforcement term as every other retrieval path, once per
-            // consumed revision.
-            state.writer.bump_access(context.access_bump_ids).await.ok();
+            if bump == AccessBump::Record {
+                // Same reinforcement term as every other retrieval path, once
+                // per consumed revision.
+                state.writer.bump_access(context.access_bump_ids).await.ok();
+            }
             Some(context.assembled)
         }
         Err(error) => {
@@ -948,11 +1030,16 @@ async fn resolve_handoff_scope(
         engram_consolidate::derive_project_name(std::path::Path::new(cwd), strategy)
             .map(|(name, _)| name)
     });
+    // A cwd that yields no project name, or that resolves to the reserved
+    // global scope, must NOT fall back to the server's baked default project.
+    // This endpoint claims, and the resolved scope decides whose continuation
+    // gets consumed: silently substituting another project would hand this
+    // session someone else's work. Fail closed instead.
     let Some(project) = project else {
-        return Ok(Some((state.workspace_id, state.project_id)));
+        return Ok(None);
     };
     if project == engram_core::GLOBAL_SCOPE_PROJECT {
-        return Ok(Some((state.workspace_id, state.project_id)));
+        return Ok(None);
     }
     let workspace = query.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE_NAME);
     match resolver.lookup_existing(workspace, &project).await {
@@ -2202,6 +2289,17 @@ mod tests {
             )),
             continuity: SessionStartContinuity::default(),
         }
+    }
+
+    /// Drive the continuation endpoint at the tier a default single-user
+    /// install runs at. The claiming path passes `Capability::NormalWrite`
+    /// through [`AuthLevel::authorize`] exactly as every MCP transition does.
+    async fn fetch_continuation(
+        state: &HookState,
+        query: HandoffQuery,
+        actor: &engram_core::ActorContext,
+    ) -> anyhow::Result<Option<String>> {
+        fetch_handoff_context(state, query, actor, AuthLevel::Anonymous).await
     }
 
     /// A SessionStart query from an output-capable Agent Adapter that can name
@@ -4716,7 +4814,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
@@ -4883,7 +4981,7 @@ mod tests {
             "successor must name the transfer it continues"
         );
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
@@ -4950,7 +5048,7 @@ mod tests {
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             query(Some("false")),
             &engram_core::ActorContext::default(),
@@ -4963,7 +5061,7 @@ mod tests {
         );
 
         // Truthy opt-in, no pending handoff: brief alone (the /clear case).
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             query(Some("true")),
             &engram_core::ActorContext::default(),
@@ -5008,7 +5106,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             query(Some("true")),
             &engram_core::ActorContext::default(),
@@ -5123,7 +5221,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
@@ -5264,7 +5362,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some(cwd.into()),
@@ -5356,12 +5454,12 @@ mod tests {
             ..Default::default()
         };
         let alice_context =
-            fetch_handoff_context(&state, session_start_query("claude-code", ""), &alice_actor)
+            fetch_continuation(&state, session_start_query("claude-code", ""), &alice_actor)
                 .await
                 .unwrap()
                 .unwrap();
         let bob_context =
-            fetch_handoff_context(&state, session_start_query("claude-code", ""), &bob_actor)
+            fetch_continuation(&state, session_start_query("claude-code", ""), &bob_actor)
                 .await
                 .unwrap()
                 .unwrap();
@@ -5369,7 +5467,7 @@ mod tests {
         assert!(!alice_context.contains("bob continuation"));
         assert!(bob_context.contains("bob continuation"));
 
-        let missing = fetch_handoff_context(
+        let missing = fetch_continuation(
             &state,
             HandoffQuery {
                 cwd: Some("/tmp/never-created".into()),
@@ -6073,7 +6171,7 @@ mod tests {
                 publish_continuation(&state, state.workspace_id, state.project_id, "resume auth")
                     .await;
 
-            let rendered = fetch_handoff_context(
+            let rendered = fetch_continuation(
                 &state,
                 session_start_query(agent, "harness-session-1"),
                 &alice(),
@@ -6136,9 +6234,7 @@ mod tests {
                 agent: agent.map(str::to_owned),
                 ..session_start_query("unused", "harness-session-2")
             };
-            let rendered = fetch_handoff_context(&state, query, &alice())
-                .await
-                .unwrap();
+            let rendered = fetch_continuation(&state, query, &alice()).await.unwrap();
             assert!(
                 rendered.is_none(),
                 "{agent:?} must inject nothing: {rendered:?}"
@@ -6190,7 +6286,7 @@ mod tests {
         let published =
             publish_continuation(&state, state.workspace_id, state.project_id, "no run id").await;
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 session_id: None,
@@ -6230,7 +6326,7 @@ mod tests {
 
         let harness_session = "codex-session-2026-09-03";
         let expected_run = SessionId::from_agent_session(harness_session);
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             session_start_query("codex", harness_session),
             &alice(),
@@ -6312,7 +6408,7 @@ mod tests {
         let published =
             publish_continuation(&state, state.workspace_id, state.project_id, "recoverable").await;
 
-        fetch_handoff_context(
+        fetch_continuation(
             &state,
             session_start_query("claude-code", "lost-run"),
             &alice(),
@@ -6323,7 +6419,7 @@ mod tests {
 
         // A second session start finds nothing while the lease is live.
         assert!(
-            fetch_handoff_context(
+            fetch_continuation(
                 &state,
                 session_start_query("claude-code", "second-run"),
                 &alice()
@@ -6346,7 +6442,7 @@ mod tests {
         );
         drop(conn);
 
-        let recovered = fetch_handoff_context(
+        let recovered = fetch_continuation(
             &state,
             session_start_query("claude-code", "second-run"),
             &alice(),
@@ -6372,7 +6468,7 @@ mod tests {
         let automatic = {
             let state = state.clone();
             tokio::spawn(async move {
-                fetch_handoff_context(
+                fetch_continuation(
                     &state,
                     session_start_query("claude-code", "auto-run"),
                     &alice(),
@@ -6450,7 +6546,7 @@ mod tests {
         .await;
         state.continuity.context_budget = 4_000;
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             session_start_query("claude-code", "no-provider-run"),
             &alice(),
@@ -6469,7 +6565,7 @@ mod tests {
 
         // Same state, unreachable timeout: nothing is injected.
         state.continuity.timeout = std::time::Duration::from_nanos(1);
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             session_start_query("claude-code", "slow-run"),
             &alice(),
@@ -6495,7 +6591,7 @@ mod tests {
         assert_ne!(older.work_item_id, newer.work_item_id);
 
         // Without a hint the newest transfer wins.
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             session_start_query("claude-code", "hint-run-a"),
             &alice(),
@@ -6506,7 +6602,7 @@ mod tests {
         assert!(rendered.contains("newer work"), "{rendered}");
 
         // A hint naming the older WorkItem selects that one instead.
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 work_item: Some(older.work_item_id.to_string()),
@@ -6528,7 +6624,7 @@ mod tests {
             .unwrap();
         let foreign =
             publish_continuation(&state, state.workspace_id, other_project, "foreign work").await;
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             HandoffQuery {
                 work_item: Some(foreign.work_item_id.to_string()),
@@ -6580,7 +6676,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_handoff_context(
+        let rendered = fetch_continuation(
             &state,
             session_start_query("claude-code", "peer-run"),
             &alice(),
@@ -6619,7 +6715,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
         publish_continuation(&state, state.workspace_id, state.project_id, "audited").await;
-        fetch_handoff_context(
+        fetch_continuation(
             &state,
             session_start_query("claude-code", "audited-run"),
             &alice(),
@@ -6649,16 +6745,26 @@ mod tests {
         );
     }
 
-    /// The Attempt id of an automatic claim is derived from the transfer
-    /// revision and the Run, so a SessionStart hook that fires twice for one
-    /// session replays its own claim instead of racing itself.
+    /// A SessionStart that fires again inside the SAME Run re-renders the
+    /// claim that Run already holds — even when the project has since acquired
+    /// another open transfer.
+    ///
+    /// This is the `/clear` path. Discovering open work first would claim the
+    /// *newer* transfer instead, stranding the continuation this Run is
+    /// carrying under its lease and injecting unrelated work.
     #[tokio::test]
-    async fn repeated_session_start_for_one_run_replays_its_own_claim() {
+    async fn repeated_session_start_rerenders_the_held_claim_not_another_open_one() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        publish_continuation(&state, state.workspace_id, state.project_id, "idempotent").await;
+        publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "the held work",
+        )
+        .await;
 
-        let first = fetch_handoff_context(
+        let first = fetch_continuation(
             &state,
             session_start_query("claude-code", "same-run"),
             &alice(),
@@ -6666,14 +6772,34 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let second = fetch_handoff_context(
+        assert!(first.contains("the held work"), "{first}");
+
+        // Another agent leaves a NEWER open transfer in the same project while
+        // this Run is mid-task.
+        let distraction = publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "someone else's newer work",
+        )
+        .await;
+
+        let second = fetch_continuation(
             &state,
             session_start_query("claude-code", "same-run"),
             &alice(),
         )
         .await
         .unwrap()
-        .expect("an identical retry replays the recorded claim");
+        .expect("the same Run must get its own continuation back");
+        assert!(
+            second.contains("the held work"),
+            "the Run's own claim must be re-rendered: {second}"
+        );
+        assert!(
+            !second.contains("someone else's newer work"),
+            "a second start must not claim unrelated work: {second}"
+        );
 
         let claim_line = |rendered: &str| {
             rendered
@@ -6685,13 +6811,70 @@ mod tests {
         assert_eq!(
             claim_line(&first),
             claim_line(&second),
-            "the replay must return the same Claim and lease"
+            "the re-render must return the same Claim and lease"
         );
 
+        // The distraction is untouched, and exactly one claim exists.
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(distraction.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Open,
+        );
         let conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
-        let live: i64 = conn
+        let claims: i64 = conn
             .query_row("SELECT COUNT(*) FROM handoff_claims", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(live, 1, "a replay must not record a second claim");
+        assert_eq!(claims, 1, "a re-render must not record a second claim");
+    }
+
+    /// A supplied cwd that resolves to no existing project must claim nothing.
+    ///
+    /// This endpoint mutates, and the resolved scope decides WHOSE
+    /// continuation is consumed — falling back to the server's baked default
+    /// project would hand this session another project's work.
+    #[tokio::test]
+    async fn unresolvable_cwd_claims_nothing_instead_of_falling_back() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let published = publish_continuation(
+            &state,
+            state.workspace_id,
+            state.project_id,
+            "default-scope work",
+        )
+        .await;
+
+        for cwd in ["/", engram_core::GLOBAL_SCOPE_PROJECT] {
+            let rendered = fetch_continuation(
+                &state,
+                HandoffQuery {
+                    cwd: Some(cwd.into()),
+                    ..session_start_query("claude-code", "unresolved-run")
+                },
+                &alice(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                rendered.is_none(),
+                "cwd {cwd:?} must not fall back to the default scope: {rendered:?}"
+            );
+        }
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(published.handoff_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            engram_core::HandoffState::Open,
+            "the default project's transfer must be untouched"
+        );
     }
 }

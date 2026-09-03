@@ -2846,6 +2846,110 @@ mod tests {
         );
     }
 
+    /// The server's continuation timeout ceiling must stay strictly below the
+    /// deadline every shipped hook client aborts at, and every client must
+    /// actually use that deadline.
+    ///
+    /// If a client aborted first, the claim would already be committed while
+    /// nothing reached the agent — the transfer would sit leased for the whole
+    /// lease with no receiver, on every session start.
+    #[test]
+    fn server_continuation_timeout_stays_under_every_client_deadline() {
+        // The ceiling-below-client-budget invariant itself is a compile-time
+        // assertion in `engram_hooks`. What needs proving here is that an
+        // operator cannot configure past that ceiling, and that every shipped
+        // client really does use the budget the ceiling is derived from.
+        let over = crate::config::ContinuitySettings {
+            session_start_timeout_ms: 60_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            over.resolved().timeout,
+            std::time::Duration::from_millis(engram_hooks::MAX_SESSION_START_TIMEOUT_MS)
+        );
+
+        // Every shipped client encodes the same 1s deadline.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let posix = fs::read_to_string(root.join("hooks").join("_lib.sh")).unwrap();
+        assert!(
+            posix.contains("curl -s --max-time 1.0"),
+            "hooks/_lib.sh must use the shared client budget"
+        );
+        let powershell =
+            fs::read_to_string(root.join("hooks").join("lib").join("engram-hook.ps1")).unwrap();
+        assert!(
+            powershell.contains("-TimeoutSec 1 `"),
+            "the PowerShell client must use the same budget as the POSIX one"
+        );
+        for generated in [
+            build_opencode_plugin("http://127.0.0.1:49374", None, None),
+            build_omp_extension("http://127.0.0.1:49374", None, None),
+            super::super::openclaw_plugin::build_plugin("http://127.0.0.1:49374", None, None),
+        ] {
+            assert!(
+                generated.contains("signal: timeoutSignal(1000)"),
+                "every generated client must use the same budget"
+            );
+        }
+    }
+
+    /// The POSIX helper's session-id extraction must agree with
+    /// `engram_hooks::extract_session_id` on every payload shape a supported
+    /// harness sends.
+    ///
+    /// Divergence is silent and expensive in both directions: a miss degrades
+    /// an output-capable adapter to the read-only render on every start, and a
+    /// *different* answer binds the automatic claim to a Run that never writes
+    /// the acknowledging checkpoint.
+    #[cfg(unix)]
+    #[test]
+    fn posix_helper_session_id_matches_the_shared_extractor() {
+        let lib = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks")
+            .join("_lib.sh");
+        for payload in [
+            // Claude Code / Codex / OpenCode / Antigravity top-level spellings.
+            r#"{"session_id":"cc-1","cwd":"/repo"}"#,
+            r#"{"sessionId":"cx-1"}"#,
+            r#"{"sessionID":"oc-1"}"#,
+            r#"{"conversationId":"ag-1"}"#,
+            // OpenCode's nested shape — the one a key-only scan misses.
+            r#"{"info":{"id":"oc-nested"},"cwd":"/repo"}"#,
+            r#"{"properties":{"info":{"id":"oc-props"}}}"#,
+            r#"{"event":{"properties":{"sessionID":"ev-1"}}}"#,
+            r#"{"payload":{"info":{"id":"pl-1"}}}"#,
+            // A key spelling and a nested path together: both sides must pick
+            // the SAME one, or capture and the claim disagree about the Run.
+            r#"{"info":{"id":"a"},"properties":{"sessionID":"b"}}"#,
+            // No session identity at all.
+            r#"{"cwd":"/repo"}"#,
+        ] {
+            let script = format!(
+                ". {}; engram_extract_session_id '{}'",
+                lib.display(),
+                payload
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("sh must run");
+            assert!(out.status.success(), "sh failed for {payload}");
+            let shell = String::from_utf8(out.stdout).unwrap();
+            let shell = shell.trim();
+            let rust = engram_hooks::extract_session_id(
+                &serde_json::from_str(payload).expect("test payload is valid JSON"),
+            )
+            .unwrap_or_default();
+            assert_eq!(
+                shell, rust,
+                "hooks/_lib.sh and engram_hooks::extract_session_id disagree on {payload}"
+            );
+        }
+    }
+
     /// Every shipped hook bundle must encode its adapter's SessionStart
     /// output capability exactly as `engram_core::adapter` declares it.
     ///

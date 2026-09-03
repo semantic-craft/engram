@@ -65,6 +65,49 @@ pub struct HandoffContextRequest {
 /// Default retrieval-candidate ceiling for continuation assembly.
 pub const DEFAULT_HANDOFF_RETRIEVAL_LIMIT: usize = 20;
 
+/// Default per-kind entry ceilings for a continuation or query package.
+///
+/// Shared by `memory_query`, on-demand `memory_handoff_claim`, and automatic
+/// SessionStart recovery. Passing an empty quota list instead would give every
+/// kind an unlimited ceiling, so the SessionStart package would be assembled
+/// under different rules than the identical on-demand claim — exactly the drift
+/// this module exists to prevent.
+pub const DEFAULT_WIKI_PAGE_QUOTA: usize = 6;
+/// Default `session_page` ceiling. See [`DEFAULT_WIKI_PAGE_QUOTA`].
+pub const DEFAULT_SESSION_PAGE_QUOTA: usize = 3;
+/// Default `observation` ceiling. See [`DEFAULT_WIKI_PAGE_QUOTA`].
+pub const DEFAULT_OBSERVATION_QUOTA: usize = 3;
+
+/// Caller overrides for the per-kind ceilings. `None` keeps the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextQuotaOverrides {
+    /// Maximum `wiki_page` entries.
+    pub wiki_page: Option<usize>,
+    /// Maximum `session_page` entries.
+    pub session_page: Option<usize>,
+    /// Maximum `observation` entries.
+    pub observation: Option<usize>,
+}
+
+/// Build the per-kind ceilings for one assembly.
+#[must_use]
+pub fn context_quotas(overrides: ContextQuotaOverrides) -> Vec<ContextQuota> {
+    vec![
+        ContextQuota {
+            kind: ContextKind::WikiPage,
+            maximum: overrides.wiki_page.unwrap_or(DEFAULT_WIKI_PAGE_QUOTA),
+        },
+        ContextQuota {
+            kind: ContextKind::SessionPage,
+            maximum: overrides.session_page.unwrap_or(DEFAULT_SESSION_PAGE_QUOTA),
+        },
+        ContextQuota {
+            kind: ContextKind::Observation,
+            maximum: overrides.observation.unwrap_or(DEFAULT_OBSERVATION_QUOTA),
+        },
+    ]
+}
+
 /// Assembled continuation package plus the reinforcement ids its caller owes
 /// the retention model.
 #[derive(Debug)]

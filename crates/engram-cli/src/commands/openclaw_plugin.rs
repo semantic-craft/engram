@@ -279,7 +279,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     )
 }
 
-fn build_plugin(
+pub(super) fn build_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,

@@ -537,17 +537,22 @@ impl Default for ContinuitySettings {
 impl ContinuitySettings {
     /// Clamped, typed view used by the hook router.
     ///
-    /// The budget floor keeps a package meaningful, the ceiling stops one
-    /// config line from injecting a novel into every session start, and the
-    /// timeout stays under the client-side `GET /handoff` budget so the server
-    /// gives up before the hook does.
+    /// The budget floor keeps a package meaningful and the ceiling stops one
+    /// config line from injecting a novel into every session start. The
+    /// timeout ceiling is [`engram_hooks::MAX_SESSION_START_TIMEOUT_MS`],
+    /// strictly below [`engram_hooks::SESSION_START_CLIENT_BUDGET_MS`] — the
+    /// deadline every shipped hook client aborts at — so the SERVER always
+    /// gives up first. Letting an operator configure past the client deadline
+    /// would commit the claim while nothing reached the agent, leaving the
+    /// transfer leased with no receiver on every session start.
     #[must_use]
     pub fn resolved(&self) -> engram_hooks::SessionStartContinuity {
         engram_hooks::SessionStartContinuity {
             context_budget: self.session_start_context_budget.clamp(500, 100_000),
-            timeout: std::time::Duration::from_millis(
-                self.session_start_timeout_ms.clamp(50, 10_000),
-            ),
+            timeout: std::time::Duration::from_millis(self.session_start_timeout_ms.clamp(
+                engram_hooks::MIN_SESSION_START_TIMEOUT_MS,
+                engram_hooks::MAX_SESSION_START_TIMEOUT_MS,
+            )),
             lease_seconds: self.session_start_lease_seconds.clamp(1, 3_600),
         }
     }

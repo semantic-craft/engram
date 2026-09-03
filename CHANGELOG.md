@@ -37,8 +37,10 @@ below start from the fork.
 - New `[continuity]` config table bounds automatic session-start recovery:
   `session_start_context_budget` (UTF-8 bytes, default 8000),
   `session_start_timeout_ms` (default 750) covering discover + claim +
-  assemble + render, and `session_start_lease_seconds` (default 900). Values
-  are clamped, and context assembly on this path never calls an LLM provider.
+  assemble + render, and `session_start_lease_seconds` (default 900). The
+  timeout is clamped to 50-900 ms, strictly below the 1 s deadline every
+  shipped hook client aborts at, so the server always gives up first; context
+  assembly on this path never calls an LLM provider.
 - `.engram.toml` gains an optional `work_item` key: a checkout pinned to one
   task only receives continuations for that exact WorkItem. It is a selection
   hint inside the already-resolved scope — it never widens scope and never
@@ -57,6 +59,16 @@ below start from the fork.
   descriptions now teach agents to use an injected "continuation CLAIMED"
   block directly and acknowledge it with their first checkpoint, rather than
   claiming it again.
+- `GET /handoff` now passes `Capability::NormalWrite` through
+  `AuthLevel::authorize` on its claiming path, matching every MCP continuity
+  transition. A supplied cwd that resolves to no existing project claims
+  nothing instead of falling back to the server's default project.
+- Every delivery path resolves the harness session id through one shared
+  ordered key-and-path list (`engram_hooks::extract_session_id`), so
+  OpenCode-shaped `{"info":{"id":…}}` payloads are recognized and the
+  automatic claim can never bind to a different Run than hook capture
+  recorded. The PowerShell client's `GET /handoff` deadline drops from 2 s to
+  1 s to match the POSIX and generated TypeScript clients.
 
 - A WorkItem can now cross many agents and Runs without overwriting earlier
   transfers. `memory_handoff_begin` publishes a *successor* Handoff for an

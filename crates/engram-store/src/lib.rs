@@ -44,11 +44,12 @@ pub use auto_improve::{
     project_instruction_unified_diff,
 };
 pub use continuation::{
-    ContextCandidateParts, DEFAULT_HANDOFF_RETRIEVAL_LIMIT, HandoffContext, HandoffContextRequest,
-    PageCandidateHit, QueryEmbedding, ResolvedContextRef, assemble_handoff_context,
-    build_context_candidates, claim_access_bump_ids, context_candidate, context_ref_omission_label,
-    handoff_retrieval_query, observation_context_candidate, page_context_candidate,
-    resolve_context_refs,
+    ContextCandidateParts, ContextQuotaOverrides, DEFAULT_HANDOFF_RETRIEVAL_LIMIT,
+    DEFAULT_OBSERVATION_QUOTA, DEFAULT_SESSION_PAGE_QUOTA, DEFAULT_WIKI_PAGE_QUOTA, HandoffContext,
+    HandoffContextRequest, PageCandidateHit, QueryEmbedding, ResolvedContextRef,
+    assemble_handoff_context, build_context_candidates, claim_access_bump_ids, context_candidate,
+    context_quotas, context_ref_omission_label, handoff_retrieval_query,
+    observation_context_candidate, page_context_candidate, resolve_context_refs,
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
