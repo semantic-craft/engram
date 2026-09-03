@@ -10,6 +10,8 @@ below start from the fork.
 
 ## Unreleased
 
+## 2.3.0 - 2026-09-03
+
 ### Added
 
 - Task-continuity diagnostics on every briefing snapshot: WorkItems by
